@@ -1,4 +1,4 @@
-module github.com/webmakom-com/saiService
+module github.com/saiset-co/saiService
 
 go 1.18
 
