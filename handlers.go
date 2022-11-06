@@ -17,12 +17,13 @@ type Handler map[string]HandlerElement
 type HandlerElement struct {
 	Name        string // name to execute, can be path
 	Description string
-	Function    func(interface{}) interface{}
+	Function    func(interface{}, string) interface{}
 }
 
 type jsonRequestType struct {
 	Method string
 	Data   interface{}
+	Token  string
 }
 
 type j map[string]interface{}
@@ -43,7 +44,7 @@ func (s *Service) handleSocketConnections(conn net.Conn) {
 				continue
 			}
 
-			result, resultErr := s.processPath(message.Method, message.Data)
+			result, resultErr := s.processPath(&message)
 
 			if resultErr != nil {
 				err := j{"Status": "NOK", "Error": resultErr.Error()}
@@ -86,7 +87,7 @@ func (s *Service) handleCliCommand(data []byte) ([]byte, error) {
 
 	}
 
-	result, err := s.processPath(message.Method, message.Data)
+	result, err := s.processPath(&message)
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +117,11 @@ func (s *Service) handleWSConnections(conn *websocket.Conn) {
 			continue
 		}
 
-		result, resultErr := s.processPath(message.Method, message.Data)
+		headers := conn.Request().Header
+		token := headers.Get("Token")
+		message.Token = token
+
+		result, resultErr := s.processPath(&message)
 
 		if resultErr != nil {
 			err := j{"Status": "NOK", "Error": resultErr.Error()}
@@ -156,7 +161,11 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 		return
 	}
 
-	result, resultErr := s.processPath(message.Method, message.Data)
+	headers := req.Header
+	token := headers.Get("Token")
+	message.Token = token
+
+	result, resultErr := s.processPath(&message)
 
 	if resultErr != nil {
 		err := j{"Status": "NOK", "Error": resultErr.Error()}
@@ -179,8 +188,8 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 	resp.Write(body)
 }
 
-func (s *Service) processPath(path string, data interface{}) (interface{}, error) {
-	h, ok := s.Handlers[path]
+func (s *Service) processPath(msg *jsonRequestType) (interface{}, error) {
+	h, ok := s.Handlers[msg.Method]
 
 	if !ok {
 		return nil, errors.New("no handler")
@@ -188,5 +197,5 @@ func (s *Service) processPath(path string, data interface{}) (interface{}, error
 
 	//todo: Rutina na process
 
-	return h.Function(data), nil
+	return h.Function(msg.Data, msg.Token), nil
 }
