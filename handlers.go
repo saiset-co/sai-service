@@ -17,13 +17,12 @@ type Handler map[string]HandlerElement
 type HandlerElement struct {
 	Name        string // name to execute, can be path
 	Description string
-	Function    func(interface{}, string) (interface{}, error)
+	Function    func(interface{}) (interface{}, error)
 }
 
 type jsonRequestType struct {
 	Method string
 	Data   interface{}
-	Token  string
 }
 
 type j map[string]interface{}
@@ -119,7 +118,14 @@ func (s *Service) handleWSConnections(conn *websocket.Conn) {
 
 		headers := conn.Request().Header
 		token := headers.Get("Token")
-		message.Token = token
+		if s.GetConfig("token", "").(string) != "" {
+			if token != s.GetConfig("token", "") {
+				err := j{"Status": "NOK", "Error": "Wrong token"}
+				log.Println(err)
+				websocket.JSON.Send(conn, err)
+				continue
+			}
+		}
 
 		result, resultErr := s.processPath(&message)
 
@@ -163,7 +169,14 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 
 	headers := req.Header
 	token := headers.Get("Token")
-	message.Token = token
+	if s.GetConfig("token", "").(string) != "" {
+		if token != s.GetConfig("token", "") {
+			err := j{"Status": "NOK", "Error": "Wrong token"}
+			errBody, _ := json.Marshal(err)
+			log.Println(err)
+			resp.Write(errBody)
+		}
+	}
 
 	result, resultErr := s.processPath(&message)
 
@@ -197,5 +210,5 @@ func (s *Service) processPath(msg *jsonRequestType) (interface{}, error) {
 
 	//todo: Rutina na process
 
-	return h.Function(msg.Data, msg.Token)
+	return h.Function(msg.Data)
 }

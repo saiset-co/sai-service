@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/urfave/cli/v2"
+	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 )
 
@@ -17,6 +18,7 @@ type Service struct {
 	Handlers      Handler
 	Tasks         []func()
 	InitTask      func()
+	Logger        *zap.Logger
 }
 
 var svc = new(Service)
@@ -79,7 +81,9 @@ func (s *Service) GetConfig(path string, def interface{}) interface{} {
 }
 
 func (s *Service) Start() {
-	s.InitTask()
+	if s.InitTask != nil {
+		s.InitTask()
+	}
 
 	app := &cli.App{
 		Commands: []*cli.Command{
@@ -147,4 +151,28 @@ func (s *Service) StartTasks() {
 	for _, task := range s.Tasks {
 		go task()
 	}
+}
+
+func (s *Service) SetLogger() {
+	var (
+		logger *zap.Logger
+		err    error
+	)
+
+	mode := s.Configuration["log_mode"].(string)
+	if mode == "debug" {
+		logger, err = zap.NewDevelopment(zap.AddStacktrace(zap.DPanicLevel))
+		if err != nil {
+			log.Fatal("error creating logger : ", err.Error())
+		}
+		logger.Debug("Logger started", zap.String("mode", "debug"))
+	} else {
+		logger, err = zap.NewProduction(zap.AddStacktrace(zap.DPanicLevel))
+		if err != nil {
+			log.Fatal("error creating logger : ", err.Error())
+		}
+		logger.Info("Logger started", zap.String("mode", "production"))
+	}
+
+	s.Logger = logger
 }
