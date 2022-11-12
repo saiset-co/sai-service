@@ -41,6 +41,8 @@ func (s *Service) RegisterConfig(path string) {
 	if err != nil {
 		log.Fatalf("yamlErr: %v", err)
 	}
+
+	s.SetLogger()
 }
 
 func (s *Service) RegisterHandlers(handlers Handler) {
@@ -159,7 +161,7 @@ func (s *Service) SetLogger() {
 		err    error
 	)
 
-	mode := s.Configuration["log_mode"].(string)
+	mode := s.GetConfig("common.log_mode", "debug")
 	if mode == "debug" {
 		logger, err = zap.NewDevelopment(zap.AddStacktrace(zap.DPanicLevel))
 		if err != nil {
