@@ -169,8 +169,8 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 
 	headers := req.Header
 	token := headers.Get("Token")
-	if s.GetConfig("token", "").(string) != "" {
-		if token != s.GetConfig("token", "") {
+	if s.GetConfig("common.token", "").(string) != "" {
+		if token != s.GetConfig("common.token", "") {
 			err := j{"Status": "NOK", "Error": "Wrong token"}
 			errBody, _ := json.Marshal(err)
 			log.Println(err)
