@@ -13,12 +13,12 @@ import (
 )
 
 type Service struct {
-	Name          string
-	Configuration map[string]interface{}
-	Handlers      Handler
-	Tasks         []func()
-	InitTask      func()
-	Logger        *zap.Logger
+	Name string
+	*CoreCtx
+	Handlers Handler
+	Tasks    []func()
+	InitTask func()
+	Logger   *zap.Logger
 }
 
 var svc = new(Service)
@@ -26,6 +26,7 @@ var eos = []byte("\n")
 
 func NewService(name string) *Service {
 	svc.Name = name
+	svc.CoreCtx = new(CoreCtx)
 	return svc
 }
 
@@ -36,7 +37,7 @@ func (s *Service) RegisterConfig(path string) {
 		log.Printf("yamlErr:  %v", err)
 	}
 
-	err = yaml.Unmarshal(yamlData, &s.Configuration)
+	err = yaml.Unmarshal(yamlData, &s.CoreCtx.Configuration)
 
 	if err != nil {
 		log.Fatalf("yamlErr: %v", err)
@@ -59,7 +60,7 @@ func (s *Service) RegisterInitTask(initTask func()) {
 
 func (s *Service) GetConfig(path string, def interface{}) interface{} {
 	steps := strings.Split(path, ".")
-	configuration := s.Configuration
+	configuration := s.CoreCtx.Configuration
 
 	for _, step := range steps {
 		val, _ := configuration[step]
@@ -177,4 +178,5 @@ func (s *Service) SetLogger() {
 	}
 
 	s.Logger = logger
+
 }
