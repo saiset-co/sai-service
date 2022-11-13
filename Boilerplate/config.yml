@@ -1,0 +1,10 @@
+common:
+  socket:
+    port: 8002
+  http:
+    enabled: true
+    port: 8080
+  ws:
+    enabled: true
+    port: 8081
+  test: " TEST"
