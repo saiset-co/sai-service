@@ -2,19 +2,17 @@ package saiService
 
 import (
 	"fmt"
-	"io/ioutil"
-	"log"
-	"os"
-	"strings"
-
 	"github.com/urfave/cli/v2"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
+	"io/ioutil"
+	"log"
+	"os"
 )
 
 type Service struct {
-	Name string
-	*CoreCtx
+	Name     string
+	Context  *Context
 	Handlers Handler
 	Tasks    []func()
 	InitTask func()
@@ -26,7 +24,7 @@ var eos = []byte("\n")
 
 func NewService(name string) *Service {
 	svc.Name = name
-	svc.CoreCtx = new(CoreCtx)
+	svc.Context = NewContext()
 	return svc
 }
 
@@ -37,7 +35,7 @@ func (s *Service) RegisterConfig(path string) {
 		log.Printf("yamlErr:  %v", err)
 	}
 
-	err = yaml.Unmarshal(yamlData, &s.CoreCtx.Configuration)
+	err = yaml.Unmarshal(yamlData, &s.Context.Configuration)
 
 	if err != nil {
 		log.Fatalf("yamlErr: %v", err)
@@ -59,28 +57,7 @@ func (s *Service) RegisterInitTask(initTask func()) {
 }
 
 func (s *Service) GetConfig(path string, def interface{}) interface{} {
-	steps := strings.Split(path, ".")
-	configuration := s.CoreCtx.Configuration
-
-	for _, step := range steps {
-		val, _ := configuration[step]
-
-		switch val.(type) {
-		case map[string]interface{}:
-			configuration = val.(map[string]interface{})
-			break
-		case string:
-			return val.(string)
-		case int:
-			return val.(int)
-		case bool:
-			return val.(bool)
-		default:
-			return def
-		}
-	}
-
-	return def
+	return s.Context.GetConfig(path, def)
 }
 
 func (s *Service) Start() {

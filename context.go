@@ -5,16 +5,23 @@ import (
 	"strings"
 )
 
-type CoreCtx struct {
+type Context struct {
 	Configuration map[string]interface{}
-	Ctx           context.Context
+	Context       context.Context
 }
 
-func (c *CoreCtx) SetCtx(key string, value interface{}) {
-	c.Ctx = context.WithValue(context.Background(), key, value)
+func NewContext() *Context {
+	return &Context{
+		Configuration: map[string]interface{}{},
+		Context:       context.Background(),
+	}
 }
 
-func (c *CoreCtx) GetConfig(path string, def interface{}) interface{} {
+func (c *Context) SetValue(key string, value interface{}) {
+	c.Context = context.WithValue(context.Background(), key, value)
+}
+
+func (c *Context) GetConfig(path string, def interface{}) any {
 	steps := strings.Split(path, ".")
 	configuration := c.Configuration
 

@@ -17,7 +17,7 @@ type Handler map[string]HandlerElement
 type HandlerElement struct {
 	Name        string // name to execute, can be path
 	Description string
-	Function    func(*CoreCtx) (interface{}, error)
+	Function    func(interface{}) (interface{}, error)
 }
 
 type jsonRequestType struct {
@@ -210,7 +210,5 @@ func (s *Service) processPath(msg *jsonRequestType) (interface{}, error) {
 
 	//todo: Rutina na process
 
-	s.CoreCtx.SetCtx("data", msg.Data)
-
-	return h.Function(s.CoreCtx)
+	return h.Function(msg.Data)
 }
