@@ -2,12 +2,13 @@ package saiService
 
 import (
 	"fmt"
-	"github.com/urfave/cli/v2"
-	"go.uber.org/zap"
-	"gopkg.in/yaml.v3"
 	"io/ioutil"
 	"log"
 	"os"
+
+	"github.com/urfave/cli/v2"
+	"go.uber.org/zap"
+	"gopkg.in/yaml.v3"
 )
 
 type Service struct {
@@ -40,8 +41,8 @@ func (s *Service) RegisterConfig(path string) {
 	if err != nil {
 		log.Fatalf("yamlErr: %v", err)
 	}
-
-	s.SetLogger()
+	svc.SetLogger()
+	svc.Context.SetValue("logger", svc.Logger)
 }
 
 func (s *Service) RegisterHandlers(handlers Handler) {
