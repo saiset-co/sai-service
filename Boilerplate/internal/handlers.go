@@ -25,9 +25,9 @@ func (is InternalService) NewHandler() saiService.Handler {
 }
 
 func (is InternalService) get(data interface{}) string {
-	return "Get:" + strconv.Itoa(is.Ctx.GetConfig("common.http.port", 80).(int))
+	return "Get:" + strconv.Itoa(is.Context.GetConfig("common.http.port", 80).(int))
 }
 
 func (is InternalService) post(data interface{}) string {
-	return "Post:" + is.Ctx.GetConfig("common.test", "80").(string) + ":" + data.(string)
+	return "Post:" + is.Context.GetConfig("common.test", "80").(string) + ":" + data.(string)
 }
