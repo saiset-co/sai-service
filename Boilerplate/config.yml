@@ -7,4 +7,5 @@ common:
   ws:
     enabled: true
     port: 8081
-  test: " TEST"
+
+test: " TEST"
