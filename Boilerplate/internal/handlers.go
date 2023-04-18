@@ -29,5 +29,5 @@ func (is InternalService) get(data interface{}) string {
 }
 
 func (is InternalService) post(data interface{}) string {
-	return "Post:" + is.Context.GetConfig("common.test", "80").(string) + ":" + data.(string)
+	return "Post:" + is.Context.GetConfig("test", "80").(string) + ":" + data.(string)
 }
