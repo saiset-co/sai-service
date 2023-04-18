@@ -6,7 +6,7 @@ import (
 )
 
 func main() {
-	svc := saiService.NewService("Storage")
+	svc := saiService.NewService("{project_name}")
 	is := internal.InternalService{Context: svc.Context}
 
 	svc.RegisterConfig("config.yml")
