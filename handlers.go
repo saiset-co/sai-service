@@ -210,7 +210,7 @@ func (s *Service) processPath(msg *jsonRequestType) (interface{}, int, error) {
 	h, ok := s.Handlers[msg.Method]
 
 	if !ok {
-		return nil, http.StatusNotImplemented, errors.New("no handler")
+		return nil, http.StatusNotFound, errors.New("no handler")
 	}
 
 	//todo: Rutina na process
