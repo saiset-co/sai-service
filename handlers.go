@@ -17,7 +17,7 @@ type Handler map[string]HandlerElement
 type HandlerElement struct {
 	Name        string // name to execute, can be path
 	Description string
-	Function    func(interface{}) (interface{}, error)
+	Function    func(interface{}) (interface{}, int, error)
 }
 
 type jsonRequestType struct {
@@ -43,7 +43,7 @@ func (s *Service) handleSocketConnections(conn net.Conn) {
 				continue
 			}
 
-			result, resultErr := s.processPath(&message)
+			result, _, resultErr := s.processPath(&message)
 
 			if resultErr != nil {
 				err := j{"Status": "NOK", "Error": resultErr.Error()}
@@ -86,7 +86,7 @@ func (s *Service) handleCliCommand(data []byte) ([]byte, error) {
 
 	}
 
-	result, err := s.processPath(&message)
+	result, _, err := s.processPath(&message)
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +127,7 @@ func (s *Service) handleWSConnections(conn *websocket.Conn) {
 			}
 		}
 
-		result, resultErr := s.processPath(&message)
+		result, _, resultErr := s.processPath(&message)
 
 		if resultErr != nil {
 			err := j{"Status": "NOK", "Error": resultErr.Error()}
@@ -155,6 +155,7 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 		err := j{"Status": "NOK", "Error": decoderErr.Error()}
 		errBody, _ := json.Marshal(err)
 		log.Println(err)
+		resp.WriteHeader(http.StatusBadRequest)
 		resp.Write(errBody)
 		return
 	}
@@ -163,6 +164,7 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 		err := j{"Status": "NOK", "Error": "Wrong message format"}
 		errBody, _ := json.Marshal(err)
 		log.Println(err)
+		resp.WriteHeader(http.StatusBadRequest)
 		resp.Write(errBody)
 		return
 	}
@@ -174,16 +176,18 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 			err := j{"Status": "NOK", "Error": "Wrong token"}
 			errBody, _ := json.Marshal(err)
 			log.Println(err)
+			resp.WriteHeader(http.StatusUnauthorized)
 			resp.Write(errBody)
 		}
 	}
 
-	result, resultErr := s.processPath(&message)
+	result, statusCode, resultErr := s.processPath(&message)
 
 	if resultErr != nil {
 		err := j{"Status": "NOK", "Error": resultErr.Error()}
 		errBody, _ := json.Marshal(err)
 		log.Println(err)
+		resp.WriteHeader(statusCode)
 		resp.Write(errBody)
 		return
 	}
@@ -194,18 +198,19 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 		err := j{"Status": "NOK", "Error": marshalErr.Error()}
 		errBody, _ := json.Marshal(err)
 		log.Println(err)
+		resp.WriteHeader(http.StatusInternalServerError)
 		resp.Write(errBody)
 		return
 	}
-
+	resp.WriteHeader(statusCode)
 	resp.Write(body)
 }
 
-func (s *Service) processPath(msg *jsonRequestType) (interface{}, error) {
+func (s *Service) processPath(msg *jsonRequestType) (interface{}, int, error) {
 	h, ok := s.Handlers[msg.Method]
 
 	if !ok {
-		return nil, errors.New("no handler")
+		return nil, http.StatusNotImplemented, errors.New("no handler")
 	}
 
 	//todo: Rutina na process
