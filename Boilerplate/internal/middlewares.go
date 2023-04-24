@@ -2,27 +2,17 @@ package internal
 
 import (
 	"github.com/Limpid-LLC/saiService"
+	"log"
 )
 
-func (is InternalService) NewMiddlewares() saiService.Handler {
-	return saiService.Handler{
-		"get": saiService.HandlerElement{
-			Name:        "get",
-			Description: "Get value from the storage",
-			Function: func(data interface{}) (interface{}, int, error) {
-				return is.get(data)
-			},
-		},
-		"post": saiService.HandlerElement{
-			Name:        "post",
-			Description: "Post value to the storage with specified key",
-			Function: func(data interface{}) (interface{}, int, error) {
-				return is.post(data)
-			},
-		},
+func (is InternalService) NewMiddlewares() []saiService.Middleware {
+	return []saiService.Middleware{
+		loggingMiddleware,
 	}
 }
-
-func logRequest(data saiService.JsonRequestType, next saiService.HandlerElement) interface{} {
-	return next.Function(data)
+func loggingMiddleware(next saiService.HandlerFunc, data interface{}) (interface{}, int, error) {
+	log.Println("Request received")
+	result, status, err := next(data)
+	log.Println("Request processed")
+	return result, status, err
 }

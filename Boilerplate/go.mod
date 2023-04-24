@@ -1,4 +1,4 @@
-module github.com/saiset-co/Boilerplate
+module Boilerplate
 
 go 1.18
 
