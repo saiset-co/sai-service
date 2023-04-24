@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/Limpid-LLC/Boilerplate/internal"
+	"Boilerplate/internal"
 	"github.com/Limpid-LLC/saiService"
 )
 
