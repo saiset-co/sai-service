@@ -218,6 +218,8 @@ func (s *Service) applyMiddleware(handler HandlerElement, data interface{}) (int
 
 	// Apply global middlewares
 	for i, middleware := range s.Middlewares {
+		println("register middleware", i)
+
 		closures[i+1] = func(data interface{}) (interface{}, int, error) {
 			return middleware(closures[i], data)
 		}
