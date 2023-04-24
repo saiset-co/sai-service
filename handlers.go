@@ -213,10 +213,8 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 }
 
 func (s *Service) applyMiddleware(handler HandlerElement, data interface{}) (interface{}, int, error) {
-	closures := make([]HandlerFunc, len(s.Middlewares))
+	closures := make([]HandlerFunc, len(s.Middlewares)+1)
 	closures[0] = handler.Function
-
-	println("new version")
 
 	// Apply global middlewares
 	for i, middleware := range s.Middlewares {
