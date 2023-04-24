@@ -20,7 +20,7 @@ type HandlerElement struct {
 	Function    func(interface{}) (interface{}, int, error)
 }
 
-type jsonRequestType struct {
+type JsonRequestType struct {
 	Method string
 	Data   interface{}
 }
@@ -29,7 +29,7 @@ type j map[string]interface{}
 
 func (s *Service) handleSocketConnections(conn net.Conn) {
 	for {
-		var message jsonRequestType
+		var message JsonRequestType
 		socketMessage, _ := bufio.NewReader(conn).ReadString('\n')
 
 		if socketMessage != "" {
@@ -71,7 +71,7 @@ func (s *Service) handleSocketConnections(conn net.Conn) {
 // handle cli command
 func (s *Service) handleCliCommand(data []byte) ([]byte, error) {
 
-	var message jsonRequestType
+	var message JsonRequestType
 	if len(data) == 0 {
 		return nil, fmt.Errorf("empty data provided")
 	}
@@ -101,7 +101,7 @@ func (s *Service) handleCliCommand(data []byte) ([]byte, error) {
 
 func (s *Service) handleWSConnections(conn *websocket.Conn) {
 	for {
-		var message jsonRequestType
+		var message JsonRequestType
 		if rErr := websocket.JSON.Receive(conn, &message); rErr != nil {
 			err := j{"Status": "NOK", "Error": "Wrong message format"}
 			log.Println(err)
@@ -147,7 +147,7 @@ func (s *Service) handleWSConnections(conn *websocket.Conn) {
 }
 
 func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Request) {
-	var message jsonRequestType
+	var message JsonRequestType
 	decoder := json.NewDecoder(req.Body)
 	decoderErr := decoder.Decode(&message)
 
@@ -206,7 +206,7 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 	resp.Write(body)
 }
 
-func (s *Service) processPath(msg *jsonRequestType) (interface{}, int, error) {
+func (s *Service) processPath(msg *JsonRequestType) (interface{}, int, error) {
 	h, ok := s.Handlers[msg.Method]
 
 	if !ok {

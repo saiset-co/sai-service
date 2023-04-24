@@ -12,12 +12,13 @@ import (
 )
 
 type Service struct {
-	Name     string
-	Context  *Context
-	Handlers Handler
-	Tasks    []func()
-	InitTask func()
-	Logger   *zap.Logger
+	Name        string
+	Context     *Context
+	Handlers    Handler
+	Tasks       []func()
+	InitTask    func()
+	Logger      *zap.Logger
+	Middlewares []func()
 }
 
 var svc = new(Service)
@@ -47,6 +48,10 @@ func (s *Service) RegisterConfig(path string) {
 
 func (s *Service) RegisterHandlers(handlers Handler) {
 	s.Handlers = handlers
+}
+
+func (s *Service) RegisterMiddlewares(middlewares []func()) {
+	s.Middlewares = middlewares
 }
 
 func (s *Service) RegisterTasks(tasks []func()) {

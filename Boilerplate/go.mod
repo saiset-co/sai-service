@@ -2,8 +2,6 @@ module github.com/saiset-co/Boilerplate
 
 go 1.18
 
-require github.com/saiset-co/saiService v0.0.0-20221114154115-8e80f2c9a6a1
-
 require (
 	github.com/cpuguy83/go-md2man/v2 v2.0.2 // indirect
 	github.com/kr/text v0.2.0 // indirect
