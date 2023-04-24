@@ -1,8 +1,8 @@
 package main
 
 import (
-	"github.com/saiset-co/Boilerplate/internal"
-	"github.com/saiset-co/saiService"
+	"github.com/Limpid-LLC/Boilerplate/internal"
+	"github.com/Limpid-LLC/saiService"
 )
 
 func main() {
@@ -19,6 +19,10 @@ func main() {
 
 	svc.RegisterHandlers(
 		is.NewHandler(),
+	)
+
+	svc.RegisterMiddlewares(
+		is.NewMiddlewares(),
 	)
 
 	svc.Start()

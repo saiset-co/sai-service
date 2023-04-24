@@ -211,15 +211,16 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 }
 
 func (s *Service) applyMiddleware(handler HandlerElement, data interface{}) (interface{}, int, error) {
-	h := handler.Function
+	next := handler.Function
 	// Apply global middlewares
 	for _, middleware := range s.Middlewares {
-		h = func(data interface{}) (interface{}, int, error) {
-			return middleware(h, data)
+		currentNext := next
+		next = func(data interface{}) (interface{}, int, error) {
+			return middleware(currentNext, data)
 		}
 	}
 
-	return h(data)
+	return next(data)
 }
 
 func (s *Service) processPath(msg *JsonRequestType) (interface{}, int, error) {

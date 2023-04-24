@@ -1,7 +1,7 @@
 package internal
 
 import (
-	"github.com/saiset-co/saiService"
+	"github.com/Limpid-LLC/saiService"
 )
 
 type InternalService struct {

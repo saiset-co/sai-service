@@ -3,7 +3,7 @@ package internal
 import (
 	"strconv"
 
-	"github.com/saiset-co/saiService"
+	"github.com/Limpid-LLC/saiService"
 )
 
 func (is InternalService) NewHandler() saiService.Handler {
