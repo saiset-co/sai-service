@@ -155,6 +155,8 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 	decoder := json.NewDecoder(req.Body)
 	decoderErr := decoder.Decode(&message)
 
+	resp.Header().Set("Content-Type", "application/json")
+
 	if decoderErr != nil {
 		err := ErrorResponse{"Status": "NOK", "Error": decoderErr.Error()}
 		errBody, _ := json.Marshal(err)
@@ -211,16 +213,19 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 }
 
 func (s *Service) applyMiddleware(handler HandlerElement, data interface{}) (interface{}, int, error) {
-	next := handler.Function
+	closures := make([]HandlerFunc, len(s.Middlewares))
+	closures[0] = handler.Function
+
+	println("new version")
+
 	// Apply global middlewares
-	for _, middleware := range s.Middlewares {
-		currentNext := next
-		next = func(data interface{}) (interface{}, int, error) {
-			return middleware(currentNext, data)
+	for i, middleware := range s.Middlewares {
+		closures[i+1] = func(data interface{}) (interface{}, int, error) {
+			return middleware(closures[i], data)
 		}
 	}
 
-	return next(data)
+	return closures[len(s.Middlewares)](data)
 }
 
 func (s *Service) processPath(msg *JsonRequestType) (interface{}, int, error) {
