@@ -18,7 +18,7 @@ type Service struct {
 	Tasks       []func()
 	InitTask    func()
 	Logger      *zap.Logger
-	Middlewares []func()
+	Middlewares []Middleware
 }
 
 var svc = new(Service)
@@ -50,7 +50,7 @@ func (s *Service) RegisterHandlers(handlers Handler) {
 	s.Handlers = handlers
 }
 
-func (s *Service) RegisterMiddlewares(middlewares []func()) {
+func (s *Service) RegisterMiddlewares(middlewares []Middleware) {
 	s.Middlewares = middlewares
 }
 

@@ -14,18 +14,22 @@ import (
 
 type Handler map[string]HandlerElement
 
+type Middleware func(next HandlerFunc, data interface{}) (interface{}, int, error)
+
 type HandlerElement struct {
-	Name        string // name to execute, can be path
+	Name        string
 	Description string
-	Function    func(interface{}) (interface{}, int, error)
+	Function    HandlerFunc
 }
+
+type HandlerFunc = func(interface{}) (interface{}, int, error)
 
 type JsonRequestType struct {
 	Method string
 	Data   interface{}
 }
 
-type j map[string]interface{}
+type ErrorResponse map[string]interface{}
 
 func (s *Service) handleSocketConnections(conn net.Conn) {
 	for {
@@ -36,7 +40,7 @@ func (s *Service) handleSocketConnections(conn net.Conn) {
 			_ = json.Unmarshal([]byte(socketMessage), &message)
 
 			if message.Method == "" {
-				err := j{"Status": "NOK", "Error": "Wrong message format"}
+				err := ErrorResponse{"Status": "NOK", "Error": "Wrong message format"}
 				errBody, _ := json.Marshal(err)
 				log.Println(err)
 				conn.Write(append(errBody, eos...))
@@ -46,7 +50,7 @@ func (s *Service) handleSocketConnections(conn net.Conn) {
 			result, _, resultErr := s.processPath(&message)
 
 			if resultErr != nil {
-				err := j{"Status": "NOK", "Error": resultErr.Error()}
+				err := ErrorResponse{"Status": "NOK", "Error": resultErr.Error()}
 				errBody, _ := json.Marshal(err)
 				log.Println(err)
 				conn.Write(append(errBody, eos...))
@@ -56,7 +60,7 @@ func (s *Service) handleSocketConnections(conn net.Conn) {
 			body, marshalErr := json.Marshal(result)
 
 			if marshalErr != nil {
-				err := j{"Status": "NOK", "Error": marshalErr.Error()}
+				err := ErrorResponse{"Status": "NOK", "Error": marshalErr.Error()}
 				errBody, _ := json.Marshal(err)
 				log.Println(err)
 				conn.Write(append(errBody, eos...))
@@ -103,14 +107,14 @@ func (s *Service) handleWSConnections(conn *websocket.Conn) {
 	for {
 		var message JsonRequestType
 		if rErr := websocket.JSON.Receive(conn, &message); rErr != nil {
-			err := j{"Status": "NOK", "Error": "Wrong message format"}
+			err := ErrorResponse{"Status": "NOK", "Error": "Wrong message format"}
 			log.Println(err)
 			websocket.JSON.Send(conn, err)
 			continue
 		}
 
 		if message.Method == "" {
-			err := j{"Status": "NOK", "Error": "Wrong message format"}
+			err := ErrorResponse{"Status": "NOK", "Error": "Wrong message format"}
 			log.Println(err)
 			websocket.JSON.Send(conn, err)
 			continue
@@ -120,7 +124,7 @@ func (s *Service) handleWSConnections(conn *websocket.Conn) {
 		token := headers.Get("Token")
 		if s.GetConfig("token", "").(string) != "" {
 			if token != s.GetConfig("token", "") {
-				err := j{"Status": "NOK", "Error": "Wrong token"}
+				err := ErrorResponse{"Status": "NOK", "Error": "Wrong token"}
 				log.Println(err)
 				websocket.JSON.Send(conn, err)
 				continue
@@ -130,7 +134,7 @@ func (s *Service) handleWSConnections(conn *websocket.Conn) {
 		result, _, resultErr := s.processPath(&message)
 
 		if resultErr != nil {
-			err := j{"Status": "NOK", "Error": resultErr.Error()}
+			err := ErrorResponse{"Status": "NOK", "Error": resultErr.Error()}
 			log.Println(err)
 			websocket.JSON.Send(conn, err)
 			continue
@@ -139,7 +143,7 @@ func (s *Service) handleWSConnections(conn *websocket.Conn) {
 		sErr := websocket.JSON.Send(conn, result)
 
 		if sErr != nil {
-			err := j{"Status": "NOK", "Error": sErr.Error()}
+			err := ErrorResponse{"Status": "NOK", "Error": sErr.Error()}
 			log.Println(err)
 			websocket.JSON.Send(conn, err)
 		}
@@ -152,7 +156,7 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 	decoderErr := decoder.Decode(&message)
 
 	if decoderErr != nil {
-		err := j{"Status": "NOK", "Error": decoderErr.Error()}
+		err := ErrorResponse{"Status": "NOK", "Error": decoderErr.Error()}
 		errBody, _ := json.Marshal(err)
 		log.Println(err)
 		resp.WriteHeader(http.StatusBadRequest)
@@ -161,7 +165,7 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 	}
 
 	if message.Method == "" {
-		err := j{"Status": "NOK", "Error": "Wrong message format"}
+		err := ErrorResponse{"Status": "NOK", "Error": "Wrong message format"}
 		errBody, _ := json.Marshal(err)
 		log.Println(err)
 		resp.WriteHeader(http.StatusBadRequest)
@@ -173,7 +177,7 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 	token := headers.Get("Token")
 	if s.GetConfig("common.token", "").(string) != "" {
 		if token != s.GetConfig("common.token", "") {
-			err := j{"Status": "NOK", "Error": "Wrong token"}
+			err := ErrorResponse{"Status": "NOK", "Error": "Wrong token"}
 			errBody, _ := json.Marshal(err)
 			log.Println(err)
 			resp.WriteHeader(http.StatusUnauthorized)
@@ -184,7 +188,7 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 	result, statusCode, resultErr := s.processPath(&message)
 
 	if resultErr != nil {
-		err := j{"Status": "NOK", "Error": resultErr.Error()}
+		err := ErrorResponse{"Status": "NOK", "Error": resultErr.Error()}
 		errBody, _ := json.Marshal(err)
 		log.Println(err)
 		resp.WriteHeader(statusCode)
@@ -195,7 +199,7 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 	body, marshalErr := json.Marshal(result)
 
 	if marshalErr != nil {
-		err := j{"Status": "NOK", "Error": marshalErr.Error()}
+		err := ErrorResponse{"Status": "NOK", "Error": marshalErr.Error()}
 		errBody, _ := json.Marshal(err)
 		log.Println(err)
 		resp.WriteHeader(http.StatusInternalServerError)
@@ -204,6 +208,18 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 	}
 	resp.WriteHeader(statusCode)
 	resp.Write(body)
+}
+
+func (s *Service) applyMiddleware(handler HandlerElement, data interface{}) (interface{}, int, error) {
+	h := handler.Function
+	// Apply global middlewares
+	for _, middleware := range s.Middlewares {
+		h = func(data interface{}) (interface{}, int, error) {
+			return middleware(h, data)
+		}
+	}
+
+	return h(data)
 }
 
 func (s *Service) processPath(msg *JsonRequestType) (interface{}, int, error) {
@@ -215,5 +231,6 @@ func (s *Service) processPath(msg *JsonRequestType) (interface{}, int, error) {
 
 	//todo: Rutina na process
 
-	return h.Function(msg.Data)
+	// Apply middleware
+	return s.applyMiddleware(h, msg.Data)
 }
