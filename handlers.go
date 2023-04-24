@@ -216,13 +216,16 @@ func (s *Service) applyMiddleware(handler HandlerElement, data interface{}) (int
 	closures := make([]HandlerFunc, len(s.Middlewares)+1)
 	closures[0] = handler.Function
 
+	// Function to create a closure for the middleware with the correct next function
+	createMiddlewareClosure := func(middleware Middleware, next HandlerFunc) HandlerFunc {
+		return func(data interface{}) (interface{}, int, error) {
+			return middleware(next, data)
+		}
+	}
+
 	// Apply global middlewares
 	for i, middleware := range s.Middlewares {
-		println("register middleware", i)
-
-		closures[i+1] = func(data interface{}) (interface{}, int, error) {
-			return middleware(closures[i], data)
-		}
+		closures[i+1] = createMiddlewareClosure(middleware, closures[i])
 	}
 
 	return closures[len(s.Middlewares)](data)
