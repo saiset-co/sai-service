@@ -157,11 +157,6 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 
 	resp.Header().Set("Content-Type", "application/json")
 
-	// Set CORS headers (temporary)
-	resp.Header().Set("Access-Control-Allow-Origin", "*")
-	resp.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
-	resp.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
-
 	if decoderErr != nil {
 		err := ErrorResponse{"Status": "NOK", "Error": decoderErr.Error()}
 		errBody, _ := json.Marshal(err)
