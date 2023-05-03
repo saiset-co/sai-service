@@ -1,6 +1,7 @@
 package saiService
 
 import (
+	"github.com/rs/cors"
 	"log"
 	"net"
 	"net/http"
@@ -12,8 +13,12 @@ import (
 func (s *Service) StartHttp() {
 	port := s.GetConfig("common.http.port", 8080).(int)
 	log.Println("Http server has been started:", port)
+	handler := http.HandlerFunc(s.handleHttpConnections)
 
-	http.HandleFunc("/", s.handleHttpConnections)
+	// Wrap the handler with the cors handler
+	corsHandler := cors.AllowAll().Handler(handler)
+
+	http.Handle("/", corsHandler)
 
 	err := http.ListenAndServe(":"+strconv.Itoa(port), nil)
 
