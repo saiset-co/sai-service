@@ -5,6 +5,12 @@ import (
 	"strings"
 )
 
+const (
+	corsAllowOrigin  = "Access-Control-Allow-Origin"
+	corsAllowMethods = "Access-Control-Allow-Methods"
+	corsAllowHeaders = "Access-Control-Allow-Headers"
+)
+
 type Context struct {
 	Configuration map[string]interface{}
 	Context       context.Context

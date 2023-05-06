@@ -8,7 +8,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"reflect"
 
+	"github.com/rs/cors"
 	"golang.org/x/net/websocket"
 )
 
@@ -21,8 +23,9 @@ type HandlerElement struct {
 }
 
 type jsonRequestType struct {
-	Method string
-	Data   interface{}
+	Method  string
+	Headers http.Header
+	Data    interface{}
 }
 
 type j map[string]interface{}
@@ -101,7 +104,7 @@ func (s *Service) handleCliCommand(data []byte) ([]byte, error) {
 
 func (s *Service) handleWSConnections(conn *websocket.Conn) {
 	for {
-		var message jsonRequestType
+		message := jsonRequestType{}
 		if rErr := websocket.JSON.Receive(conn, &message); rErr != nil {
 			err := j{"Status": "NOK", "Error": "Wrong message format"}
 			log.Println(err)
@@ -116,8 +119,8 @@ func (s *Service) handleWSConnections(conn *websocket.Conn) {
 			continue
 		}
 
-		headers := conn.Request().Header
-		token := headers.Get("Token")
+		message.Headers = conn.Request().Header
+		token := message.Headers.Get("Token")
 		if s.GetConfig("token", "").(string) != "" {
 			if token != s.GetConfig("token", "") {
 				err := j{"Status": "NOK", "Error": "Wrong token"}
@@ -147,7 +150,7 @@ func (s *Service) handleWSConnections(conn *websocket.Conn) {
 }
 
 func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Request) {
-	var message jsonRequestType
+	message := jsonRequestType{}
 	decoder := json.NewDecoder(req.Body)
 	decoderErr := decoder.Decode(&message)
 
@@ -169,8 +172,8 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 		return
 	}
 
-	headers := req.Header
-	token := headers.Get("Token")
+	message.Headers = req.Header
+	token := message.Headers.Get("Token")
 	if s.GetConfig("common.token", "").(string) != "" {
 		if token != s.GetConfig("common.token", "") {
 			err := j{"Status": "NOK", "Error": "Wrong token"}
@@ -202,6 +205,7 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 		resp.Write(errBody)
 		return
 	}
+
 	resp.WriteHeader(statusCode)
 	resp.Write(body)
 }
@@ -216,4 +220,27 @@ func (s *Service) processPath(msg *jsonRequestType) (interface{}, int, error) {
 	//todo: Rutina na process
 
 	return h.Function(msg.Data)
+}
+
+// get cors options from config
+func (s *Service) getCorsOptions(opts *cors.Options) (*cors.Options, error) {
+	allowOrigin, ok := s.GetConfig("common.cors.allow_origin", "*").([]string)
+	if !ok {
+		return nil, fmt.Errorf("wrong type of allow origin value from config, value : %s, type : %s", allowOrigin, reflect.TypeOf(allowOrigin))
+	}
+
+	allowMethods, ok := s.GetConfig("common.cors.allow_methods", []string{"POST", "GET", "OPTIONS", "DELETE"}).([]string)
+	if !ok {
+		return nil, fmt.Errorf("wrong type of allow origin value from config, value : %s, type : %s", allowMethods, reflect.TypeOf(allowMethods))
+	}
+
+	allowHeaders, ok := s.GetConfig("common.cors.allow_headers", []string{"Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization"}).([]string)
+	if !ok {
+		return nil, fmt.Errorf("wrong type of allow origin value from config, value : %s, type : %s", allowHeaders, reflect.TypeOf(allowHeaders))
+	}
+
+	opts.AllowedOrigins = allowOrigin
+	opts.AllowedMethods = allowMethods
+	opts.AllowedHeaders = allowHeaders
+	return opts, nil
 }

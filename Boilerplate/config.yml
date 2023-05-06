@@ -7,5 +7,11 @@ common:
   ws:
     enabled: true
     port: 8081
+  cors:
+    origin: ["*"]
+    methods: ["POST","GET","OPTIONS","DELETE"]
+    headers: ["Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization"]
+
+
 
 test: " TEST"
