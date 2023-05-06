@@ -14,21 +14,29 @@ import (
 	"golang.org/x/net/websocket"
 )
 
-type Handler map[string]HandlerElement
+type (
+	Handler map[string]HandlerElement
 
-type HandlerElement struct {
-	Name        string // name to execute, can be path
-	Description string
-	Function    func(interface{}) (interface{}, int, error)
-}
+	HandlerElement struct {
+		Name        string // name to execute, can be path
+		Description string
+		Function    func(interface{}) (*Response, error)
+	}
 
-type jsonRequestType struct {
-	Method  string
-	Headers http.Header
-	Data    interface{}
-}
+	jsonRequestType struct {
+		Method  string
+		Headers http.Header
+		Data    interface{}
+	}
 
-type j map[string]interface{}
+	Response struct {
+		Data       interface{}
+		StatusCode int
+		Headers    http.Header
+	}
+
+	j map[string]interface{}
+)
 
 func (s *Service) handleSocketConnections(conn net.Conn) {
 	for {
@@ -46,7 +54,7 @@ func (s *Service) handleSocketConnections(conn net.Conn) {
 				continue
 			}
 
-			result, _, resultErr := s.processPath(&message)
+			result, resultErr := s.processPath(&message)
 
 			if resultErr != nil {
 				err := j{"Status": "NOK", "Error": resultErr.Error()}
@@ -89,7 +97,7 @@ func (s *Service) handleCliCommand(data []byte) ([]byte, error) {
 
 	}
 
-	result, _, err := s.processPath(&message)
+	result, err := s.processPath(&message)
 	if err != nil {
 		return nil, err
 	}
@@ -130,7 +138,7 @@ func (s *Service) handleWSConnections(conn *websocket.Conn) {
 			}
 		}
 
-		result, _, resultErr := s.processPath(&message)
+		result, resultErr := s.processPath(&message)
 
 		if resultErr != nil {
 			err := j{"Status": "NOK", "Error": resultErr.Error()}
@@ -184,13 +192,13 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 		}
 	}
 
-	result, statusCode, resultErr := s.processPath(&message)
+	result, resultErr := s.processPath(&message)
 
 	if resultErr != nil {
 		err := j{"Status": "NOK", "Error": resultErr.Error()}
 		errBody, _ := json.Marshal(err)
 		log.Println(err)
-		resp.WriteHeader(statusCode)
+		resp.WriteHeader(result.StatusCode)
 		resp.Write(errBody)
 		return
 	}
@@ -206,15 +214,15 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 		return
 	}
 
-	resp.WriteHeader(statusCode)
+	resp.WriteHeader(result.StatusCode)
 	resp.Write(body)
 }
 
-func (s *Service) processPath(msg *jsonRequestType) (interface{}, int, error) {
+func (s *Service) processPath(msg *jsonRequestType) (*Response, error) {
 	h, ok := s.Handlers[msg.Method]
 
 	if !ok {
-		return nil, http.StatusNotFound, errors.New("no handler")
+		return nil, errors.New("no handler")
 	}
 
 	//todo: Rutina na process
