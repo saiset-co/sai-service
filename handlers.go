@@ -20,7 +20,7 @@ type (
 	HandlerElement struct {
 		Name        string // name to execute, can be path
 		Description string
-		Function    func(interface{}) (*Response, error)
+		Function    func(interface{}) (*SaiResponse, error)
 	}
 
 	jsonRequestType struct {
@@ -29,7 +29,7 @@ type (
 		Data    interface{}
 	}
 
-	Response struct {
+	SaiResponse struct {
 		Data       interface{}
 		StatusCode int
 		Headers    http.Header
@@ -218,7 +218,7 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 	resp.Write(body)
 }
 
-func (s *Service) processPath(msg *jsonRequestType) (*Response, error) {
+func (s *Service) processPath(msg *jsonRequestType) (*SaiResponse, error) {
 	h, ok := s.Handlers[msg.Method]
 
 	if !ok {
@@ -232,17 +232,17 @@ func (s *Service) processPath(msg *jsonRequestType) (*Response, error) {
 
 // get cors options from config
 func (s *Service) getCorsOptions(opts *cors.Options) (*cors.Options, error) {
-	allowOrigin, ok := s.GetConfig("common.cors.allow_origin", "*").([]string)
+	allowOrigin, ok := s.GetConfig("common.cors", "*").([]string)
 	if !ok {
 		return nil, fmt.Errorf("wrong type of allow origin value from config, value : %s, type : %s", allowOrigin, reflect.TypeOf(allowOrigin))
 	}
 
-	allowMethods, ok := s.GetConfig("common.cors.allow_methods", []string{"POST", "GET", "OPTIONS", "DELETE"}).([]string)
+	allowMethods, ok := s.GetConfig("common.methods", []string{"POST", "GET", "OPTIONS", "DELETE"}).([]string)
 	if !ok {
 		return nil, fmt.Errorf("wrong type of allow origin value from config, value : %s, type : %s", allowMethods, reflect.TypeOf(allowMethods))
 	}
 
-	allowHeaders, ok := s.GetConfig("common.cors.allow_headers", []string{"Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization"}).([]string)
+	allowHeaders, ok := s.GetConfig("common.headers", []string{"Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization"}).([]string)
 	if !ok {
 		return nil, fmt.Errorf("wrong type of allow origin value from config, value : %s, type : %s", allowHeaders, reflect.TypeOf(allowHeaders))
 	}
@@ -251,4 +251,27 @@ func (s *Service) getCorsOptions(opts *cors.Options) (*cors.Options, error) {
 	opts.AllowedMethods = allowMethods
 	opts.AllowedHeaders = allowHeaders
 	return opts, nil
+}
+
+// return new saiResponse with 200 status code and 'OK' as default
+func NewSaiResponse() *SaiResponse {
+	return &SaiResponse{
+		StatusCode: 200,
+		Data:       "OK",
+	}
+}
+
+// set data to saiResponse
+func (r *SaiResponse) SetData(data interface{}) {
+	r.Data = data
+}
+
+// set status code to saiResponse
+func (r *SaiResponse) SetStatus(statusCode int) {
+	r.StatusCode = statusCode
+}
+
+// add header to saiResponse
+func (r *SaiResponse) AddHeader(key, value string) {
+	r.Headers.Add(key, value)
 }
