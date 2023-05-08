@@ -41,6 +41,7 @@ func (s *Service) RegisterConfig(path string) {
 	if err != nil {
 		log.Fatalf("yamlErr: %v", err)
 	}
+
 	svc.SetLogger()
 	svc.Context.SetValue("logger", svc.Logger)
 }

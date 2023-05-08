@@ -6,10 +6,12 @@ common:
     port: 8080
   ws:
     enabled: true
-    port: 8081
-  cors: ["*"]
-  methods: ["POST","GET","OPTIONS","DELETE"]
-  headers: ["Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization"]
+    port: 8082
+  cors: ["*1"]
+  methods: ["POST","GET","OPTIONS","DELETE1"]
+  headers: ["Accept", "Content-Type", "Content-Length", "Accept-Encoding", "X-CSRF-Token", "Authorization1"]
+  profiling: true
+  profiling_port: 8084
 
 
 

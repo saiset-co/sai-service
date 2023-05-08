@@ -232,7 +232,7 @@ func (s *Service) processPath(msg *jsonRequestType) (*SaiResponse, error) {
 
 // get cors options from config
 func (s *Service) getCorsOptions(opts *cors.Options) (*cors.Options, error) {
-	allowOrigin, ok := s.GetConfig("common.cors", "*").([]string)
+	allowOrigin, ok := s.GetConfig("common.cors", []string{"*"}).([]string)
 	if !ok {
 		return nil, fmt.Errorf("wrong type of allow origin value from config, value : %s, type : %s", allowOrigin, reflect.TypeOf(allowOrigin))
 	}
@@ -250,6 +250,7 @@ func (s *Service) getCorsOptions(opts *cors.Options) (*cors.Options, error) {
 	opts.AllowedOrigins = allowOrigin
 	opts.AllowedMethods = allowMethods
 	opts.AllowedHeaders = allowHeaders
+
 	return opts, nil
 }
 

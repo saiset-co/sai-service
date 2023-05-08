@@ -44,6 +44,8 @@ func (c *Context) GetConfig(path string, def interface{}) any {
 			return val.(int)
 		case bool:
 			return val.(bool)
+		case []string:
+			return val.([]string)
 		default:
 			return def
 		}
