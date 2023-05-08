@@ -3,6 +3,7 @@ module github.com/saiset-co/saiService
 go 1.18
 
 require (
+	github.com/rs/cors v1.9.0
 	github.com/urfave/cli/v2 v2.11.1
 	go.uber.org/zap v1.23.0
 	golang.org/x/net v0.0.0-20211112202133-69e39bad7dc2

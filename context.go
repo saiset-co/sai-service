@@ -5,6 +5,12 @@ import (
 	"strings"
 )
 
+const (
+	corsAllowOrigin  = "Access-Control-Allow-Origin"
+	corsAllowMethods = "Access-Control-Allow-Methods"
+	corsAllowHeaders = "Access-Control-Allow-Headers"
+)
+
 type Context struct {
 	Configuration map[string]interface{}
 	Context       context.Context
@@ -38,6 +44,8 @@ func (c *Context) GetConfig(path string, def interface{}) any {
 			return val.(int)
 		case bool:
 			return val.(bool)
+		case []string:
+			return val.([]string)
 		default:
 			return def
 		}

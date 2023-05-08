@@ -8,24 +8,35 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"reflect"
 
+	"github.com/rs/cors"
 	"golang.org/x/net/websocket"
 )
 
-type Handler map[string]HandlerElement
+type (
+	Handler map[string]HandlerElement
 
-type HandlerElement struct {
-	Name        string // name to execute, can be path
-	Description string
-	Function    func(interface{}) (interface{}, int, error)
-}
+	HandlerElement struct {
+		Name        string // name to execute, can be path
+		Description string
+		Function    func(interface{}) (*SaiResponse, error)
+	}
 
-type jsonRequestType struct {
-	Method string
-	Data   interface{}
-}
+	jsonRequestType struct {
+		Method  string
+		Headers http.Header
+		Data    interface{}
+	}
 
-type j map[string]interface{}
+	SaiResponse struct {
+		Data       interface{}
+		StatusCode int
+		Headers    http.Header
+	}
+
+	j map[string]interface{}
+)
 
 func (s *Service) handleSocketConnections(conn net.Conn) {
 	for {
@@ -43,7 +54,7 @@ func (s *Service) handleSocketConnections(conn net.Conn) {
 				continue
 			}
 
-			result, _, resultErr := s.processPath(&message)
+			result, resultErr := s.processPath(&message)
 
 			if resultErr != nil {
 				err := j{"Status": "NOK", "Error": resultErr.Error()}
@@ -86,7 +97,7 @@ func (s *Service) handleCliCommand(data []byte) ([]byte, error) {
 
 	}
 
-	result, _, err := s.processPath(&message)
+	result, err := s.processPath(&message)
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +112,7 @@ func (s *Service) handleCliCommand(data []byte) ([]byte, error) {
 
 func (s *Service) handleWSConnections(conn *websocket.Conn) {
 	for {
-		var message jsonRequestType
+		message := jsonRequestType{}
 		if rErr := websocket.JSON.Receive(conn, &message); rErr != nil {
 			err := j{"Status": "NOK", "Error": "Wrong message format"}
 			log.Println(err)
@@ -116,8 +127,8 @@ func (s *Service) handleWSConnections(conn *websocket.Conn) {
 			continue
 		}
 
-		headers := conn.Request().Header
-		token := headers.Get("Token")
+		message.Headers = conn.Request().Header
+		token := message.Headers.Get("Token")
 		if s.GetConfig("token", "").(string) != "" {
 			if token != s.GetConfig("token", "") {
 				err := j{"Status": "NOK", "Error": "Wrong token"}
@@ -127,7 +138,7 @@ func (s *Service) handleWSConnections(conn *websocket.Conn) {
 			}
 		}
 
-		result, _, resultErr := s.processPath(&message)
+		result, resultErr := s.processPath(&message)
 
 		if resultErr != nil {
 			err := j{"Status": "NOK", "Error": resultErr.Error()}
@@ -147,7 +158,7 @@ func (s *Service) handleWSConnections(conn *websocket.Conn) {
 }
 
 func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Request) {
-	var message jsonRequestType
+	message := jsonRequestType{}
 	decoder := json.NewDecoder(req.Body)
 	decoderErr := decoder.Decode(&message)
 
@@ -169,8 +180,8 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 		return
 	}
 
-	headers := req.Header
-	token := headers.Get("Token")
+	message.Headers = req.Header
+	token := message.Headers.Get("Token")
 	if s.GetConfig("common.token", "").(string) != "" {
 		if token != s.GetConfig("common.token", "") {
 			err := j{"Status": "NOK", "Error": "Wrong token"}
@@ -181,13 +192,13 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 		}
 	}
 
-	result, statusCode, resultErr := s.processPath(&message)
+	result, resultErr := s.processPath(&message)
 
 	if resultErr != nil {
 		err := j{"Status": "NOK", "Error": resultErr.Error()}
 		errBody, _ := json.Marshal(err)
 		log.Println(err)
-		resp.WriteHeader(statusCode)
+		resp.WriteHeader(result.StatusCode)
 		resp.Write(errBody)
 		return
 	}
@@ -202,18 +213,66 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 		resp.Write(errBody)
 		return
 	}
-	resp.WriteHeader(statusCode)
+
+	resp.WriteHeader(result.StatusCode)
 	resp.Write(body)
 }
 
-func (s *Service) processPath(msg *jsonRequestType) (interface{}, int, error) {
+func (s *Service) processPath(msg *jsonRequestType) (*SaiResponse, error) {
 	h, ok := s.Handlers[msg.Method]
 
 	if !ok {
-		return nil, http.StatusNotFound, errors.New("no handler")
+		return nil, errors.New("no handler")
 	}
 
 	//todo: Rutina na process
 
 	return h.Function(msg.Data)
+}
+
+// get cors options from config
+func (s *Service) getCorsOptions(opts *cors.Options) (*cors.Options, error) {
+	allowOrigin, ok := s.GetConfig("common.cors", []string{"*"}).([]string)
+	if !ok {
+		return nil, fmt.Errorf("wrong type of allow origin value from config, value : %s, type : %s", allowOrigin, reflect.TypeOf(allowOrigin))
+	}
+
+	allowMethods, ok := s.GetConfig("common.methods", []string{"POST", "GET", "OPTIONS", "DELETE"}).([]string)
+	if !ok {
+		return nil, fmt.Errorf("wrong type of allow origin value from config, value : %s, type : %s", allowMethods, reflect.TypeOf(allowMethods))
+	}
+
+	allowHeaders, ok := s.GetConfig("common.headers", []string{"Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization"}).([]string)
+	if !ok {
+		return nil, fmt.Errorf("wrong type of allow origin value from config, value : %s, type : %s", allowHeaders, reflect.TypeOf(allowHeaders))
+	}
+
+	opts.AllowedOrigins = allowOrigin
+	opts.AllowedMethods = allowMethods
+	opts.AllowedHeaders = allowHeaders
+
+	return opts, nil
+}
+
+// return new saiResponse with 200 status code and 'OK' as default
+func NewSaiResponse() *SaiResponse {
+	return &SaiResponse{
+		StatusCode: 200,
+		Data:       "OK",
+	}
+}
+
+// set data to saiResponse
+func (r *SaiResponse) SetData(data interface{}) {
+	r.Data = data
+}
+
+// set status code to saiResponse
+func (r *SaiResponse) SetStatus(statusCode int) {
+	r.StatusCode = statusCode
+}
+
+// add header to saiResponse
+func (r *SaiResponse) AddHeader(key, value string) {
+	r.Headers.Add(key, value)
 }
