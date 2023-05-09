@@ -1,7 +1,6 @@
 package saiService
 
 import (
-	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -21,8 +20,6 @@ func (s *Service) StartHttp() {
 	if err != nil {
 		log.Fatalf("get cors opts from config error: %s", err.Error())
 	}
-
-	fmt.Println(corsOpts)
 
 	mux := http.NewServeMux()
 

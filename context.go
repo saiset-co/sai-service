@@ -44,8 +44,26 @@ func (c *Context) GetConfig(path string, def interface{}) any {
 			return val.(int)
 		case bool:
 			return val.(bool)
-		case []string:
-			return val.([]string)
+		case []interface{}:
+			is := val.([]interface{})
+			if len(is) == 0 {
+				continue
+			}
+			switch is[0].(type) {
+			case string:
+				strSlice := make([]string, 0)
+				for _, v := range is {
+					strSlice = append(strSlice, v.(string))
+				}
+				return strSlice
+			case int:
+				intSlice := make([]int, 0)
+				for _, v := range is {
+					intSlice = append(intSlice, v.(int))
+				}
+				return intSlice
+			}
+
 		default:
 			return def
 		}
