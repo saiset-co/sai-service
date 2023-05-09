@@ -130,7 +130,7 @@ func (s *Service) StartServices() {
 
 	log.Printf("%s has been started!", s.Name)
 
-	s.StartSocket()
+	//s.StartSocket() -- Commented because overload CPU usage
 }
 
 func (s *Service) StartTasks() {
