@@ -115,12 +115,7 @@ func (s *Service) ExecuteCommand(path string, data string) error {
 }
 
 func (s *Service) StartServices() {
-	useHttp := s.GetConfig("common.http.enabled", true).(bool)
 	useWS := s.GetConfig("common.ws.enabled", true).(bool)
-
-	if useHttp {
-		go s.StartHttp()
-	}
 
 	if useWS {
 		go s.StartWS()
@@ -131,6 +126,8 @@ func (s *Service) StartServices() {
 	log.Printf("%s has been started!", s.Name)
 
 	//s.StartSocket() -- Commented because overload CPU usage
+
+	s.StartHttp()
 }
 
 func (s *Service) StartTasks() {
