@@ -1,6 +1,4 @@
 common:
-  socket:
-    port: 8002
   http:
     enabled: true
     port: 8080
