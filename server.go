@@ -21,11 +21,8 @@ func (s *Service) StartHttp() {
 		log.Fatalf("get cors opts from config error: %s", err.Error())
 	}
 
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/", s.handleHttpConnections)
 	c := cors.New(*corsOpts)
-	handler := c.Handler(mux)
+	handler := c.Handler(http.HandlerFunc(s.handleHttpConnections))
 
 	err = http.ListenAndServe(":"+strconv.Itoa(port), handler)
 
