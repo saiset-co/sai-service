@@ -12,11 +12,17 @@ import (
 )
 
 type Request struct {
-	Microservice string      `json:"microservice"`
-	Payload      interface{} `json:"payload"`
+	Method string      `json:"method"`
+	Data   RequestData `json:"data"`
 }
 
-func CreateAuthMiddleware(authServiceURL string, microserviceName string) func(next saiService.HandlerFunc, data interface{}) (interface{}, int, error) {
+type RequestData struct {
+	Microservice string      `json:"microservice"`
+	Method       string      `json:"method"`
+	Data         interface{} `json:"data"`
+}
+
+func CreateAuthMiddleware(authServiceURL string, microserviceName string, method string) func(next saiService.HandlerFunc, data interface{}) (interface{}, int, error) {
 	return func(next saiService.HandlerFunc, data interface{}) (interface{}, int, error) {
 		if authServiceURL == "" {
 			log.Println("authMiddleware: auth service url is empty")
@@ -24,8 +30,12 @@ func CreateAuthMiddleware(authServiceURL string, microserviceName string) func(n
 		}
 
 		authReq := Request{
-			Microservice: microserviceName,
-			Payload:      data,
+			Method: "check",
+			Data: RequestData{
+				Microservice: microserviceName,
+				Method:       method,
+				Data:         data,
+			},
 		}
 
 		jsonData, err := json.Marshal(authReq)
@@ -50,7 +60,17 @@ func CreateAuthMiddleware(authServiceURL string, microserviceName string) func(n
 
 		body, err := ioutil.ReadAll(resp.Body)
 
-		if err != nil || string(body) != "true" {
+		if err != nil {
+			return unauthorizedResponse()
+		}
+
+		var res map[string]string
+		err = json.Unmarshal(body, &res)
+		if err != nil {
+			return unauthorizedResponse()
+		}
+
+		if res["Result"] != "Ok" {
 			return unauthorizedResponse()
 		}
 
