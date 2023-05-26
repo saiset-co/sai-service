@@ -20,6 +20,7 @@ type HandlerElement struct {
 	Name        string
 	Description string
 	Function    HandlerFunc
+	Middlewares []Middleware
 }
 
 type HandlerFunc = func(interface{}) (interface{}, int, error)
@@ -213,7 +214,7 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 }
 
 func (s *Service) applyMiddleware(handler HandlerElement, data interface{}) (interface{}, int, error) {
-	closures := make([]HandlerFunc, len(s.Middlewares)+1)
+	closures := make([]HandlerFunc, len(s.Middlewares)+len(handler.Middlewares)+1)
 	closures[0] = handler.Function
 
 	// Function to create a closure for the middleware with the correct next function
@@ -223,12 +224,23 @@ func (s *Service) applyMiddleware(handler HandlerElement, data interface{}) (int
 		}
 	}
 
+	last := closures[0]
+
 	// Apply global middlewares
-	for i, middleware := range s.Middlewares {
-		closures[i+1] = createMiddlewareClosure(middleware, closures[i])
+	for _, middleware := range s.Middlewares {
+		newClosure := createMiddlewareClosure(middleware, last)
+		last = newClosure
+		closures = append(closures, newClosure)
 	}
 
-	return closures[len(s.Middlewares)](data)
+	// Apply local middlewares
+	for _, middleware := range handler.Middlewares {
+		newClosure := createMiddlewareClosure(middleware, last)
+		last = newClosure
+		closures = append(closures, newClosure)
+	}
+
+	return last(data)
 }
 
 func (s *Service) processPath(msg *JsonRequestType) (interface{}, int, error) {
