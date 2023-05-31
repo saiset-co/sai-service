@@ -27,13 +27,13 @@ func (is InternalService) NewHandler() saiService.Handler {
 }
 
 func (is InternalService) get(data interface{}) (*saiService.SaiResponse, error) {
-	resp := saiService.NewSaiResponse()
+	resp, _ := saiService.NewSaiResponse(data)
 	resp.SetData("Get:" + strconv.Itoa(is.Context.GetConfig("common.http.port", 80).(int)))
 	return resp, nil
 }
 
 func (is InternalService) post(data interface{}) (*saiService.SaiResponse, error) {
-	resp := saiService.NewSaiResponse()
+	resp, _ := saiService.NewSaiResponse()
 	resp.SetData("Post:" + strconv.Itoa(is.Context.GetConfig("common.http.port", 80).(int)))
 	return resp, nil
 }
