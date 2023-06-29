@@ -23,8 +23,8 @@ type RequestData struct {
 	Data         interface{} `json:"data"`
 }
 
-func CreateAuthMiddleware(authServiceURL string, microserviceName string, method string) func(next saiService.HandlerFunc, data interface{}) (interface{}, int, error) {
-	return func(next saiService.HandlerFunc, data interface{}) (interface{}, int, error) {
+func CreateAuthMiddleware(authServiceURL string, microserviceName string, method string) func(next saiService.HandlerFunc, data interface{}, metadata interface{}) (interface{}, int, error) {
+	return func(next saiService.HandlerFunc, data interface{}, metadata interface{}) (interface{}, int, error) {
 		if authServiceURL == "" {
 			log.Println("authMiddleware: auth service url is empty")
 			return unauthorizedResponse("authServiceURL")
@@ -75,7 +75,7 @@ func CreateAuthMiddleware(authServiceURL string, microserviceName string, method
 			return unauthorizedResponse("Result")
 		}
 
-		return next(data)
+		return next(data, metadata)
 	}
 }
 
