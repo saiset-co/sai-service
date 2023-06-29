@@ -20,6 +20,7 @@ type Request struct {
 type RequestData struct {
 	Microservice string      `json:"microservice"`
 	Method       string      `json:"method"`
+	Metadata     interface{} `json:"metadata"`
 	Data         interface{} `json:"data"`
 }
 
@@ -30,12 +31,17 @@ func CreateAuthMiddleware(authServiceURL string, microserviceName string, method
 			return unauthorizedResponse("authServiceURL")
 		}
 
+		dataMap := data.(map[string]interface{})
+		metadataMap := metadata.(map[string]interface{})
+
+		dataMap["token"] = metadataMap["token"]
+
 		authReq := Request{
 			Method: "check",
 			Data: RequestData{
 				Microservice: microserviceName,
 				Method:       method,
-				Data:         data,
+				Data:         dataMap,
 			},
 		}
 
