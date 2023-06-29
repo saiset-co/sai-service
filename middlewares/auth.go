@@ -31,7 +31,12 @@ func CreateAuthMiddleware(authServiceURL string, microserviceName string, method
 			return unauthorizedResponse("authServiceURL")
 		}
 
-		dataMap := data.(map[string]interface{})
+		var dataMap map[string]interface{}
+
+		dataBytes, _ := json.Marshal(data)
+
+		_ = json.Unmarshal(dataBytes, &dataMap)
+
 		metadataMap := metadata.(map[string]interface{})
 
 		dataMap["token"] = metadataMap["token"]
