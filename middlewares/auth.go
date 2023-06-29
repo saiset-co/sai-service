@@ -3,12 +3,13 @@ package middlewares
 import (
 	"bytes"
 	"encoding/json"
-	"github.com/Limpid-LLC/saiService"
-	_ "github.com/Limpid-LLC/saiService"
-	"github.com/pkg/errors"
+	"errors"
 	"io/ioutil"
 	"log"
 	"net/http"
+
+	"github.com/Limpid-LLC/saiService"
+	_ "github.com/Limpid-LLC/saiService"
 )
 
 type Request struct {
@@ -26,7 +27,7 @@ func CreateAuthMiddleware(authServiceURL string, microserviceName string, method
 	return func(next saiService.HandlerFunc, data interface{}) (interface{}, int, error) {
 		if authServiceURL == "" {
 			log.Println("authMiddleware: auth service url is empty")
-			return unauthorizedResponse()
+			return unauthorizedResponse("authServiceURL")
 		}
 
 		authReq := Request{
@@ -41,43 +42,43 @@ func CreateAuthMiddleware(authServiceURL string, microserviceName string, method
 		jsonData, err := json.Marshal(authReq)
 		if err != nil {
 			log.Println("authMiddleware: error marshaling data")
-			return unauthorizedResponse()
+			return unauthorizedResponse("marshaling")
 		}
 
 		req, err := http.NewRequest("POST", authServiceURL, bytes.NewBuffer(jsonData))
 		if err != nil {
 			log.Println("authMiddleware: error creating request")
-			return unauthorizedResponse()
+			return unauthorizedResponse("creating")
 		}
 
 		client := &http.Client{}
 		resp, err := client.Do(req)
 		if err != nil {
 			log.Println("authMiddleware: error sending request to auth")
-			return unauthorizedResponse()
+			return unauthorizedResponse("sending")
 		}
 		defer resp.Body.Close()
 
 		body, err := ioutil.ReadAll(resp.Body)
 
 		if err != nil {
-			return unauthorizedResponse()
+			return unauthorizedResponse("body")
 		}
 
 		var res map[string]string
 		err = json.Unmarshal(body, &res)
 		if err != nil {
-			return unauthorizedResponse()
+			return unauthorizedResponse("Unmarshal")
 		}
 
-		if res["Result"] != "Ok" {
-			return unauthorizedResponse()
+		if res["result"] != "Ok" {
+			return unauthorizedResponse("Result")
 		}
 
 		return next(data)
 	}
 }
 
-func unauthorizedResponse() (interface{}, int, error) {
-	return nil, http.StatusUnauthorized, errors.New("unauthorized")
+func unauthorizedResponse(info string) (interface{}, int, error) {
+	return nil, http.StatusUnauthorized, errors.New("unauthorized:" + info)
 }
