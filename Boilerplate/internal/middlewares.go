@@ -11,16 +11,16 @@ func (is InternalService) NewMiddlewares() []saiService.Middleware {
 		secondMiddleware,
 	}
 }
-func loggingMiddleware(next saiService.HandlerFunc, data interface{}) (interface{}, int, error) {
+func loggingMiddleware(next saiService.HandlerFunc, data interface{}, metadata interface{}) (interface{}, int, error) {
 	log.Println("loggingMiddleware: Request received")
-	result, status, err := next(data)
+	result, status, err := next(data, metadata)
 	log.Println("loggingMiddleware: Request processed")
 	return result, status, err
 }
 
-func secondMiddleware(next saiService.HandlerFunc, data interface{}) (interface{}, int, error) {
+func secondMiddleware(next saiService.HandlerFunc, data interface{}, metadata interface{}) (interface{}, int, error) {
 	log.Println("secondMiddleware: Request received")
-	result, status, err := next(data)
+	result, status, err := next(data, metadata)
 	log.Println("secondMiddleware: Request processed")
 	return result, status, err
 }

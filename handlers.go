@@ -14,7 +14,7 @@ import (
 
 type Handler map[string]HandlerElement
 
-type Middleware func(next HandlerFunc, data interface{}) (interface{}, int, error)
+type Middleware func(next HandlerFunc, data interface{}, metadata interface{}) (interface{}, int, error)
 
 type HandlerElement struct {
 	Name        string
@@ -23,11 +23,12 @@ type HandlerElement struct {
 	Middlewares []Middleware
 }
 
-type HandlerFunc = func(interface{}) (interface{}, int, error)
+type HandlerFunc = func(interface{}, interface{}) (interface{}, int, error)
 
 type JsonRequestType struct {
-	Method string
-	Data   interface{}
+	Method   string
+	Metadata interface{}
+	Data     interface{}
 }
 
 type ErrorResponse map[string]interface{}
@@ -213,14 +214,14 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 	resp.Write(body)
 }
 
-func (s *Service) applyMiddleware(handler HandlerElement, data interface{}) (interface{}, int, error) {
+func (s *Service) applyMiddleware(handler HandlerElement, data interface{}, metadata interface{}) (interface{}, int, error) {
 	closures := make([]HandlerFunc, len(s.Middlewares)+len(handler.Middlewares)+1)
 	closures[0] = handler.Function
 
 	// Function to create a closure for the middleware with the correct next function
 	createMiddlewareClosure := func(middleware Middleware, next HandlerFunc) HandlerFunc {
-		return func(data interface{}) (interface{}, int, error) {
-			return middleware(next, data)
+		return func(data interface{}, metadata interface{}) (interface{}, int, error) {
+			return middleware(next, data, metadata)
 		}
 	}
 
@@ -240,7 +241,7 @@ func (s *Service) applyMiddleware(handler HandlerElement, data interface{}) (int
 		closures = append(closures, newClosure)
 	}
 
-	return last(data)
+	return last(data, metadata)
 }
 
 func (s *Service) processPath(msg *JsonRequestType) (interface{}, int, error) {
@@ -253,5 +254,5 @@ func (s *Service) processPath(msg *JsonRequestType) (interface{}, int, error) {
 	//todo: Rutina na process
 
 	// Apply middleware
-	return s.applyMiddleware(h, msg.Data)
+	return s.applyMiddleware(h, msg.Data, msg.Metadata)
 }
