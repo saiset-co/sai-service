@@ -37,6 +37,11 @@ func CreateAuthMiddleware(authServiceURL string, microserviceName string, method
 
 		_ = json.Unmarshal(dataBytes, &dataMap)
 
+		if metadata == nil {
+			log.Println("authMiddleware: metadata is nil")
+			return unauthorizedResponse("empty metadata")
+		}
+
 		metadataMap := metadata.(map[string]interface{})
 
 		dataMap["token"] = metadataMap["token"]
