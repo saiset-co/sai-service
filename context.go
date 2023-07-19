@@ -25,23 +25,25 @@ func (c *Context) GetConfig(path string, def interface{}) any {
 	steps := strings.Split(path, ".")
 	configuration := c.Configuration
 
+	if len(steps) == 0 {
+		return def
+	}
+
 	for _, step := range steps {
-		val, _ := configuration[step]
+		val, ok := configuration[step]
+
+		if !ok {
+			return def
+		}
 
 		switch val.(type) {
 		case map[string]interface{}:
 			configuration = val.(map[string]interface{})
 			break
-		case string:
-			return val.(string)
-		case int:
-			return val.(int)
-		case bool:
-			return val.(bool)
 		default:
-			return def
+			return val
 		}
 	}
 
-	return def
+	return configuration
 }
