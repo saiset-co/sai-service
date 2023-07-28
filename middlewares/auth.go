@@ -63,12 +63,14 @@ func CreateAuthMiddleware(authServiceURL string, microserviceName string, method
 		jsonData, err := json.Marshal(authReq)
 		if err != nil {
 			log.Println("authMiddleware: error marshaling data")
+			log.Println("authMiddleware: " + err.Error())
 			return unauthorizedResponse("marshaling")
 		}
 
 		req, err := http.NewRequest("POST", authServiceURL, bytes.NewBuffer(jsonData))
 		if err != nil {
 			log.Println("authMiddleware: error creating request")
+			log.Println("authMiddleware: " + err.Error())
 			return unauthorizedResponse("creating")
 		}
 
@@ -76,6 +78,7 @@ func CreateAuthMiddleware(authServiceURL string, microserviceName string, method
 		resp, err := client.Do(req)
 		if err != nil {
 			log.Println("authMiddleware: error sending request to auth")
+			log.Println("authMiddleware: " + err.Error())
 			return unauthorizedResponse("sending")
 		}
 		defer resp.Body.Close()
@@ -83,16 +86,22 @@ func CreateAuthMiddleware(authServiceURL string, microserviceName string, method
 		body, err := ioutil.ReadAll(resp.Body)
 
 		if err != nil {
+			log.Println("authMiddleware: error reading body from auth")
+			log.Println("authMiddleware: " + err.Error())
 			return unauthorizedResponse("body")
 		}
 
 		var res map[string]string
 		err = json.Unmarshal(body, &res)
 		if err != nil {
+			log.Println("authMiddleware: error unmarshalling body from auth")
+			log.Println("authMiddleware: " + err.Error())
 			return unauthorizedResponse("Unmarshal")
 		}
 
 		if res["result"] != "Ok" {
+			log.Println("authMiddleware: response-body -> result is not `Ok`")
+			log.Println("authMiddleware: " + string(body))
 			return unauthorizedResponse("Result")
 		}
 
