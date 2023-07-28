@@ -64,14 +64,14 @@ func CreateAuthMiddleware(authServiceURL string, microserviceName string, method
 		if err != nil {
 			log.Println("authMiddleware: error marshaling data")
 			log.Println("authMiddleware: " + err.Error())
-			return unauthorizedResponse("marshaling")
+			return unauthorizedResponse("marshaling -> " + err.Error())
 		}
 
 		req, err := http.NewRequest("POST", authServiceURL, bytes.NewBuffer(jsonData))
 		if err != nil {
 			log.Println("authMiddleware: error creating request")
 			log.Println("authMiddleware: " + err.Error())
-			return unauthorizedResponse("creating")
+			return unauthorizedResponse("creating request -> " + err.Error())
 		}
 
 		client := &http.Client{}
@@ -79,7 +79,7 @@ func CreateAuthMiddleware(authServiceURL string, microserviceName string, method
 		if err != nil {
 			log.Println("authMiddleware: error sending request to auth")
 			log.Println("authMiddleware: " + err.Error())
-			return unauthorizedResponse("sending")
+			return unauthorizedResponse("sending request -> " + err.Error())
 		}
 		defer resp.Body.Close()
 
@@ -88,7 +88,7 @@ func CreateAuthMiddleware(authServiceURL string, microserviceName string, method
 		if err != nil {
 			log.Println("authMiddleware: error reading body from auth")
 			log.Println("authMiddleware: " + err.Error())
-			return unauthorizedResponse("body")
+			return unauthorizedResponse("reading body -> " + err.Error())
 		}
 
 		var res map[string]string
@@ -96,13 +96,13 @@ func CreateAuthMiddleware(authServiceURL string, microserviceName string, method
 		if err != nil {
 			log.Println("authMiddleware: error unmarshalling body from auth")
 			log.Println("authMiddleware: " + err.Error())
-			return unauthorizedResponse("Unmarshal")
+			return unauthorizedResponse("Unmarshal -> " + err.Error())
 		}
 
 		if res["result"] != "Ok" {
 			log.Println("authMiddleware: response-body -> result is not `Ok`")
 			log.Println("authMiddleware: " + string(body))
-			return unauthorizedResponse("Result")
+			return unauthorizedResponse("Result -> " + string(body))
 		}
 
 		return next(data, metadata)
