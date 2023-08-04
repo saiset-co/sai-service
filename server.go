@@ -1,12 +1,12 @@
 package saiService
 
 import (
-	"github.com/rs/cors"
 	"log"
 	"net"
 	"net/http"
 	"strconv"
 
+	"github.com/rs/cors"
 	"golang.org/x/net/websocket"
 )
 
@@ -14,11 +14,13 @@ func (s *Service) StartHttp() {
 	port := s.GetConfig("common.http.port", 8080).(int)
 	log.Println("Http server has been started:", port)
 	handler := http.HandlerFunc(s.handleHttpConnections)
+	healthHandler := http.HandlerFunc(s.healthCheck)
 
 	// Wrap the handler with the cors handler
 	corsHandler := cors.AllowAll().Handler(handler)
 
 	http.Handle("/", corsHandler)
+	http.Handle("/check", healthHandler)
 
 	err := http.ListenAndServe(":"+strconv.Itoa(port), nil)
 
