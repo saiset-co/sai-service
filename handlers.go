@@ -152,6 +152,14 @@ func (s *Service) handleWSConnections(conn *websocket.Conn) {
 	}
 }
 
+func (s *Service) healthCheck(resp http.ResponseWriter, req *http.Request) {
+	data := map[string]interface{}{"Status": "OK"}
+	body, _ := json.Marshal(data)
+	resp.WriteHeader(http.StatusOK)
+	resp.Write(body)
+	return
+}
+
 func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Request) {
 	var message JsonRequestType
 	decoder := json.NewDecoder(req.Body)
