@@ -15,12 +15,14 @@ func (s *Service) StartHttp() {
 	log.Println("Http server has been started:", port)
 	handler := http.HandlerFunc(s.handleHttpConnections)
 	healthHandler := http.HandlerFunc(s.healthCheck)
+	versionHandler := http.HandlerFunc(s.versionCheck)
 
 	// Wrap the handler with the cors handler
 	corsHandler := cors.AllowAll().Handler(handler)
 
 	http.Handle("/", corsHandler)
 	http.Handle("/check", healthHandler)
+	http.Handle("/version", versionHandler)
 
 	err := http.ListenAndServe(":"+strconv.Itoa(port), nil)
 
