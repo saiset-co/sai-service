@@ -5,11 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"golang.org/x/net/websocket"
 	"log"
 	"net"
 	"net/http"
-
-	"golang.org/x/net/websocket"
 )
 
 type Handler map[string]HandlerElement
@@ -154,6 +153,17 @@ func (s *Service) handleWSConnections(conn *websocket.Conn) {
 
 func (s *Service) healthCheck(resp http.ResponseWriter, req *http.Request) {
 	data := map[string]interface{}{"Status": "OK"}
+	body, _ := json.Marshal(data)
+	resp.WriteHeader(http.StatusOK)
+	resp.Write(body)
+	return
+}
+
+func (s *Service) versionCheck(resp http.ResponseWriter, req *http.Request) {
+	data := map[string]interface{}{
+		"Version": s.GetConfig("common.version", "0.1").(string),
+		"Built":   s.GetBuild("no build date"),
+	}
 	body, _ := json.Marshal(data)
 	resp.WriteHeader(http.StatusOK)
 	resp.Write(body)
