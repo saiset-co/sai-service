@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 
 	"golang.org/x/net/websocket"
 )
@@ -27,7 +28,7 @@ type HandlerFunc = func(interface{}, interface{}) (interface{}, int, error)
 
 type JsonRequestType struct {
 	Method   string
-	Metadata interface{}
+	Metadata map[string]interface{}
 	Data     interface{}
 }
 
@@ -160,10 +161,22 @@ func (s *Service) healthCheck(resp http.ResponseWriter, req *http.Request) {
 	return
 }
 
+func (s *Service) versionCheck(resp http.ResponseWriter, req *http.Request) {
+	data := map[string]interface{}{
+		"Version": s.GetConfig("common.version", "0.1").(string),
+		"Built":   s.GetBuild("no build date"),
+	}
+	body, _ := json.Marshal(data)
+	resp.WriteHeader(http.StatusOK)
+	resp.Write(body)
+	return
+}
+
 func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Request) {
 	var message JsonRequestType
 	decoder := json.NewDecoder(req.Body)
 	decoderErr := decoder.Decode(&message)
+	message.Metadata["ip"] = s.getHttpIP(req)
 
 	resp.Header().Set("Content-Type", "application/json")
 
@@ -263,4 +276,33 @@ func (s *Service) processPath(msg *JsonRequestType) (interface{}, int, error) {
 
 	// Apply middleware
 	return s.applyMiddleware(h, msg.Data, msg.Metadata)
+}
+
+func (s *Service) getHttpIP(r *http.Request) string {
+	ip := r.Header.Get("X-REAL-IP")
+	netIP := net.ParseIP(ip)
+	if netIP != nil {
+		return ip
+	}
+
+	ips := r.Header.Get("X-FORWARDED-FOR")
+	splitIps := strings.Split(ips, ",")
+	for _, ip := range splitIps {
+		netIP := net.ParseIP(ip)
+		if netIP != nil {
+			return ip
+		}
+	}
+
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return ""
+	}
+
+	netIP = net.ParseIP(ip)
+	if netIP != nil {
+		return ip
+	}
+
+	return ""
 }
