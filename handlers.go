@@ -9,6 +9,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
+
+	"golang.org/x/net/websocket"
 )
 
 type Handler map[string]HandlerElement
@@ -26,7 +29,7 @@ type HandlerFunc = func(interface{}, interface{}) (interface{}, int, error)
 
 type JsonRequestType struct {
 	Method   string
-	Metadata interface{}
+	Metadata map[string]interface{}
 	Data     interface{}
 }
 
@@ -174,6 +177,7 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 	var message JsonRequestType
 	decoder := json.NewDecoder(req.Body)
 	decoderErr := decoder.Decode(&message)
+	message.Metadata["ip"] = s.getHttpIP(req)
 
 	resp.Header().Set("Content-Type", "application/json")
 
@@ -273,4 +277,33 @@ func (s *Service) processPath(msg *JsonRequestType) (interface{}, int, error) {
 
 	// Apply middleware
 	return s.applyMiddleware(h, msg.Data, msg.Metadata)
+}
+
+func (s *Service) getHttpIP(r *http.Request) string {
+	ip := r.Header.Get("X-REAL-IP")
+	netIP := net.ParseIP(ip)
+	if netIP != nil {
+		return ip
+	}
+
+	ips := r.Header.Get("X-FORWARDED-FOR")
+	splitIps := strings.Split(ips, ",")
+	for _, ip := range splitIps {
+		netIP := net.ParseIP(ip)
+		if netIP != nil {
+			return ip
+		}
+	}
+
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return ""
+	}
+
+	netIP = net.ParseIP(ip)
+	if netIP != nil {
+		return ip
+	}
+
+	return ""
 }
