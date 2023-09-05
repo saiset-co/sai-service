@@ -10,8 +10,6 @@ import (
 	"net"
 	"net/http"
 	"strings"
-
-	"golang.org/x/net/websocket"
 )
 
 type Handler map[string]HandlerElement
