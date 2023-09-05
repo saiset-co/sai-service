@@ -66,6 +66,17 @@ func (s *Service) GetConfig(path string, def interface{}) interface{} {
 	return s.Context.GetConfig(path, def)
 }
 
+func (s *Service) GetBuild(def string) string {
+	buildData, err := ioutil.ReadFile("build.info")
+
+	if err != nil {
+		log.Printf("yamlErr:  %v", err)
+		return def
+	}
+
+	return string(buildData)
+}
+
 func (s *Service) Start() {
 	if s.InitTask != nil {
 		s.InitTask()
