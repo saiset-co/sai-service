@@ -175,6 +175,10 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 	var message JsonRequestType
 	decoder := json.NewDecoder(req.Body)
 	decoderErr := decoder.Decode(&message)
+	if message.Metadata == nil {
+		message.Metadata = map[string]interface{}{}
+	}
+
 	message.Metadata["ip"] = s.getHttpIP(req)
 
 	resp.Header().Set("Content-Type", "application/json")
