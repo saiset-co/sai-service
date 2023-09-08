@@ -30,9 +30,9 @@ type (
 	}
 
 	SaiResponse struct {
-		Data       interface{}
-		StatusCode int
-		Headers    http.Header
+		Data       interface{} `json:"Data,omitempty"`
+		StatusCode int         `json:"StatusCode,omitempty"`
+		Headers    http.Header `json:"Headers,omitempty"`
 	}
 
 	j map[string]interface{}
@@ -255,7 +255,7 @@ func (s *Service) getCorsOptions(opts *cors.Options) (*cors.Options, error) {
 }
 
 // return new saiResponse with 200 status code and 'OK' as default
-func NewSaiResponse() *SaiResponse {
+func DefaultSaiResponse() *SaiResponse {
 	return &SaiResponse{
 		StatusCode: 200,
 		Data:       "OK",
@@ -275,4 +275,46 @@ func (r *SaiResponse) SetStatus(statusCode int) {
 // add header to saiResponse
 func (r *SaiResponse) AddHeader(key, value string) {
 	r.Headers.Add(key, value)
+}
+
+// return saiResponse depends on params count
+func NewSaiResponse(params ...interface{}) (*SaiResponse, error) {
+	if len(params) == 0 {
+		return DefaultSaiResponse(), nil
+	}
+	resp := &SaiResponse{}
+
+	if len(params) == 1 {
+		resp.SetData(params[0])
+		resp.SetStatus(http.StatusOK)
+		return resp, nil
+	}
+
+	if len(params) == 2 {
+		resp.SetData(params[0])
+		status, ok := params[1].(int)
+		if !ok {
+			return nil, fmt.Errorf("ReturnSaiResponse - wrong status param, want = int, have = %s", reflect.TypeOf(status).String())
+		}
+		resp.SetStatus(status)
+		return resp, nil
+	}
+
+	if len(params) == 3 {
+		resp.SetData(params[0])
+		status, ok := params[1].(int)
+		if !ok {
+			return nil, fmt.Errorf("ReturnSaiResponse - wrong status param, want = int, have = %s", reflect.TypeOf(status).String())
+		}
+		resp.SetStatus(status)
+		headers, ok := params[2].(http.Header)
+		if !ok {
+			return nil, fmt.Errorf("ReturnSaiResponse - wrong headers param, want = http.Header, have = %s", reflect.TypeOf(headers).String())
+		}
+		resp.Headers = headers
+		return resp, nil
+	}
+
+	return nil, fmt.Errorf("ReturnSaiResponse - wrong params count, want equal or less than 3, got = %d", len(params))
+
 }
