@@ -1,18 +1,9 @@
 common:
-  socket:
-    port: 8002
   http:
     enabled: true
     port: 8080
   ws:
     enabled: true
-    port: 8082
-  cors: ["*"]
-  methods: ["POST","GET","OPTIONS","DELETE"]
-  headers: ["Accept", "Content-Type", "Content-Length", "Accept-Encoding", "X-CSRF-Token", "Authorization"]
-  profiling: true
-  profiling_port: 8084
-
-
+    port: 8081
 
 test: " TEST"

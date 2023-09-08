@@ -7,24 +7,24 @@ import (
 	"strconv"
 
 	"github.com/rs/cors"
-
 	"golang.org/x/net/websocket"
 )
 
 func (s *Service) StartHttp() {
 	port := s.GetConfig("common.http.port", 8080).(int)
 	log.Println("Http server has been started:", port)
+	handler := http.HandlerFunc(s.handleHttpConnections)
+	healthHandler := http.HandlerFunc(s.healthCheck)
+	versionHandler := http.HandlerFunc(s.versionCheck)
 
-	defaultOpts := &cors.Options{}
-	corsOpts, err := s.getCorsOptions(defaultOpts)
-	if err != nil {
-		log.Fatalf("get cors opts from config error: %s", err.Error())
-	}
+	// Wrap the handler with the cors handler
+	corsHandler := cors.AllowAll().Handler(handler)
 
-	c := cors.New(*corsOpts)
-	handler := c.Handler(http.HandlerFunc(s.handleHttpConnections))
+	http.Handle("/", corsHandler)
+	http.Handle("/check", healthHandler)
+	http.Handle("/version", versionHandler)
 
-	err = http.ListenAndServe(":"+strconv.Itoa(port), handler)
+	err := http.ListenAndServe(":"+strconv.Itoa(port), nil)
 
 	if err != nil {
 		log.Println("Http server error: ", err)

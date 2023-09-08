@@ -30,7 +30,7 @@ svc.RegisterTasks([]func(){
   // another call here  
 })  
 ```
-6. To define HTTP, Socket or CLI endpoints you can write code in the internal/handlers.go "NewHandler" function.
+6. To define HTTP, WebSocket or CLI endpoints you can write code in the internal/handlers.go "NewHandler" function.
 ```
 func (is InternalService) NewHandler() saiService.Handler {  
   return saiService.Handler{  

@@ -5,59 +5,54 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"golang.org/x/net/websocket"
 	"log"
 	"net"
 	"net/http"
-	"reflect"
-
-	"github.com/rs/cors"
-	"golang.org/x/net/websocket"
+	"strings"
 )
 
-type (
-	Handler map[string]HandlerElement
+type Handler map[string]HandlerElement
 
-	HandlerElement struct {
-		Name        string // name to execute, can be path
-		Description string
-		Function    func(interface{}) (*SaiResponse, error)
-	}
+type Middleware func(next HandlerFunc, data interface{}, metadata interface{}) (interface{}, int, error)
 
-	jsonRequestType struct {
-		Method  string
-		Headers http.Header
-		Data    interface{}
-	}
+type HandlerElement struct {
+	Name        string
+	Description string
+	Function    HandlerFunc
+	Middlewares []Middleware
+}
 
-	SaiResponse struct {
-		Data       interface{} `json:"Data,omitempty"`
-		StatusCode int         `json:"StatusCode,omitempty"`
-		Headers    http.Header `json:"Headers,omitempty"`
-	}
+type HandlerFunc = func(interface{}, interface{}) (interface{}, int, error)
 
-	j map[string]interface{}
-)
+type JsonRequestType struct {
+	Method   string
+	Metadata map[string]interface{}
+	Data     interface{}
+}
+
+type ErrorResponse map[string]interface{}
 
 func (s *Service) handleSocketConnections(conn net.Conn) {
 	for {
-		var message jsonRequestType
+		var message JsonRequestType
 		socketMessage, _ := bufio.NewReader(conn).ReadString('\n')
 
 		if socketMessage != "" {
 			_ = json.Unmarshal([]byte(socketMessage), &message)
 
 			if message.Method == "" {
-				err := j{"Status": "NOK", "Error": "Wrong message format"}
+				err := ErrorResponse{"Status": "NOK", "Error": "Wrong message format"}
 				errBody, _ := json.Marshal(err)
 				log.Println(err)
 				conn.Write(append(errBody, eos...))
 				continue
 			}
 
-			result, resultErr := s.processPath(&message)
+			result, _, resultErr := s.processPath(&message)
 
 			if resultErr != nil {
-				err := j{"Status": "NOK", "Error": resultErr.Error()}
+				err := ErrorResponse{"Status": "NOK", "Error": resultErr.Error()}
 				errBody, _ := json.Marshal(err)
 				log.Println(err)
 				conn.Write(append(errBody, eos...))
@@ -67,7 +62,7 @@ func (s *Service) handleSocketConnections(conn net.Conn) {
 			body, marshalErr := json.Marshal(result)
 
 			if marshalErr != nil {
-				err := j{"Status": "NOK", "Error": marshalErr.Error()}
+				err := ErrorResponse{"Status": "NOK", "Error": marshalErr.Error()}
 				errBody, _ := json.Marshal(err)
 				log.Println(err)
 				conn.Write(append(errBody, eos...))
@@ -82,7 +77,7 @@ func (s *Service) handleSocketConnections(conn net.Conn) {
 // handle cli command
 func (s *Service) handleCliCommand(data []byte) ([]byte, error) {
 
-	var message jsonRequestType
+	var message JsonRequestType
 	if len(data) == 0 {
 		return nil, fmt.Errorf("empty data provided")
 	}
@@ -97,7 +92,7 @@ func (s *Service) handleCliCommand(data []byte) ([]byte, error) {
 
 	}
 
-	result, err := s.processPath(&message)
+	result, _, err := s.processPath(&message)
 	if err != nil {
 		return nil, err
 	}
@@ -112,36 +107,36 @@ func (s *Service) handleCliCommand(data []byte) ([]byte, error) {
 
 func (s *Service) handleWSConnections(conn *websocket.Conn) {
 	for {
-		message := jsonRequestType{}
+		var message JsonRequestType
 		if rErr := websocket.JSON.Receive(conn, &message); rErr != nil {
-			err := j{"Status": "NOK", "Error": "Wrong message format"}
+			err := ErrorResponse{"Status": "NOK", "Error": "Wrong message format"}
 			log.Println(err)
 			websocket.JSON.Send(conn, err)
 			continue
 		}
 
 		if message.Method == "" {
-			err := j{"Status": "NOK", "Error": "Wrong message format"}
+			err := ErrorResponse{"Status": "NOK", "Error": "Wrong message format"}
 			log.Println(err)
 			websocket.JSON.Send(conn, err)
 			continue
 		}
 
-		message.Headers = conn.Request().Header
-		token := message.Headers.Get("Token")
+		headers := conn.Request().Header
+		token := headers.Get("Token")
 		if s.GetConfig("token", "").(string) != "" {
 			if token != s.GetConfig("token", "") {
-				err := j{"Status": "NOK", "Error": "Wrong token"}
+				err := ErrorResponse{"Status": "NOK", "Error": "Wrong token"}
 				log.Println(err)
 				websocket.JSON.Send(conn, err)
 				continue
 			}
 		}
 
-		result, resultErr := s.processPath(&message)
+		result, _, resultErr := s.processPath(&message)
 
 		if resultErr != nil {
-			err := j{"Status": "NOK", "Error": resultErr.Error()}
+			err := ErrorResponse{"Status": "NOK", "Error": resultErr.Error()}
 			log.Println(err)
 			websocket.JSON.Send(conn, err)
 			continue
@@ -150,20 +145,46 @@ func (s *Service) handleWSConnections(conn *websocket.Conn) {
 		sErr := websocket.JSON.Send(conn, result)
 
 		if sErr != nil {
-			err := j{"Status": "NOK", "Error": sErr.Error()}
+			err := ErrorResponse{"Status": "NOK", "Error": sErr.Error()}
 			log.Println(err)
 			websocket.JSON.Send(conn, err)
 		}
 	}
 }
 
+func (s *Service) healthCheck(resp http.ResponseWriter, req *http.Request) {
+	data := map[string]interface{}{"Status": "OK"}
+	body, _ := json.Marshal(data)
+	resp.WriteHeader(http.StatusOK)
+	resp.Write(body)
+	return
+}
+
+func (s *Service) versionCheck(resp http.ResponseWriter, req *http.Request) {
+	data := map[string]interface{}{
+		"Version": s.GetConfig("common.version", "0.1").(string),
+		"Built":   s.GetBuild("no build date"),
+	}
+	body, _ := json.Marshal(data)
+	resp.WriteHeader(http.StatusOK)
+	resp.Write(body)
+	return
+}
+
 func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Request) {
-	message := jsonRequestType{}
+	var message JsonRequestType
 	decoder := json.NewDecoder(req.Body)
 	decoderErr := decoder.Decode(&message)
+	if message.Metadata == nil {
+		message.Metadata = map[string]interface{}{}
+	}
+
+	message.Metadata["ip"] = s.getHttpIP(req)
+
+	resp.Header().Set("Content-Type", "application/json")
 
 	if decoderErr != nil {
-		err := j{"Status": "NOK", "Error": decoderErr.Error()}
+		err := ErrorResponse{"Status": "NOK", "Error": decoderErr.Error()}
 		errBody, _ := json.Marshal(err)
 		log.Println(err)
 		resp.WriteHeader(http.StatusBadRequest)
@@ -172,7 +193,7 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 	}
 
 	if message.Method == "" {
-		err := j{"Status": "NOK", "Error": "Wrong message format"}
+		err := ErrorResponse{"Status": "NOK", "Error": "Wrong message format"}
 		errBody, _ := json.Marshal(err)
 		log.Println(err)
 		resp.WriteHeader(http.StatusBadRequest)
@@ -180,11 +201,11 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 		return
 	}
 
-	message.Headers = req.Header
-	token := message.Headers.Get("Token")
+	headers := req.Header
+	token := headers.Get("Token")
 	if s.GetConfig("common.token", "").(string) != "" {
 		if token != s.GetConfig("common.token", "") {
-			err := j{"Status": "NOK", "Error": "Wrong token"}
+			err := ErrorResponse{"Status": "NOK", "Error": "Wrong token"}
 			errBody, _ := json.Marshal(err)
 			log.Println(err)
 			resp.WriteHeader(http.StatusUnauthorized)
@@ -192,13 +213,13 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 		}
 	}
 
-	result, resultErr := s.processPath(&message)
+	result, statusCode, resultErr := s.processPath(&message)
 
 	if resultErr != nil {
-		err := j{"Status": "NOK", "Error": resultErr.Error()}
+		err := ErrorResponse{"Status": "NOK", "Error": resultErr.Error()}
 		errBody, _ := json.Marshal(err)
 		log.Println(err)
-		resp.WriteHeader(result.StatusCode)
+		resp.WriteHeader(statusCode)
 		resp.Write(errBody)
 		return
 	}
@@ -206,115 +227,85 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 	body, marshalErr := json.Marshal(result)
 
 	if marshalErr != nil {
-		err := j{"Status": "NOK", "Error": marshalErr.Error()}
+		err := ErrorResponse{"Status": "NOK", "Error": marshalErr.Error()}
 		errBody, _ := json.Marshal(err)
 		log.Println(err)
 		resp.WriteHeader(http.StatusInternalServerError)
 		resp.Write(errBody)
 		return
 	}
-
-	resp.WriteHeader(result.StatusCode)
+	resp.WriteHeader(statusCode)
 	resp.Write(body)
 }
 
-func (s *Service) processPath(msg *jsonRequestType) (*SaiResponse, error) {
+func (s *Service) applyMiddleware(handler HandlerElement, data interface{}, metadata interface{}) (interface{}, int, error) {
+	closures := make([]HandlerFunc, len(s.Middlewares)+len(handler.Middlewares)+1)
+	closures[0] = handler.Function
+
+	// Function to create a closure for the middleware with the correct next function
+	createMiddlewareClosure := func(middleware Middleware, next HandlerFunc) HandlerFunc {
+		return func(data interface{}, metadata interface{}) (interface{}, int, error) {
+			return middleware(next, data, metadata)
+		}
+	}
+
+	last := closures[0]
+
+	// Apply global middlewares
+	for _, middleware := range s.Middlewares {
+		newClosure := createMiddlewareClosure(middleware, last)
+		last = newClosure
+		closures = append(closures, newClosure)
+	}
+
+	// Apply local middlewares
+	for _, middleware := range handler.Middlewares {
+		newClosure := createMiddlewareClosure(middleware, last)
+		last = newClosure
+		closures = append(closures, newClosure)
+	}
+
+	return last(data, metadata)
+}
+
+func (s *Service) processPath(msg *JsonRequestType) (interface{}, int, error) {
 	h, ok := s.Handlers[msg.Method]
 
 	if !ok {
-		return nil, errors.New("no handler")
+		return nil, http.StatusNotFound, errors.New("no handler")
 	}
 
 	//todo: Rutina na process
 
-	return h.Function(msg.Data)
+	// Apply middleware
+	return s.applyMiddleware(h, msg.Data, msg.Metadata)
 }
 
-// get cors options from config
-func (s *Service) getCorsOptions(opts *cors.Options) (*cors.Options, error) {
-	allowOrigin, ok := s.GetConfig("common.cors", []string{"*"}).([]string)
-	if !ok {
-		return nil, fmt.Errorf("wrong type of allow origin value from config, value : %s, type : %s", allowOrigin, reflect.TypeOf(allowOrigin))
+func (s *Service) getHttpIP(r *http.Request) string {
+	ip := r.Header.Get("X-REAL-IP")
+	netIP := net.ParseIP(ip)
+	if netIP != nil {
+		return ip
 	}
 
-	allowMethods, ok := s.GetConfig("common.methods", []string{"POST", "GET", "OPTIONS", "DELETE"}).([]string)
-	if !ok {
-		return nil, fmt.Errorf("wrong type of allow origin value from config, value : %s, type : %s", allowMethods, reflect.TypeOf(allowMethods))
-	}
-
-	allowHeaders, ok := s.GetConfig("common.headers", []string{"Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization"}).([]string)
-	if !ok {
-		return nil, fmt.Errorf("wrong type of allow origin value from config, value : %s, type : %s", allowHeaders, reflect.TypeOf(allowHeaders))
-	}
-
-	opts.AllowedOrigins = allowOrigin
-	opts.AllowedMethods = allowMethods
-	opts.AllowedHeaders = allowHeaders
-
-	return opts, nil
-}
-
-// return new saiResponse with 200 status code and 'OK' as default
-func DefaultSaiResponse() *SaiResponse {
-	return &SaiResponse{
-		StatusCode: 200,
-		Data:       "OK",
-	}
-}
-
-// set data to saiResponse
-func (r *SaiResponse) SetData(data interface{}) {
-	r.Data = data
-}
-
-// set status code to saiResponse
-func (r *SaiResponse) SetStatus(statusCode int) {
-	r.StatusCode = statusCode
-}
-
-// add header to saiResponse
-func (r *SaiResponse) AddHeader(key, value string) {
-	r.Headers.Add(key, value)
-}
-
-// return saiResponse depends on params count
-func NewSaiResponse(params ...interface{}) (*SaiResponse, error) {
-	if len(params) == 0 {
-		return DefaultSaiResponse(), nil
-	}
-	resp := &SaiResponse{}
-
-	if len(params) == 1 {
-		resp.SetData(params[0])
-		resp.SetStatus(http.StatusOK)
-		return resp, nil
-	}
-
-	if len(params) == 2 {
-		resp.SetData(params[0])
-		status, ok := params[1].(int)
-		if !ok {
-			return nil, fmt.Errorf("ReturnSaiResponse - wrong status param, want = int, have = %s", reflect.TypeOf(status).String())
+	ips := r.Header.Get("X-FORWARDED-FOR")
+	splitIps := strings.Split(ips, ",")
+	for _, ip := range splitIps {
+		netIP := net.ParseIP(ip)
+		if netIP != nil {
+			return ip
 		}
-		resp.SetStatus(status)
-		return resp, nil
 	}
 
-	if len(params) == 3 {
-		resp.SetData(params[0])
-		status, ok := params[1].(int)
-		if !ok {
-			return nil, fmt.Errorf("ReturnSaiResponse - wrong status param, want = int, have = %s", reflect.TypeOf(status).String())
-		}
-		resp.SetStatus(status)
-		headers, ok := params[2].(http.Header)
-		if !ok {
-			return nil, fmt.Errorf("ReturnSaiResponse - wrong headers param, want = http.Header, have = %s", reflect.TypeOf(headers).String())
-		}
-		resp.Headers = headers
-		return resp, nil
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return ""
 	}
 
-	return nil, fmt.Errorf("ReturnSaiResponse - wrong params count, want equal or less than 3, got = %d", len(params))
+	netIP = net.ParseIP(ip)
+	if netIP != nil {
+		return ip
+	}
 
+	return ""
 }

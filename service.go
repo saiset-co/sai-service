@@ -12,12 +12,13 @@ import (
 )
 
 type Service struct {
-	Name     string
-	Context  *Context
-	Handlers Handler
-	Tasks    []func()
-	InitTask func()
-	Logger   *zap.Logger
+	Name        string
+	Context     *Context
+	Handlers    Handler
+	Tasks       []func()
+	InitTask    func()
+	Logger      *zap.Logger
+	Middlewares []Middleware
 }
 
 var svc = new(Service)
@@ -41,13 +42,16 @@ func (s *Service) RegisterConfig(path string) {
 	if err != nil {
 		log.Fatalf("yamlErr: %v", err)
 	}
-
 	svc.SetLogger()
 	svc.Context.SetValue("logger", svc.Logger)
 }
 
 func (s *Service) RegisterHandlers(handlers Handler) {
 	s.Handlers = handlers
+}
+
+func (s *Service) RegisterMiddlewares(middlewares []Middleware) {
+	s.Middlewares = middlewares
 }
 
 func (s *Service) RegisterTasks(tasks []func()) {
@@ -60,6 +64,17 @@ func (s *Service) RegisterInitTask(initTask func()) {
 
 func (s *Service) GetConfig(path string, def interface{}) interface{} {
 	return s.Context.GetConfig(path, def)
+}
+
+func (s *Service) GetBuild(def string) string {
+	buildData, err := ioutil.ReadFile("build.info")
+
+	if err != nil {
+		log.Printf("yamlErr:  %v", err)
+		return def
+	}
+
+	return string(buildData)
 }
 
 func (s *Service) Start() {
@@ -126,7 +141,9 @@ func (s *Service) StartServices() {
 
 	log.Printf("%s has been started!", s.Name)
 
-	s.StartSocket()
+	//s.StartSocket() -- Commented because overload CPU usage
+
+	select {}
 }
 
 func (s *Service) StartTasks() {
