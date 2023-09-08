@@ -2,7 +2,7 @@ module Boilerplate
 
 go 1.18
 
-require github.com/Limpid-LLC/saiService v1.4.0
+require github.com/saiset-co/saiService v1.4.0
 
 require (
 	github.com/cpuguy83/go-md2man/v2 v2.0.2 // indirect
@@ -17,4 +17,4 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/Limpid-LLC/saiService => ../
+replace github.com/saiset-co/saiService => ../

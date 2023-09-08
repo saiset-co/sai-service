@@ -2,7 +2,7 @@ package main
 
 import (
 	"Boilerplate/internal"
-	"github.com/Limpid-LLC/saiService"
+	"github.com/saiset-co/saiService"
 )
 
 func main() {
