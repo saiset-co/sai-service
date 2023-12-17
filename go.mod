@@ -1,4 +1,4 @@
-module github.com/saiset-co/saiService
+module github.com/Limpid-LLC/saiService
 
 go 1.18
 
