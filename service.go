@@ -2,7 +2,7 @@ package saiService
 
 import (
 	"fmt"
-	"io/ioutil"
+	"go.uber.org/zap/zapcore"
 	"log"
 	"os"
 
@@ -31,7 +31,7 @@ func NewService(name string) *Service {
 }
 
 func (s *Service) RegisterConfig(path string) {
-	yamlData, err := ioutil.ReadFile(path)
+	yamlData, err := os.ReadFile(path)
 
 	if err != nil {
 		log.Printf("yamlErr:  %v", err)
@@ -67,7 +67,7 @@ func (s *Service) GetConfig(path string, def interface{}) interface{} {
 }
 
 func (s *Service) GetBuild(def string) string {
-	buildData, err := ioutil.ReadFile("build.info")
+	buildData, err := os.ReadFile("build.info")
 
 	if err != nil {
 		log.Printf("yamlErr:  %v", err)
@@ -153,26 +153,19 @@ func (s *Service) StartTasks() {
 }
 
 func (s *Service) SetLogger() {
-	var (
-		logger *zap.Logger
-		err    error
-	)
+	var logger *zap.Logger
 
-	mode := s.GetConfig("common.log_mode", "debug")
-	if mode == "debug" {
-		logger, err = zap.NewDevelopment(zap.AddStacktrace(zap.DPanicLevel))
-		if err != nil {
-			log.Fatal("error creating logger : ", err.Error())
-		}
-		logger.Debug("Logger started", zap.String("mode", "debug"))
-	} else {
-		logger, err = zap.NewProduction(zap.AddStacktrace(zap.DPanicLevel))
-		if err != nil {
-			log.Fatal("error creating logger : ", err.Error())
-		}
-		logger.Info("Logger started", zap.String("mode", "production"))
+	debugMode := s.GetConfig("common.log_mode", "debug")
+	switch debugMode {
+	case true:
+		config := zap.NewDevelopmentConfig()
+		config.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
+		logger, _ = config.Build()
+	case false:
+		config := zap.NewProductionConfig()
+		config.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
+		logger, _ = config.Build()
 	}
 
 	s.Logger = logger
-
 }

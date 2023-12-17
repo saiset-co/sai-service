@@ -3,7 +3,7 @@ package internal
 import (
 	"strconv"
 
-	"github.com/Limpid-LLC/saiService"
+	"github.com/saiset-co/saiService"
 )
 
 func (is InternalService) NewHandler() saiService.Handler {
@@ -11,14 +11,14 @@ func (is InternalService) NewHandler() saiService.Handler {
 		"get": saiService.HandlerElement{
 			Name:        "get",
 			Description: "Get value from the storage",
-			Function: func(data interface{}) (interface{}, int, error) {
+			Function: func(data, meta interface{}) (interface{}, int, error) {
 				return is.get(data)
 			},
 		},
 		"post": saiService.HandlerElement{
 			Name:        "post",
 			Description: "Post value to the storage with specified key",
-			Function: func(data interface{}) (interface{}, int, error) {
+			Function: func(data, meta interface{}) (interface{}, int, error) {
 				return is.post(data)
 			},
 		},
