@@ -157,11 +157,11 @@ func (s *Service) SetLogger() {
 
 	debugMode := s.GetConfig("common.log_mode", "debug")
 	switch debugMode {
-	case true:
+	case "debug":
 		config := zap.NewDevelopmentConfig()
 		config.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
 		logger, _ = config.Build()
-	case false:
+	default:
 		config := zap.NewProductionConfig()
 		config.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
 		logger, _ = config.Build()
