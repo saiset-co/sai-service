@@ -8,8 +8,7 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/saiset-co/saiService"
-	_ "github.com/saiset-co/saiService"
+	"github.com/saiset-co/saiService/service"
 )
 
 type Request struct {
@@ -24,8 +23,8 @@ type RequestData struct {
 	Data         interface{} `json:"data"`
 }
 
-func CreateAuthMiddleware(authServiceURL string, microserviceName string, method string) func(next saiService.HandlerFunc, data interface{}, metadata interface{}) (interface{}, int, error) {
-	return func(next saiService.HandlerFunc, data interface{}, metadata interface{}) (interface{}, int, error) {
+func CreateAuthMiddleware(authServiceURL string, microserviceName string, method string) func(next service.HandlerFunc, data interface{}, metadata interface{}) (interface{}, int, error) {
+	return func(next service.HandlerFunc, data interface{}, metadata interface{}) (interface{}, int, error) {
 		if authServiceURL == "" {
 			log.Println("authMiddleware: auth service url is empty")
 			return unauthorizedResponse("authServiceURL")

@@ -1,4 +1,4 @@
-package saiService
+package service
 
 import (
 	"fmt"
