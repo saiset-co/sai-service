@@ -8,7 +8,7 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/saiset-co/saiService/service"
+	"github.com/saiset-co/sai-service/service"
 )
 
 type Request struct {
