@@ -2,6 +2,7 @@ package service
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,11 +11,12 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type Handler map[string]HandlerElement
 
-type Middleware func(next HandlerFunc, data interface{}, metadata interface{}) (interface{}, int, error)
+type Middleware func(ctx context.Context, next HandlerFunc, data interface{}, metadata interface{}) (interface{}, int, error)
 
 type HandlerElement struct {
 	Name        string
@@ -23,7 +25,7 @@ type HandlerElement struct {
 	Middlewares []Middleware
 }
 
-type HandlerFunc = func(interface{}, interface{}) (interface{}, int, error)
+type HandlerFunc = func(context.Context, interface{}, interface{}) (interface{}, int, error)
 
 type JsonRequestType struct {
 	Method   string
@@ -34,6 +36,8 @@ type JsonRequestType struct {
 type ErrorResponse map[string]interface{}
 
 func (s *Service) handleSocketConnections(conn net.Conn) {
+	ctx, _ := context.WithDeadline(context.Background(), time.Now().Add(time.Second*10))
+
 	for {
 		var message JsonRequestType
 		socketMessage, _ := bufio.NewReader(conn).ReadString('\n')
@@ -49,7 +53,7 @@ func (s *Service) handleSocketConnections(conn net.Conn) {
 				continue
 			}
 
-			result, _, resultErr := s.processPath(&message)
+			result, _, resultErr := s.processPath(ctx, &message)
 
 			if resultErr != nil {
 				err := ErrorResponse{"Status": "NOK", "Error": resultErr.Error()}
@@ -76,8 +80,9 @@ func (s *Service) handleSocketConnections(conn net.Conn) {
 
 // handle cli command
 func (s *Service) handleCliCommand(data []byte) ([]byte, error) {
-
+	ctx, _ := context.WithDeadline(context.Background(), time.Now().Add(time.Second*10))
 	var message JsonRequestType
+
 	if len(data) == 0 {
 		return nil, fmt.Errorf("empty data provided")
 	}
@@ -92,7 +97,7 @@ func (s *Service) handleCliCommand(data []byte) ([]byte, error) {
 
 	}
 
-	result, _, err := s.processPath(&message)
+	result, _, err := s.processPath(ctx, &message)
 	if err != nil {
 		return nil, err
 	}
@@ -106,6 +111,8 @@ func (s *Service) handleCliCommand(data []byte) ([]byte, error) {
 }
 
 func (s *Service) handleWSConnections(conn *websocket.Conn) {
+	ctx, _ := context.WithDeadline(context.Background(), time.Now().Add(time.Second*10))
+
 	for {
 		var message JsonRequestType
 		if rErr := websocket.JSON.Receive(conn, &message); rErr != nil {
@@ -133,7 +140,7 @@ func (s *Service) handleWSConnections(conn *websocket.Conn) {
 			}
 		}
 
-		result, _, resultErr := s.processPath(&message)
+		result, _, resultErr := s.processPath(ctx, &message)
 
 		if resultErr != nil {
 			err := ErrorResponse{"Status": "NOK", "Error": resultErr.Error()}
@@ -213,7 +220,7 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 		}
 	}
 
-	result, statusCode, resultErr := s.processPath(&message)
+	result, statusCode, resultErr := s.processPath(req.Context(), &message)
 
 	if resultErr != nil {
 		err := ErrorResponse{"Status": "NOK", "Error": resultErr.Error()}
@@ -238,14 +245,14 @@ func (s *Service) handleHttpConnections(resp http.ResponseWriter, req *http.Requ
 	resp.Write(body)
 }
 
-func (s *Service) applyMiddleware(handler HandlerElement, data interface{}, metadata interface{}) (interface{}, int, error) {
+func (s *Service) applyMiddleware(ctx context.Context, handler HandlerElement, data interface{}, metadata interface{}) (interface{}, int, error) {
 	closures := make([]HandlerFunc, len(s.Middlewares)+len(handler.Middlewares)+1)
 	closures[0] = handler.Function
 
 	// Function to create a closure for the middleware with the correct next function
-	createMiddlewareClosure := func(middleware Middleware, next HandlerFunc) HandlerFunc {
-		return func(data interface{}, metadata interface{}) (interface{}, int, error) {
-			return middleware(next, data, metadata)
+	createMiddlewareClosure := func(ctx context.Context, middleware Middleware, next HandlerFunc) HandlerFunc {
+		return func(ctx context.Context, data interface{}, metadata interface{}) (interface{}, int, error) {
+			return middleware(ctx, next, data, metadata)
 		}
 	}
 
@@ -253,22 +260,22 @@ func (s *Service) applyMiddleware(handler HandlerElement, data interface{}, meta
 
 	// Apply global middlewares
 	for _, middleware := range s.Middlewares {
-		newClosure := createMiddlewareClosure(middleware, last)
+		newClosure := createMiddlewareClosure(ctx, middleware, last)
 		last = newClosure
 		closures = append(closures, newClosure)
 	}
 
 	// Apply local middlewares
 	for _, middleware := range handler.Middlewares {
-		newClosure := createMiddlewareClosure(middleware, last)
+		newClosure := createMiddlewareClosure(ctx, middleware, last)
 		last = newClosure
 		closures = append(closures, newClosure)
 	}
 
-	return last(data, metadata)
+	return last(ctx, data, metadata)
 }
 
-func (s *Service) processPath(msg *JsonRequestType) (interface{}, int, error) {
+func (s *Service) processPath(ctx context.Context, msg *JsonRequestType) (interface{}, int, error) {
 	h, ok := s.Handlers[msg.Method]
 
 	if !ok {
@@ -278,7 +285,7 @@ func (s *Service) processPath(msg *JsonRequestType) (interface{}, int, error) {
 	//todo: Rutina na process
 
 	// Apply middleware
-	return s.applyMiddleware(h, msg.Data, msg.Metadata)
+	return s.applyMiddleware(ctx, h, msg.Data, msg.Metadata)
 }
 
 func (s *Service) getHttpIP(r *http.Request) string {
