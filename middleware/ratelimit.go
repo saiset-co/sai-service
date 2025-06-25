@@ -1,11 +1,12 @@
 package middleware
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"hash"
 	"hash/fnv"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,7 +19,8 @@ import (
 )
 
 const (
-	shardCount = 64
+	shardCount       = 128
+	maxRetryAttempts = 3
 )
 
 type RateLimitMiddleware struct {
@@ -27,18 +29,19 @@ type RateLimitMiddleware struct {
 	logger          types.Logger
 	metrics         types.MetricsManager
 	shards          [shardCount]*RateLimitShard
-	cleanupTicker   *time.Ticker
 	stopCleanup     chan struct{}
 	rateLimitConfig *RateLimitConfig
 	workerGroup     sync.WaitGroup
 	shutdown        int32
-	metricsChan     chan MetricEvent
+	name            string
+	weight          int
+	hasherPool      sync.Pool
 }
 
 type RateLimitShard struct {
 	clients map[string]*FastRateLimit
 	mu      sync.RWMutex
-	_       [64]byte
+	_       [56]byte
 }
 
 type FastRateLimit struct {
@@ -47,25 +50,19 @@ type FastRateLimit struct {
 	blocked      int64
 	blockedUntil int64
 	lastAccess   int64
-}
-
-type MetricEvent struct {
-	Type   string
-	Labels map[string]string
-	Value  float64
+	_            [24]byte
 }
 
 type RateLimitConfig struct {
-	RequestsPerMinute int64           `json:"requests_per_minute"`
-	BurstSize         int64           `json:"burst_size"`
-	WindowSize        time.Duration   `json:"window_size"`
-	TrustedServices   map[string]bool `json:"trusted_services"`
+	RequestsPerMinute int64         `json:"requests_per_minute"`
+	BurstSize         int64         `json:"burst_size"`
+	WindowSize        time.Duration `json:"window_size"`
 }
 
 var (
-	trustedLabels = map[string]string{"result": "trusted"}
-	blockedLabels = map[string]string{"result": "blocked"}
-	allowedLabels = map[string]string{"result": "allowed"}
+	realIPHeader    = []byte("X-Real-IP")
+	forwardedHeader = []byte("X-Forwarded-For")
+	commaBytes      = []byte(",")
 )
 
 func NewRateLimitMiddleware(ctx context.Context, config types.ConfigManager, logger types.Logger, metrics types.MetricsManager) *RateLimitMiddleware {
@@ -73,7 +70,6 @@ func NewRateLimitMiddleware(ctx context.Context, config types.ConfigManager, log
 		RequestsPerMinute: 100,
 		BurstSize:         20,
 		WindowSize:        time.Minute,
-		TrustedServices:   make(map[string]bool),
 	}
 
 	if config.GetConfig().Middlewares.RateLimit.Params != nil {
@@ -84,104 +80,75 @@ func NewRateLimitMiddleware(ctx context.Context, config types.ConfigManager, log
 	}
 
 	rl := &RateLimitMiddleware{
+		name:            "rate-limit",
+		weight:          config.GetConfig().Middlewares.RateLimit.Weight,
 		ctx:             ctx,
 		config:          config,
 		logger:          logger,
 		metrics:         metrics,
-		metricsChan:     make(chan MetricEvent, 100),
 		stopCleanup:     make(chan struct{}),
 		rateLimitConfig: rateLimitConfig,
+
+		hasherPool: sync.Pool{
+			New: func() interface{} {
+				return fnv.New32a()
+			},
+		},
 	}
 
 	for i := range rl.shards {
 		rl.shards[i] = &RateLimitShard{
-			clients: make(map[string]*FastRateLimit),
+			clients: make(map[string]*FastRateLimit, 256),
 		}
 	}
 
-	rl.workerGroup.Add(2)
-	go rl.metricsWorker()
+	rl.workerGroup.Add(1)
 	go rl.cleanupWorker()
 
 	return rl
 }
 
-func (rl *RateLimitMiddleware) Name() string { return "rate-limit" }
-func (rl *RateLimitMiddleware) Weight() int  { return 25 }
+func (rl *RateLimitMiddleware) Name() string          { return rl.name }
+func (rl *RateLimitMiddleware) Weight() int           { return rl.weight }
+func (rl *RateLimitMiddleware) Provider() interface{} { return nil }
 
-func (rl *RateLimitMiddleware) Handle(ctx *fasthttp.RequestCtx, next func(*fasthttp.RequestCtx), _ *types.RouteConfig) {
-	start := time.Now()
-	clientIP := rl.getClientIP(ctx)
-
-	if rl.isTrustedService(ctx) {
-		rl.recordMetricZeroAlloc("trusted", 1)
-		next(ctx)
-		return
-	}
+func (rl *RateLimitMiddleware) Handle(ctx *types.RequestCtx, next func(*types.RequestCtx), _ *types.RouteConfig) {
+	clientIP := rl.extractRealIP(ctx)
 
 	if !rl.isAllowed(clientIP) {
-		duration := time.Since(start).Seconds()
-		rl.recordMetricZeroAlloc("blocked", 1)
-		rl.recordDurationZeroAlloc("blocked", duration)
-
 		rl.createRateLimitResponse(ctx)
 		return
 	}
 
 	next(ctx)
-
-	duration := time.Since(start).Seconds()
-	rl.recordMetricZeroAlloc("allowed", 1)
-	rl.recordDurationZeroAlloc("allowed", duration)
 }
 
-func (rl *RateLimitMiddleware) recordMetricZeroAlloc(result string, value float64) {
-	if rl.metrics == nil {
-		return
+func (rl *RateLimitMiddleware) extractRealIP(ctx *types.RequestCtx) []byte {
+	if realIP := ctx.Request.Header.PeekBytes(realIPHeader); len(realIP) > 0 {
+		return realIP
 	}
 
-	var labels map[string]string
-	switch result {
-	case "trusted":
-		labels = trustedLabels
-	case "blocked":
-		labels = blockedLabels
-	case "allowed":
-		labels = allowedLabels
-	default:
-		return
+	if forwarded := ctx.Request.Header.PeekBytes(forwardedHeader); len(forwarded) > 0 {
+		if comma := bytes.Index(forwarded, commaBytes); comma > 0 {
+			return bytes.TrimSpace(forwarded[:comma])
+		}
+		return bytes.TrimSpace(forwarded)
 	}
 
-	counter := rl.metrics.Counter("rate_limit_requests_total", labels)
-	counter.Add(value)
+	return ctx.RemoteIP()
 }
 
-func (rl *RateLimitMiddleware) recordDurationZeroAlloc(result string, duration float64) {
-	if rl.metrics == nil {
-		return
+func (rl *RateLimitMiddleware) isAllowed(clientIP []byte) bool {
+	clientIPStr := utils.BytesToString(clientIP)
+	shard, err := rl.getShard(clientIP)
+	if err != nil {
+		return false
 	}
 
-	var labels map[string]string
-	switch result {
-	case "blocked":
-		labels = blockedLabels
-	case "allowed":
-		labels = allowedLabels
-	default:
-		return
-	}
-
-	histogram := rl.metrics.Histogram("rate_limit_duration_seconds",
-		[]float64{0.001, 0.01, 0.1, 0.5}, labels)
-	histogram.Observe(duration)
-}
-
-func (rl *RateLimitMiddleware) isAllowed(clientIP string) bool {
-	shard := rl.getShard(clientIP)
 	now := time.Now().UnixNano()
 
 	shard.mu.RLock()
-	limiter, exists := shard.clients[clientIP]
+	limiter, exists := shard.clients[clientIPStr]
 	shard.mu.RUnlock()
 
 	if !exists {
@@ -192,20 +159,34 @@ func (rl *RateLimitMiddleware) isAllowed(clientIP string) bool {
 		}
 
 		shard.mu.Lock()
-		if existing, exists := shard.clients[clientIP]; exists {
+		if existing, exists := shard.clients[clientIPStr]; exists {
 			shard.mu.Unlock()
-			return rl.checkLimitLockFree(existing, now)
+			return rl.checkLimit(existing, now)
 		} else {
-			shard.clients[clientIP] = limiter
+			shard.clients[clientIPStr] = limiter
 			shard.mu.Unlock()
 			return true
 		}
 	}
 
-	return rl.checkLimitLockFree(limiter, now)
+	return rl.checkLimit(limiter, now)
 }
 
-func (rl *RateLimitMiddleware) checkLimitLockFree(limiter *FastRateLimit, now int64) bool {
+func (rl *RateLimitMiddleware) getShard(clientIP []byte) (*RateLimitShard, error) {
+	hasher := rl.hasherPool.Get().(hash.Hash32)
+	defer rl.hasherPool.Put(hasher)
+
+	hasher.Reset()
+	_, err := hasher.Write(clientIP)
+	if err != nil {
+		return nil, err
+	}
+	_hash := hasher.Sum32()
+
+	return rl.shards[_hash&(shardCount-1)], nil
+}
+
+func (rl *RateLimitMiddleware) checkLimit(limiter *FastRateLimit, now int64) bool {
 	atomic.StoreInt64(&limiter.lastAccess, now)
 
 	if atomic.LoadInt64(&limiter.blocked) == 1 {
@@ -214,27 +195,20 @@ func (rl *RateLimitMiddleware) checkLimitLockFree(limiter *FastRateLimit, now in
 			return false
 		}
 
-		if atomic.CompareAndSwapInt64(&limiter.blocked, 1, 0) {
-			atomic.StoreInt64(&limiter.counter, 0)
-			atomic.StoreInt64(&limiter.windowStart, now)
-		} else {
-			return rl.checkLimitLockFree(limiter, now)
-		}
+		atomic.StoreInt64(&limiter.blocked, 0)
+		atomic.StoreInt64(&limiter.counter, 0)
+		atomic.StoreInt64(&limiter.windowStart, now)
 	}
 
-	for {
-		windowStart := atomic.LoadInt64(&limiter.windowStart)
-		windowSize := int64(rl.rateLimitConfig.WindowSize)
+	windowStart := atomic.LoadInt64(&limiter.windowStart)
+	windowSize := int64(rl.rateLimitConfig.WindowSize)
 
-		if now-windowStart > windowSize {
-			if atomic.CompareAndSwapInt64(&limiter.windowStart, windowStart, now) {
-				atomic.StoreInt64(&limiter.counter, 1)
-				return true
-			}
-			continue
+	if now-windowStart > windowSize {
+		if atomic.CompareAndSwapInt64(&limiter.windowStart, windowStart, now) {
+			atomic.StoreInt64(&limiter.counter, 1)
+			return true
 		}
-
-		break
+		return rl.checkLimitWithRetry(limiter, now, 0)
 	}
 
 	counter := atomic.AddInt64(&limiter.counter, 1)
@@ -248,52 +222,24 @@ func (rl *RateLimitMiddleware) checkLimitLockFree(limiter *FastRateLimit, now in
 	return true
 }
 
-func (rl *RateLimitMiddleware) getShard(clientIP string) *RateLimitShard {
-	hash := fnv.New32a()
-	_, _ = hash.Write([]byte(clientIP))
-	return rl.shards[hash.Sum32()&(shardCount-1)]
-}
-
-func (rl *RateLimitMiddleware) metricsWorker() {
-	defer rl.workerGroup.Done()
-
-	buffer := make([]MetricEvent, 0, 1000)
-	ticker := time.NewTicker(time.Second * 5)
-	defer ticker.Stop()
-
-	for {
-		if atomic.LoadInt32(&rl.shutdown) == 1 {
-			rl.logger.Debug("Metrics worker shutting down")
-			return
-		}
-
-		select {
-		case event := <-rl.metricsChan:
-			buffer = append(buffer, event)
-
-		case <-ticker.C:
-			if len(buffer) > 0 {
-				rl.flushMetrics(buffer)
-				buffer = buffer[:0]
-			}
-		case <-rl.ctx.Done():
-			rl.logger.Debug("Metrics worker stopping due to context")
-			return
-		}
+func (rl *RateLimitMiddleware) checkLimitWithRetry(limiter *FastRateLimit, now int64, attempts int) bool {
+	if attempts >= maxRetryAttempts {
+		return false
 	}
-}
 
-func (rl *RateLimitMiddleware) flushMetrics(events []MetricEvent) {
-	metrics := rl.metrics
+	windowStart := atomic.LoadInt64(&limiter.windowStart)
+	windowSize := int64(rl.rateLimitConfig.WindowSize)
 
-	for _, event := range events {
-		switch event.Type {
-		case "histogram":
-			histogram := metrics.Histogram("rate_limit_duration_seconds",
-				[]float64{0.001, 0.01, 0.1, 0.5}, event.Labels)
-			histogram.Observe(event.Value)
+	if now-windowStart > windowSize {
+		if atomic.CompareAndSwapInt64(&limiter.windowStart, windowStart, now) {
+			atomic.StoreInt64(&limiter.counter, 1)
+			return true
 		}
+		return rl.checkLimitWithRetry(limiter, now, attempts+1)
 	}
+
+	counter := atomic.AddInt64(&limiter.counter, 1)
+	return counter <= rl.rateLimitConfig.RequestsPerMinute
 }
 
 func (rl *RateLimitMiddleware) cleanupWorker() {
@@ -307,14 +253,47 @@ func (rl *RateLimitMiddleware) cleanupWorker() {
 		case <-ticker.C:
 			rl.cleanup()
 		case <-rl.ctx.Done():
+			return
 		case <-rl.stopCleanup:
 			return
 		}
 	}
 }
 
+func (rl *RateLimitMiddleware) cleanup() {
+	now := time.Now().UnixNano()
+	cutoff := now - int64(time.Hour)
+
+	var totalClients, cleanedClients int
+	for _, shard := range rl.shards {
+		shard.mu.Lock()
+		for ip, limiter := range shard.clients {
+			totalClients++
+			lastAccess := atomic.LoadInt64(&limiter.lastAccess)
+			blocked := atomic.LoadInt64(&limiter.blocked)
+
+			if lastAccess < cutoff && blocked == 0 {
+				delete(shard.clients, ip)
+				cleanedClients++
+			}
+		}
+		shard.mu.Unlock()
+	}
+}
+
+func (rl *RateLimitMiddleware) createRateLimitResponse(ctx *types.RequestCtx) {
+	ctx.SetStatusCode(fasthttp.StatusTooManyRequests)
+	ctx.Response.Header.Set("Content-Type", "application/json")
+	ctx.Response.Header.Set("Retry-After", "60")
+	ctx.Response.Header.Set("X-RateLimit-Limit", strconv.Itoa(int(rl.rateLimitConfig.RequestsPerMinute)))
+
+	ctx.SetBodyString(`{"error":"Rate limit exceeded","message":"Too many requests","retry_after":60}`)
+}
+
 func (rl *RateLimitMiddleware) Stop() error {
-	atomic.StoreInt32(&rl.shutdown, 1)
+	if !atomic.CompareAndSwapInt32(&rl.shutdown, 0, 1) {
+		return nil
+	}
 
 	close(rl.stopCleanup)
 
@@ -332,85 +311,4 @@ func (rl *RateLimitMiddleware) Stop() error {
 		rl.logger.Warn("Rate limit middleware stop timeout")
 		return errors.New("timeout waiting for workers to stop")
 	}
-}
-
-func (rl *RateLimitMiddleware) cleanup() {
-	now := time.Now().UnixNano()
-	cutoff := now - int64(time.Hour)
-
-	var totalClients, cleanedClients int
-
-	for _, shard := range rl.shards {
-		shard.mu.Lock()
-		for ip, limiter := range shard.clients {
-			totalClients++
-			lastAccess := atomic.LoadInt64(&limiter.lastAccess)
-			blocked := atomic.LoadInt64(&limiter.blocked)
-
-			if lastAccess < cutoff && blocked == 0 {
-				delete(shard.clients, ip)
-				cleanedClients++
-			}
-		}
-		shard.mu.Unlock()
-	}
-
-	rl.logger.Debug("Rate limit cleanup completed",
-		zap.Int("total_clients", totalClients),
-		zap.Int("cleaned_clients", cleanedClients))
-}
-
-func (rl *RateLimitMiddleware) getClientIP(ctx *fasthttp.RequestCtx) string {
-	if forwarded := string(ctx.Request.Header.Peek("X-Forwarded-For")); forwarded != "" {
-		if commaIndex := strings.IndexByte(forwarded, ','); commaIndex != -1 {
-			ip := forwarded[:commaIndex]
-			return strings.TrimSpace(ip)
-		}
-		return strings.TrimSpace(forwarded)
-	}
-
-	if realIP := string(ctx.Request.Header.Peek("X-Real-IP")); realIP != "" {
-		return realIP
-	}
-
-	return ctx.RemoteIP().String()
-}
-
-func (rl *RateLimitMiddleware) isTrustedService(ctx *fasthttp.RequestCtx) bool {
-	userAgent := string(ctx.UserAgent())
-	for serviceName := range rl.rateLimitConfig.TrustedServices {
-		if strings.Contains(strings.ToLower(userAgent), strings.ToLower(serviceName)) {
-			return true
-		}
-	}
-
-	serviceHeader := string(ctx.Request.Header.Peek("X-Service-Name"))
-	if serviceHeader != "" {
-		return rl.rateLimitConfig.TrustedServices[serviceHeader]
-	}
-
-	apiKey := string(ctx.Request.Header.Peek("X-Internal-API-Key"))
-	if apiKey != "" {
-		return rl.validateInternalAPIKey(apiKey)
-	}
-
-	return false
-}
-
-func (rl *RateLimitMiddleware) validateInternalAPIKey(apiKey string) bool {
-	internalKeys := map[string]bool{
-		"internal-service-key-123": true,
-		"monitoring-key-456":       true,
-	}
-
-	return internalKeys[apiKey]
-}
-
-func (rl *RateLimitMiddleware) createRateLimitResponse(ctx *fasthttp.RequestCtx) {
-	ctx.SetStatusCode(fasthttp.StatusTooManyRequests)
-	ctx.Response.Header.Set("Content-Type", "application/json")
-	ctx.Response.Header.Set("Retry-After", "60")
-	ctx.Response.Header.Set("X-RateLimit-Limit", strconv.Itoa(int(rl.rateLimitConfig.RequestsPerMinute)))
-
-	ctx.SetBodyString(`{"error":"Rate limit exceeded","message":"Too many requests","retry_after":60}`)
 }

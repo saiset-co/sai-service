@@ -7,12 +7,12 @@ import (
 )
 
 type GroupBuilder struct {
-	router types.HTTPRouter
+	router *LazyHTTPRouter
 	prefix string
 	config *types.RouteConfig
 }
 
-func (gb *GroupBuilder) WithCache(key string, ttl int, dependencies ...string) types.GroupBuilder {
+func (gb *GroupBuilder) WithCache(key string, ttl time.Duration, dependencies ...string) types.GroupBuilder {
 	gb.config.Cache = &types.CacheHandlerConfig{
 		Enabled: true,
 		Key:     key,
@@ -38,7 +38,7 @@ func (gb *GroupBuilder) WithTimeout(duration time.Duration) types.GroupBuilder {
 }
 
 func (gb *GroupBuilder) Route(method, path string, handler types.FastHTTPHandler) types.RouteBuilder {
-	rb := gb.router.Route(method, gb.prefix+path, handler, gb)
+	rb := gb.router.route(method, gb.prefix+path, handler, gb)
 
 	if gb.config != nil {
 		routeBuilder := rb.(*RouteBuilder)

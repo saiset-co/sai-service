@@ -14,36 +14,57 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/saiset-co/sai-service/types"
 )
 
+type State int32
+
+const (
+	StateStopped State = iota
+	StateStarting
+	StateRunning
+	StateStopping
+)
+
 type CertManager struct {
-	ctx           context.Context
-	logger        types.Logger
-	config        *types.TLSConfig
-	autocertMgr   *autocert.Manager
-	certCache     autocert.Cache
-	renewalTicker *time.Ticker
-	stopCh        chan struct{}
-	mu            sync.RWMutex
-	certificates  map[string]*tls.Certificate
-	running       uint32
+	ctx             context.Context
+	cancel          context.CancelFunc
+	logger          types.Logger
+	config          *types.TLSConfig
+	autocertMgr     *autocert.Manager
+	certCache       autocert.Cache
+	renewalTicker   *time.Ticker
+	stopCh          chan struct{}
+	mu              sync.RWMutex
+	certificates    map[string]*tls.Certificate
+	state           atomic.Value
+	shutdownTimeout time.Duration
+	renewalInterval time.Duration
 }
 
 func NewCertManager(ctx context.Context, logger types.Logger, config types.ConfigManager) (types.TLSManager, error) {
 	tlsConfig := config.GetConfig().Server.TLS
 
+	managerCtx, cancel := context.WithCancel(ctx)
+
 	cm := &CertManager{
-		ctx:          ctx,
-		logger:       logger,
-		config:       tlsConfig,
-		stopCh:       make(chan struct{}),
-		certificates: make(map[string]*tls.Certificate),
+		ctx:             managerCtx,
+		cancel:          cancel,
+		logger:          logger,
+		config:          tlsConfig,
+		stopCh:          make(chan struct{}),
+		certificates:    make(map[string]*tls.Certificate),
+		shutdownTimeout: 10 * time.Second,
+		renewalInterval: 12 * time.Hour,
 	}
+
+	cm.state.Store(StateStopped)
 
 	if tlsConfig.AutoCert {
 		if err := cm.initializeAutocert(); err != nil {
+			cancel()
 			return nil, types.WrapError(err, "failed to initialize autocert manager")
 		}
 	}
@@ -52,12 +73,15 @@ func NewCertManager(ctx context.Context, logger types.Logger, config types.Confi
 }
 
 func (cm *CertManager) Serve(addr string) (net.Listener, error) {
+	if !cm.IsRunning() {
+		return nil, types.ErrServerNotRunning
+	}
+
 	var ln net.Listener
 	var err error
 
 	if cm.config.AutoCert {
 		tlsConfig := cm.GetTLSConfig()
-
 		if tlsConfig == nil {
 			return nil, fmt.Errorf("failed to get TLS config from manager")
 		}
@@ -106,6 +130,10 @@ func (cm *CertManager) Serve(addr string) (net.Listener, error) {
 }
 
 func (cm *CertManager) GetTLSConfig() *tls.Config {
+	if cm.autocertMgr == nil {
+		return nil
+	}
+
 	tlsConfig := &tls.Config{
 		GetCertificate: cm.autocertMgr.GetCertificate,
 		NextProtos:     []string{"h2", "http/1.1"},
@@ -127,13 +155,52 @@ func (cm *CertManager) GetTLSConfig() *tls.Config {
 }
 
 func (cm *CertManager) Start() error {
-	if !atomic.CompareAndSwapUint32(&cm.running, 0, 1) {
+	if !cm.transitionState(StateStopped, StateStarting) {
 		return types.ErrServerAlreadyRunning
 	}
 
+	defer func() {
+		if cm.getState() == StateStarting {
+			cm.setState(StateRunning)
+		}
+	}()
+
 	if cm.config.AutoCert {
-		go cm.preloadCertificates()
-		cm.startRenewalMonitor()
+		ctx, cancel := context.WithTimeout(cm.ctx, 30*time.Second)
+		defer cancel()
+
+		g, gCtx := errgroup.WithContext(ctx)
+
+		g.Go(func() error {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+				cm.preloadCertificates()
+				return nil
+			}
+		})
+
+		g.Go(func() error {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+				cm.startRenewalMonitor()
+				return nil
+			}
+		})
+
+		if err := g.Wait(); err != nil {
+			cm.setState(StateStopped)
+			select {
+			case <-ctx.Done():
+				cm.logger.Warn("TLS manager start timeout")
+			default:
+				cm.logger.Error("Error during TLS manager startup", zap.Error(err))
+			}
+			return types.WrapError(err, "failed to start certificate manager")
+		}
 	}
 
 	cm.logger.Info("TLS Certificate Manager started",
@@ -143,22 +210,66 @@ func (cm *CertManager) Start() error {
 }
 
 func (cm *CertManager) Stop() error {
-	if !atomic.CompareAndSwapUint32(&cm.running, 1, 0) {
+	if !cm.transitionState(StateRunning, StateStopping) {
 		return types.ErrServerNotRunning
 	}
 
-	close(cm.stopCh)
+	defer func() {
+		cm.setState(StateStopped)
+		cm.cancel()
+	}()
 
-	if cm.renewalTicker != nil {
-		cm.renewalTicker.Stop()
+	ctx, cancel := context.WithTimeout(context.Background(), cm.shutdownTimeout)
+	defer cancel()
+
+	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		select {
+		case <-gCtx.Done():
+			return gCtx.Err()
+		default:
+			close(cm.stopCh)
+			return nil
+		}
+	})
+
+	g.Go(func() error {
+		if cm.renewalTicker != nil {
+			cm.renewalTicker.Stop()
+		}
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		select {
+		case <-ctx.Done():
+			cm.logger.Warn("TLS manager stop timeout, some components may not have stopped gracefully")
+		default:
+			cm.logger.Error("Error during TLS manager shutdown", zap.Error(err))
+		}
+	} else {
+		cm.logger.Info("TLS Certificate Manager stopped gracefully")
 	}
 
-	cm.logger.Info("TLS Certificate Manager stopped")
 	return nil
 }
 
 func (cm *CertManager) IsRunning() bool {
-	return atomic.LoadUint32(&cm.running) == 1
+	return cm.getState() == StateRunning
+}
+
+func (cm *CertManager) getState() State {
+	return cm.state.Load().(State)
+}
+
+func (cm *CertManager) setState(newState State) bool {
+	currentState := cm.getState()
+	return cm.state.CompareAndSwap(currentState, newState)
+}
+
+func (cm *CertManager) transitionState(from, to State) bool {
+	return cm.state.CompareAndSwap(from, to)
 }
 
 func (cm *CertManager) validateCertificate(cert tls.Certificate) error {
@@ -233,12 +344,27 @@ func (cm *CertManager) wrapCertificateWithOCSP(getCert func(*tls.ClientHelloInfo
 }
 
 func (cm *CertManager) validateDomains() error {
+	ctx, cancel := context.WithTimeout(cm.ctx, 10*time.Second)
+	defer cancel()
+
+	g, gCtx := errgroup.WithContext(ctx)
+
 	for _, domain := range cm.config.Domains {
-		if err := cm.checkDomainDNS(domain); err != nil {
-			return types.WrapError(err, fmt.Sprintf("domain %s validation failed", domain))
-		}
+		d := domain
+		g.Go(func() error {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+				if err := cm.checkDomainDNS(d); err != nil {
+					return types.WrapError(err, fmt.Sprintf("domain %s validation failed", d))
+				}
+				return nil
+			}
+		})
 	}
-	return nil
+
+	return g.Wait()
 }
 
 func (cm *CertManager) checkDomainDNS(domain string) error {
@@ -249,33 +375,59 @@ func (cm *CertManager) checkDomainDNS(domain string) error {
 }
 
 func (cm *CertManager) preloadCertificates() {
+	ctx, cancel := context.WithTimeout(cm.ctx, 60*time.Second)
+	defer cancel()
+
+	g, gCtx := errgroup.WithContext(ctx)
+
 	for _, domain := range cm.config.Domains {
-		hello := &tls.ClientHelloInfo{
-			ServerName: domain,
+		d := domain
+		g.Go(func() error {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+				hello := &tls.ClientHelloInfo{
+					ServerName: d,
+				}
+
+				cert, err := cm.autocertMgr.GetCertificate(hello)
+				if err != nil {
+					cm.logger.Warn("Failed to preload certificate",
+						zap.String("domain", d),
+						zap.Error(err))
+					return nil
+				}
+
+				cm.mu.Lock()
+				cm.certificates[d] = cert
+				cm.mu.Unlock()
+
+				cm.logger.Info("Certificate preloaded successfully",
+					zap.String("domain", d))
+				return nil
+			}
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		select {
+		case <-ctx.Done():
+			cm.logger.Warn("Certificate preloading timeout")
+		default:
+			cm.logger.Error("Error during certificate preloading", zap.Error(err))
 		}
-
-		cert, err := cm.autocertMgr.GetCertificate(hello)
-		if err != nil {
-			cm.logger.Warn("Failed to preload certificate",
-				zap.String("domain", domain),
-				zap.Error(err))
-			continue
-		}
-
-		cm.mu.Lock()
-		cm.certificates[domain] = cert
-		cm.mu.Unlock()
-
-		cm.logger.Info("Certificate preloaded successfully",
-			zap.String("domain", domain))
 	}
 }
 
 func (cm *CertManager) startRenewalMonitor() {
-	cm.renewalTicker = time.NewTicker(12 * time.Hour)
+	cm.renewalTicker = time.NewTicker(cm.renewalInterval)
 
 	go func() {
-		defer cm.renewalTicker.Stop()
+		defer func() {
+			cm.renewalTicker.Stop()
+			cm.logger.Debug("Certificate renewal monitor stopped")
+		}()
 
 		for {
 			select {
@@ -293,6 +445,10 @@ func (cm *CertManager) startRenewalMonitor() {
 }
 
 func (cm *CertManager) checkCertificateRenewal() {
+	if !cm.IsRunning() {
+		return
+	}
+
 	cm.logger.Debug("Checking certificate renewal status")
 
 	cm.mu.RLock()
@@ -302,39 +458,62 @@ func (cm *CertManager) checkCertificateRenewal() {
 	}
 	cm.mu.RUnlock()
 
+	ctx, cancel := context.WithTimeout(cm.ctx, 5*time.Minute)
+	defer cancel()
+
+	g, gCtx := errgroup.WithContext(ctx)
+
 	for _, domain := range domains {
-		x509Cert, err := cm.getCertificateInfo(domain)
-		if err != nil {
-			cm.logger.Error("Failed to get certificate info",
-				zap.String("domain", domain),
-				zap.Error(err))
-			continue
-		}
+		d := domain
+		g.Go(func() error {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+				x509Cert, err := cm.getCertificateInfo(d)
+				if err != nil {
+					cm.logger.Error("Failed to get certificate info",
+						zap.String("domain", d),
+						zap.Error(err))
+					return nil
+				}
 
-		renewalTime := x509Cert.NotAfter.Add(-30 * 24 * time.Hour)
-		if time.Now().After(renewalTime) {
-			cm.logger.Info("Certificate renewal required",
-				zap.String("domain", domain),
-				zap.Time("expires_at", x509Cert.NotAfter))
+				renewalTime := x509Cert.NotAfter.Add(-30 * 24 * time.Hour)
+				if time.Now().After(renewalTime) {
+					cm.logger.Info("Certificate renewal required",
+						zap.String("domain", d),
+						zap.Time("expires_at", x509Cert.NotAfter))
 
-			hello := &tls.ClientHelloInfo{
-				ServerName: domain,
+					hello := &tls.ClientHelloInfo{
+						ServerName: d,
+					}
+
+					newCert, err := cm.autocertMgr.GetCertificate(hello)
+					if err != nil {
+						cm.logger.Error("Failed to renew certificate",
+							zap.String("domain", d),
+							zap.Error(err))
+						return nil
+					}
+
+					cm.mu.Lock()
+					cm.certificates[d] = newCert
+					cm.mu.Unlock()
+
+					cm.logger.Info("Certificate renewed successfully",
+						zap.String("domain", d))
+				}
+				return nil
 			}
+		})
+	}
 
-			newCert, err := cm.autocertMgr.GetCertificate(hello)
-			if err != nil {
-				cm.logger.Error("Failed to renew certificate",
-					zap.String("domain", domain),
-					zap.Error(err))
-				continue
-			}
-
-			cm.mu.Lock()
-			cm.certificates[domain] = newCert
-			cm.mu.Unlock()
-
-			cm.logger.Info("Certificate renewed successfully",
-				zap.String("domain", domain))
+	if err := g.Wait(); err != nil {
+		select {
+		case <-ctx.Done():
+			cm.logger.Warn("Certificate renewal check timeout")
+		default:
+			cm.logger.Error("Error during certificate renewal check", zap.Error(err))
 		}
 	}
 }

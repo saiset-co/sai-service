@@ -12,7 +12,7 @@ type CacheManager interface {
 	Invalidate(keys ...string) error
 	GetRevision(key string) uint64
 	SetRevision(key string, revision uint64)
-	BuildCacheKey(requestPath string, dependencies []string, metadata map[string]string) string
+	BuildCacheKey(requestPath []byte, dependencies []string, metadata map[string][]byte) string
 }
 
 type CacheManagerCreator func(config interface{}) (CacheManager, error)

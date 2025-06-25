@@ -7,10 +7,6 @@ import (
 
 type DocumentationManager interface {
 	LifecycleManager
-	RegisterRoutes(router HTTPRouter)
-	AddRoute(*RouteConfig) error
-	Generate() error
-	GetSpec() *OpenAPISpec
 }
 
 type OpenAPISpec struct {

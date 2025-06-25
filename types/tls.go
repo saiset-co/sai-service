@@ -17,7 +17,7 @@ type TLSManager interface {
 
 type CertificateStatus struct {
 	Domain          string    `json:"domain"`
-	Status          string    `json:"status"` // valid, expiring_soon, expired, error
+	Status          string    `json:"status"`
 	Issuer          string    `json:"issuer,omitempty"`
 	Subject         string    `json:"subject,omitempty"`
 	NotBefore       time.Time `json:"not_before,omitempty"`

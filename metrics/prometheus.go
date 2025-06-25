@@ -12,11 +12,20 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	dto "github.com/prometheus/client_model/go"
-	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/saiset-co/sai-service/types"
 	"github.com/saiset-co/sai-service/utils"
+)
+
+type PrometheusState int32
+
+const (
+	PrometheusStateStopped PrometheusState = iota
+	PrometheusStateStarting
+	PrometheusStateRunning
+	PrometheusStateStopping
 )
 
 type PrometheusConfig struct {
@@ -30,21 +39,24 @@ type PrometheusConfig struct {
 }
 
 type PrometheusMetrics struct {
-	ctx           context.Context
-	logger        types.Logger
-	health        types.HealthManager
-	config        *PrometheusConfig
-	registry      *prometheus.Registry
-	counters      map[string]*prometheus.CounterVec
-	gauges        map[string]*prometheus.GaugeVec
-	histograms    map[string]*prometheus.HistogramVec
-	summaries     map[string]*prometheus.SummaryVec
-	systemMetrics *SystemMetricsCollector
-	mu            sync.RWMutex
-	running       int32
+	ctx             context.Context
+	cancel          context.CancelFunc
+	logger          types.Logger
+	router          types.HTTPRouter
+	health          types.HealthManager
+	config          *PrometheusConfig
+	registry        *prometheus.Registry
+	counters        map[string]*prometheus.CounterVec
+	gauges          map[string]*prometheus.GaugeVec
+	histograms      map[string]*prometheus.HistogramVec
+	summaries       map[string]*prometheus.SummaryVec
+	systemMetrics   atomic.Pointer[*SystemMetricsCollector]
+	state           atomic.Value
+	shutdownTimeout time.Duration
+	mu              sync.RWMutex
 }
 
-func NewPrometheusMetrics(ctx context.Context, logger types.Logger, config *types.MetricsConfig, health types.HealthManager) (types.MetricsManager, error) {
+func NewPrometheusMetrics(ctx context.Context, logger types.Logger, config *types.MetricsConfig, router types.HTTPRouter, health types.HealthManager) (types.MetricsManager, error) {
 	var promConfig = &PrometheusConfig{
 		Path:            "/metrics",
 		Namespace:       "sai_service",
@@ -60,6 +72,8 @@ func NewPrometheusMetrics(ctx context.Context, logger types.Logger, config *type
 		}
 	}
 
+	promCtx, cancel := context.WithCancel(ctx)
+
 	registry := prometheus.NewRegistry()
 	if promConfig.EnableGoMetrics {
 		registry.MustRegister(collectors.NewGoCollector())
@@ -67,17 +81,21 @@ func NewPrometheusMetrics(ctx context.Context, logger types.Logger, config *type
 	}
 
 	metrics := &PrometheusMetrics{
-		ctx:        ctx,
-		logger:     logger,
-		health:     health,
-		config:     promConfig,
-		registry:   registry,
-		counters:   make(map[string]*prometheus.CounterVec),
-		gauges:     make(map[string]*prometheus.GaugeVec),
-		histograms: make(map[string]*prometheus.HistogramVec),
-		summaries:  make(map[string]*prometheus.SummaryVec),
-		running:    0,
+		ctx:             promCtx,
+		cancel:          cancel,
+		logger:          logger,
+		router:          router,
+		health:          health,
+		config:          promConfig,
+		registry:        registry,
+		counters:        make(map[string]*prometheus.CounterVec),
+		gauges:          make(map[string]*prometheus.GaugeVec),
+		histograms:      make(map[string]*prometheus.HistogramVec),
+		summaries:       make(map[string]*prometheus.SummaryVec),
+		shutdownTimeout: 10 * time.Second,
 	}
+
+	metrics.state.Store(PrometheusStateStopped)
 
 	logger.Info("Prometheus metrics initialized",
 		zap.String("namespace", promConfig.Namespace),
@@ -88,37 +106,147 @@ func NewPrometheusMetrics(ctx context.Context, logger types.Logger, config *type
 }
 
 func (p *PrometheusMetrics) Start() error {
-	if !atomic.CompareAndSwapInt32(&p.running, 0, 1) {
+	if !p.transitionState(PrometheusStateStopped, PrometheusStateStarting) {
 		p.logger.Warn("Prometheus metrics is already running")
 		return types.ErrServerAlreadyRunning
 	}
 
-	p.logger.Info("prometheus metrics started")
+	defer func() {
+		if p.getState() == PrometheusStateStarting {
+			p.setState(PrometheusStateRunning)
+		}
+	}()
 
+	ctx, cancel := context.WithTimeout(p.ctx, 30*time.Second)
+	defer cancel()
+
+	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		select {
+		case <-gCtx.Done():
+			return gCtx.Err()
+		default:
+			p.registerRoutes()
+			return nil
+		}
+	})
+
+	g.Go(func() error {
+		select {
+		case <-gCtx.Done():
+			return gCtx.Err()
+		default:
+			if err := p.RegisterSystemMetrics(); err != nil {
+				p.logger.Warn("Failed to register system metrics", zap.Error(err))
+			}
+			if err := p.StartSystemCollection(); err != nil {
+				p.logger.Warn("Failed to start system collection", zap.Error(err))
+			}
+			return nil
+		}
+	})
+
+	if err := g.Wait(); err != nil {
+		select {
+		case <-ctx.Done():
+			p.setState(PrometheusStateStopped)
+			return types.NewErrorf("prometheus metrics start timeout")
+		default:
+			p.setState(PrometheusStateStopped)
+			return types.WrapError(err, "failed to start prometheus metrics")
+		}
+	}
+
+	p.logger.Info("prometheus metrics started")
 	return nil
 }
 
 func (p *PrometheusMetrics) Stop() error {
-	if !atomic.CompareAndSwapInt32(&p.running, 1, 0) {
+	if !p.transitionState(PrometheusStateRunning, PrometheusStateStopping) {
 		p.logger.Warn("Prometheus metrics is not running")
 		return types.ErrServerNotRunning
 	}
 
-	err := p.StopSystemCollection()
-	if err != nil {
-		return err
+	defer func() {
+		p.setState(PrometheusStateStopped)
+		p.cancel()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), p.shutdownTimeout)
+	defer cancel()
+
+	g, gCtx := errgroup.WithContext(ctx)
+
+	if collector := p.systemMetrics.Load(); collector != nil {
+		g.Go(func() error {
+			if err := (*collector).Stop(); err != nil {
+				p.logger.Error("Failed to stop system collection", zap.Error(err))
+				return err
+			}
+			return nil
+		})
 	}
 
-	p.logger.Info("prometheus metrics stopped")
+	g.Go(func() error {
+		select {
+		case <-gCtx.Done():
+			return gCtx.Err()
+		default:
+			return p.cleanup()
+		}
+	})
 
+	if err := g.Wait(); err != nil {
+		select {
+		case <-ctx.Done():
+			p.logger.Warn("Prometheus metrics stop timeout, some components may not have stopped gracefully")
+		default:
+			p.logger.Error("Error during prometheus metrics shutdown", zap.Error(err))
+		}
+	} else {
+		p.logger.Info("prometheus metrics stopped gracefully")
+	}
+
+	p.systemMetrics.Store(nil)
 	return nil
 }
 
 func (p *PrometheusMetrics) IsRunning() bool {
-	return atomic.LoadInt32(&p.running) == 1
+	return p.getState() == PrometheusStateRunning
+}
+
+func (p *PrometheusMetrics) getState() PrometheusState {
+	return p.state.Load().(PrometheusState)
+}
+
+func (p *PrometheusMetrics) setState(newState PrometheusState) bool {
+	currentState := p.getState()
+	return p.state.CompareAndSwap(currentState, newState)
+}
+
+func (p *PrometheusMetrics) transitionState(from, to PrometheusState) bool {
+	return p.state.CompareAndSwap(from, to)
+}
+
+func (p *PrometheusMetrics) cleanup() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.counters = make(map[string]*prometheus.CounterVec)
+	p.gauges = make(map[string]*prometheus.GaugeVec)
+	p.histograms = make(map[string]*prometheus.HistogramVec)
+	p.summaries = make(map[string]*prometheus.SummaryVec)
+
+	p.logger.Info("Prometheus metrics cleaned up")
+	return nil
 }
 
 func (p *PrometheusMetrics) Counter(name string, labels map[string]string) types.Counter {
+	if !p.IsRunning() {
+		return &PrometheusCounter{logger: p.logger}
+	}
+
 	key := p.buildKey(name)
 
 	p.mu.Lock()
@@ -148,6 +276,10 @@ func (p *PrometheusMetrics) Counter(name string, labels map[string]string) types
 }
 
 func (p *PrometheusMetrics) Gauge(name string, labels map[string]string) types.Gauge {
+	if !p.IsRunning() {
+		return &PrometheusGauge{logger: p.logger}
+	}
+
 	key := p.buildKey(name)
 
 	p.mu.Lock()
@@ -177,6 +309,10 @@ func (p *PrometheusMetrics) Gauge(name string, labels map[string]string) types.G
 }
 
 func (p *PrometheusMetrics) Histogram(name string, buckets []float64, labels map[string]string) types.Histogram {
+	if !p.IsRunning() {
+		return &PrometheusHistogram{}
+	}
+
 	key := p.buildKey(name)
 
 	p.mu.Lock()
@@ -207,6 +343,10 @@ func (p *PrometheusMetrics) Histogram(name string, buckets []float64, labels map
 }
 
 func (p *PrometheusMetrics) Summary(name string, objectives map[float64]float64, labels map[string]string) types.Summary {
+	if !p.IsRunning() {
+		return &PrometheusSummary{}
+	}
+
 	key := p.buildKey(name)
 
 	p.mu.Lock()
@@ -237,36 +377,73 @@ func (p *PrometheusMetrics) Summary(name string, objectives map[float64]float64,
 }
 
 func (p *PrometheusMetrics) RegisterSystemMetrics() error {
-	p.Gauge("system_memory_usage_bytes", map[string]string{"type": "heap_inuse"})
-	p.Gauge("system_memory_usage_bytes", map[string]string{"type": "heap_alloc"})
-	p.Gauge("system_memory_usage_bytes", map[string]string{"type": "sys"})
-	p.Gauge("system_memory_usage_bytes", map[string]string{"type": "stack_inuse"})
-	p.Gauge("system_goroutines_count", nil)
-	p.Gauge("system_heap_objects_count", nil)
-	p.Gauge("system_uptime_seconds", nil)
-	p.Gauge("system_cpu_usage_percent", nil)
-	p.Gauge("system_last_gc_timestamp", nil)
-	p.Histogram("system_gc_duration_seconds", []float64{0.001, 0.01, 0.1, 1.0}, nil)
+	state := p.getState()
+	if state != PrometheusStateRunning && state != PrometheusStateStarting {
+		return types.ErrMetricsNotRunning
+	}
+
+	ctx, cancel := context.WithTimeout(p.ctx, 5*time.Second)
+	defer cancel()
+
+	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		select {
+		case <-gCtx.Done():
+			return gCtx.Err()
+		default:
+			p.Gauge("system_memory_usage_bytes", map[string]string{"type": "heap_inuse"})
+			p.Gauge("system_memory_usage_bytes", map[string]string{"type": "heap_alloc"})
+			p.Gauge("system_memory_usage_bytes", map[string]string{"type": "sys"})
+			p.Gauge("system_memory_usage_bytes", map[string]string{"type": "stack_inuse"})
+			p.Gauge("system_goroutines_count", nil)
+			p.Gauge("system_heap_objects_count", nil)
+			p.Gauge("system_uptime_seconds", nil)
+			p.Gauge("system_cpu_usage_percent", nil)
+			p.Gauge("system_last_gc_timestamp", nil)
+			p.Histogram("system_gc_duration_seconds", []float64{0.001, 0.01, 0.1, 1.0}, nil)
+			return nil
+		}
+	})
+
+	if err := g.Wait(); err != nil {
+		return types.WrapError(err, "failed to register system metrics")
+	}
 
 	p.logger.Info("Prometheus system metrics registered")
 	return nil
 }
 
 func (p *PrometheusMetrics) StartSystemCollection() error {
-	if p.systemMetrics == nil {
-		p.systemMetrics = NewSystemMetricsCollector(p.ctx, p.logger, p)
+	state := p.getState()
+	if state != PrometheusStateRunning && state != PrometheusStateStarting {
+		return types.ErrMetricsNotRunning
 	}
-	return p.systemMetrics.Start()
+
+	if p.systemMetrics.Load() == nil {
+		systemMetrics := NewSystemMetricsCollector(p.ctx, p.logger, p)
+		p.systemMetrics.Store(&systemMetrics)
+	}
+
+	if collector := p.systemMetrics.Load(); collector != nil {
+		return (*collector).Start()
+	}
+
+	return nil
 }
 
 func (p *PrometheusMetrics) StopSystemCollection() error {
-	if p.systemMetrics != nil {
-		return p.systemMetrics.Stop()
+	if collector := p.systemMetrics.Load(); collector != nil {
+		return (*collector).Stop()
 	}
 	return nil
 }
 
 func (p *PrometheusMetrics) GetMetrics() ([]byte, error) {
+	if !p.IsRunning() {
+		return nil, types.ErrMetricsNotRunning
+	}
+
 	gatherer := prometheus.Gatherers{p.registry}
 	gathering, err := gatherer.Gather()
 	if err != nil {
@@ -308,6 +485,10 @@ func (p *PrometheusMetrics) GetMetrics() ([]byte, error) {
 }
 
 func (p *PrometheusMetrics) GetStats() ([]byte, error) {
+	if !p.IsRunning() {
+		return nil, types.ErrMetricsNotRunning
+	}
+
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
@@ -323,13 +504,13 @@ func (p *PrometheusMetrics) GetStats() ([]byte, error) {
 	return utils.Marshal(stats)
 }
 
-func (p *PrometheusMetrics) RegisterRoutes(router types.HTTPRouter) {
+func (p *PrometheusMetrics) registerRoutes() {
 	config := &types.RouteConfig{
 		Cache: &types.CacheHandlerConfig{
 			Enabled: false,
 		},
 		Timeout:             time.Duration(5) * time.Second,
-		DisabledMiddlewares: []string{"Auth", "BodyLimit", "Cache", "Cors", "Logging"},
+		DisabledMiddlewares: []string{"cache"},
 		Doc: &types.DocConfig{
 			Path:            p.config.Path,
 			Method:          "GET",
@@ -341,7 +522,7 @@ func (p *PrometheusMetrics) RegisterRoutes(router types.HTTPRouter) {
 		},
 	}
 
-	fastHandler := func(ctx *fasthttp.RequestCtx) {
+	fastHandler := func(ctx *types.RequestCtx) {
 		ctx.SetContentType("text/plain; version=0.0.4; charset=utf-8")
 		req, _ := http.NewRequest("GET", string(ctx.RequestURI()), nil)
 		w := types.NewFastResponseWriter(ctx)
@@ -349,20 +530,11 @@ func (p *PrometheusMetrics) RegisterRoutes(router types.HTTPRouter) {
 		promHandler.ServeHTTP(w, req)
 	}
 
-	router.Add("GET", p.config.Path, fastHandler, config)
+	p.router.Add("GET", p.config.Path, fastHandler, config)
 }
 
 func (p *PrometheusMetrics) Close() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	p.counters = make(map[string]*prometheus.CounterVec)
-	p.gauges = make(map[string]*prometheus.GaugeVec)
-	p.histograms = make(map[string]*prometheus.HistogramVec)
-	p.summaries = make(map[string]*prometheus.SummaryVec)
-
-	p.logger.Info("Prometheus metrics closed")
-	return nil
+	return p.Stop()
 }
 
 func (p *PrometheusMetrics) buildKey(name string) string {
@@ -387,18 +559,29 @@ type PrometheusCounter struct {
 }
 
 func (c *PrometheusCounter) Inc() {
-	c.counter.With(c.labels).Inc()
+	if c.counter != nil {
+		c.counter.With(c.labels).Inc()
+	}
 }
 
 func (c *PrometheusCounter) Add(value float64) {
-	c.counter.With(c.labels).Add(value)
+	if c.counter != nil {
+		c.counter.With(c.labels).Add(value)
+	}
 }
 
 func (c *PrometheusCounter) Get() float64 {
+	if c.counter == nil {
+		return 0
+	}
+
 	metric := &dto.Metric{}
 	err := c.counter.With(c.labels).Write(metric)
 	if err != nil {
-		c.logger.Error("Failed to write counter", zap.Error(err))
+		if c.logger != nil {
+			c.logger.Error("Failed to write counter", zap.Error(err))
+		}
+		return 0
 	}
 	return metric.GetCounter().GetValue()
 }
@@ -410,30 +593,47 @@ type PrometheusGauge struct {
 }
 
 func (g *PrometheusGauge) Set(value float64) {
-	g.gauge.With(g.labels).Set(value)
+	if g.gauge != nil {
+		g.gauge.With(g.labels).Set(value)
+	}
 }
 
 func (g *PrometheusGauge) Inc() {
-	g.gauge.With(g.labels).Inc()
+	if g.gauge != nil {
+		g.gauge.With(g.labels).Inc()
+	}
 }
 
 func (g *PrometheusGauge) Dec() {
-	g.gauge.With(g.labels).Dec()
+	if g.gauge != nil {
+		g.gauge.With(g.labels).Dec()
+	}
 }
 
 func (g *PrometheusGauge) Add(value float64) {
-	g.gauge.With(g.labels).Add(value)
+	if g.gauge != nil {
+		g.gauge.With(g.labels).Add(value)
+	}
 }
 
 func (g *PrometheusGauge) Sub(value float64) {
-	g.gauge.With(g.labels).Sub(value)
+	if g.gauge != nil {
+		g.gauge.With(g.labels).Sub(value)
+	}
 }
 
 func (g *PrometheusGauge) Get() float64 {
+	if g.gauge == nil {
+		return 0
+	}
+
 	metric := &dto.Metric{}
 	err := g.gauge.With(g.labels).Write(metric)
 	if err != nil {
-		g.logger.Error("Failed to write counter", zap.Error(err))
+		if g.logger != nil {
+			g.logger.Error("Failed to write gauge", zap.Error(err))
+		}
+		return 0
 	}
 	return metric.GetGauge().GetValue()
 }
@@ -444,15 +644,23 @@ type PrometheusHistogram struct {
 }
 
 func (h *PrometheusHistogram) Observe(value float64) {
-	h.histogram.With(h.labels).Observe(value)
+	if h.histogram != nil {
+		h.histogram.With(h.labels).Observe(value)
+	}
 }
 
 func (h *PrometheusHistogram) ObserveDuration(start time.Time) {
-	duration := time.Since(start).Seconds()
-	h.histogram.With(h.labels).Observe(duration)
+	if h.histogram != nil {
+		duration := time.Since(start).Seconds()
+		h.histogram.With(h.labels).Observe(duration)
+	}
 }
 
 func (h *PrometheusHistogram) GetCount() uint64 {
+	if h.histogram == nil {
+		return 0
+	}
+
 	metric := &dto.Metric{}
 	observer := h.histogram.With(h.labels)
 
@@ -470,6 +678,10 @@ func (h *PrometheusHistogram) GetCount() uint64 {
 }
 
 func (h *PrometheusHistogram) GetSum() float64 {
+	if h.histogram == nil {
+		return 0
+	}
+
 	metric := &dto.Metric{}
 	observer := h.histogram.With(h.labels)
 
@@ -486,55 +698,11 @@ func (h *PrometheusHistogram) GetSum() float64 {
 	return 0
 }
 
-type PrometheusSummary struct {
-	summary *prometheus.SummaryVec
-	labels  map[string]string
-}
-
-func (s *PrometheusSummary) Observe(value float64) {
-	s.summary.With(s.labels).Observe(value)
-}
-
-func (s *PrometheusSummary) ObserveDuration(start time.Time) {
-	duration := time.Since(start).Seconds()
-	s.summary.With(s.labels).Observe(duration)
-}
-
-func (s *PrometheusSummary) GetCount() uint64 {
-	metric := &dto.Metric{}
-	observer := s.summary.With(s.labels)
-
-	if promMetric, ok := observer.(prometheus.Metric); ok {
-		if err := promMetric.Write(metric); err != nil {
-			return 0
-		}
-
-		if summary := metric.GetSummary(); summary != nil {
-			return summary.GetSampleCount()
-		}
-	}
-
-	return 0
-}
-
-func (s *PrometheusSummary) GetSum() float64 {
-	metric := &dto.Metric{}
-	observer := s.summary.With(s.labels)
-
-	if promMetric, ok := observer.(prometheus.Metric); ok {
-		if err := promMetric.Write(metric); err != nil {
-			return 0
-		}
-
-		if summary := metric.GetSummary(); summary != nil {
-			return summary.GetSampleSum()
-		}
-	}
-
-	return 0
-}
-
 func (h *PrometheusHistogram) GetBuckets() map[float64]uint64 {
+	if h.histogram == nil {
+		return nil
+	}
+
 	metric := &dto.Metric{}
 	observer := h.histogram.With(h.labels)
 
@@ -559,7 +727,71 @@ func (h *PrometheusHistogram) GetBuckets() map[float64]uint64 {
 	return nil
 }
 
+type PrometheusSummary struct {
+	summary *prometheus.SummaryVec
+	labels  map[string]string
+}
+
+func (s *PrometheusSummary) Observe(value float64) {
+	if s.summary != nil {
+		s.summary.With(s.labels).Observe(value)
+	}
+}
+
+func (s *PrometheusSummary) ObserveDuration(start time.Time) {
+	if s.summary != nil {
+		duration := time.Since(start).Seconds()
+		s.summary.With(s.labels).Observe(duration)
+	}
+}
+
+func (s *PrometheusSummary) GetCount() uint64 {
+	if s.summary == nil {
+		return 0
+	}
+
+	metric := &dto.Metric{}
+	observer := s.summary.With(s.labels)
+
+	if promMetric, ok := observer.(prometheus.Metric); ok {
+		if err := promMetric.Write(metric); err != nil {
+			return 0
+		}
+
+		if summary := metric.GetSummary(); summary != nil {
+			return summary.GetSampleCount()
+		}
+	}
+
+	return 0
+}
+
+func (s *PrometheusSummary) GetSum() float64 {
+	if s.summary == nil {
+		return 0
+	}
+
+	metric := &dto.Metric{}
+	observer := s.summary.With(s.labels)
+
+	if promMetric, ok := observer.(prometheus.Metric); ok {
+		if err := promMetric.Write(metric); err != nil {
+			return 0
+		}
+
+		if summary := metric.GetSummary(); summary != nil {
+			return summary.GetSampleSum()
+		}
+	}
+
+	return 0
+}
+
 func (s *PrometheusSummary) GetQuantiles() map[float64]float64 {
+	if s.summary == nil {
+		return nil
+	}
+
 	metric := &dto.Metric{}
 	observer := s.summary.With(s.labels)
 

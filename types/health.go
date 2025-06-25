@@ -13,10 +13,8 @@ const (
 
 type HealthManager interface {
 	LifecycleManager
-	RegisterRoutes(router HTTPRouter)
 	RegisterChecker(name string, checker HealthChecker)
 	Check(ctx context.Context) HealthReport
-	GetStatus() HealthReport
 }
 
 type HealthStatus string

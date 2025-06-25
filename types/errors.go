@@ -7,6 +7,7 @@ import (
 
 var (
 	ErrConfigNotFound       = errors.New("config not found")
+	ErrLoggerConfigInvalid  = errors.New("config invalid")
 	ErrConfigInvalidPath    = errors.New("config invalid path")
 	ErrConfigParseFailed    = errors.New("config parse failed")
 	ErrConfigIsNil          = errors.New("config is nil")
@@ -48,6 +49,7 @@ var (
 	ErrActionConfigInvalid    = errors.New("action config invalid")
 	ErrActionTypeUnknown      = errors.New("action type unknown")
 	ErrActionIsDisabled       = errors.New("action broker is disabled")
+	ErrActionIsRunning        = errors.New("action is running")
 )
 
 var (
@@ -63,6 +65,7 @@ var (
 )
 
 var (
+	ErrMetricsNotRunning    = errors.New("metrics manager not running")
 	ErrMetricsTypeUnknown   = errors.New("metrics type unknown")
 	ErrMetricsStartFailed   = errors.New("metrics start failed")
 	ErrMetricsConfigInvalid = errors.New("metrics config invalid")

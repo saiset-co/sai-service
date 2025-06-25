@@ -2,9 +2,22 @@ package cache
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
+	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
+
 	"github.com/saiset-co/sai-service/types"
+)
+
+type State int32
+
+const (
+	StateStopped State = iota
+	StateStarting
+	StateRunning
+	StateStopping
 )
 
 var customCacheCreators = make(map[string]types.CacheManagerCreator)
@@ -46,74 +59,103 @@ func NewCacheManager(ctx context.Context, config types.ConfigManager, logger typ
 }
 
 type instrumentedCacheManager struct {
-	impl    types.CacheManager
-	logger  types.Logger
-	metrics types.MetricsManager
+	impl            types.CacheManager
+	logger          types.Logger
+	metrics         types.MetricsManager
+	state           atomic.Value
+	shutdownTimeout time.Duration
 }
 
 func newInstrumentedCacheManager(logger types.Logger, metrics types.MetricsManager, impl types.CacheManager) types.CacheManager {
 	instrumented := &instrumentedCacheManager{
-		impl:    impl,
-		logger:  logger,
-		metrics: metrics,
+		impl:            impl,
+		logger:          logger,
+		metrics:         metrics,
+		shutdownTimeout: 10 * time.Second,
 	}
 
+	instrumented.state.Store(StateStopped)
 	return instrumented
 }
 
-func (icm *instrumentedCacheManager) Get(key string) (interface{}, bool) {
-	start := time.Now()
-	value, exists := icm.impl.Get(key)
-	duration := time.Since(start)
-
-	result := "miss"
-	if exists {
-		result = "hit"
+func (icm *instrumentedCacheManager) Start() error {
+	if !icm.transitionState(StateStopped, StateStarting) {
+		return types.ErrServerAlreadyRunning
 	}
 
-	icm.recordMetric("get", result, duration)
+	defer func() {
+		if icm.getState() == StateStarting {
+			icm.setState(StateRunning)
+		}
+	}()
+
+	err := icm.impl.Start()
+	if err != nil {
+		icm.setState(StateStopped)
+		return err
+	}
+
+	icm.logger.Info("Cache manager started")
+	return nil
+}
+
+func (icm *instrumentedCacheManager) Stop() error {
+	if !icm.transitionState(StateRunning, StateStopping) {
+		return types.ErrServerNotRunning
+	}
+
+	defer func() {
+		icm.setState(StateStopped)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), icm.shutdownTimeout)
+	defer cancel()
+
+	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		if err := icm.impl.Stop(); err != nil {
+			icm.logger.Error("Failed to stop cache implementation", zap.Error(err))
+			return err
+		}
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		select {
+		case <-gCtx.Done():
+			icm.logger.Warn("Cache manager stop timeout, some components may not have stopped gracefully")
+		default:
+			icm.logger.Error("Error during cache manager shutdown", zap.Error(err))
+		}
+	} else {
+		icm.logger.Info("Cache manager stopped gracefully")
+	}
+
+	return nil
+}
+
+func (icm *instrumentedCacheManager) IsRunning() bool {
+	return icm.getState() == StateRunning
+}
+
+func (icm *instrumentedCacheManager) Get(key string) (interface{}, bool) {
+	value, exists := icm.impl.Get(key)
 	return value, exists
 }
 
 func (icm *instrumentedCacheManager) Set(key string, value interface{}, ttl time.Duration) error {
-	start := time.Now()
 	err := icm.impl.Set(key, value, ttl)
-	duration := time.Since(start)
-
-	result := "success"
-	if err != nil {
-		result = "error"
-	}
-
-	icm.recordMetric("set", result, duration)
 	return err
 }
 
 func (icm *instrumentedCacheManager) Delete(key string) error {
-	start := time.Now()
 	err := icm.impl.Delete(key)
-	duration := time.Since(start)
-
-	result := "success"
-	if err != nil {
-		result = "error"
-	}
-
-	icm.recordMetric("delete", result, duration)
 	return err
 }
 
 func (icm *instrumentedCacheManager) Invalidate(keys ...string) error {
-	start := time.Now()
 	err := icm.impl.Invalidate(keys...)
-	duration := time.Since(start)
-
-	result := "success"
-	if err != nil {
-		result = "error"
-	}
-
-	icm.recordMetric("invalidate", result, duration)
 	return err
 }
 
@@ -125,43 +167,19 @@ func (icm *instrumentedCacheManager) SetRevision(key string, revision uint64) {
 	icm.impl.SetRevision(key, revision)
 }
 
-func (icm *instrumentedCacheManager) BuildCacheKey(requestPath string, dependencies []string, metadata map[string]string) string {
+func (icm *instrumentedCacheManager) BuildCacheKey(requestPath []byte, dependencies []string, metadata map[string][]byte) string {
 	return icm.impl.BuildCacheKey(requestPath, dependencies, metadata)
 }
 
-func (icm *instrumentedCacheManager) Start() error {
-	start := time.Now()
-	err := icm.impl.Start()
-	duration := time.Since(start)
-
-	result := "success"
-	if err != nil {
-		result = "error"
-	}
-
-	icm.recordMetric("start", result, duration)
-
-	return err
+func (icm *instrumentedCacheManager) getState() State {
+	return icm.state.Load().(State)
 }
 
-func (icm *instrumentedCacheManager) Stop() error {
-	return icm.impl.Stop()
+func (icm *instrumentedCacheManager) setState(newState State) bool {
+	currentState := icm.getState()
+	return icm.state.CompareAndSwap(currentState, newState)
 }
 
-func (icm *instrumentedCacheManager) IsRunning() bool {
-	return icm.impl.IsRunning()
-}
-
-func (icm *instrumentedCacheManager) recordMetric(operation, result string, duration time.Duration) {
-	opCounter := icm.metrics.Counter("cache_operations_total", map[string]string{
-		"operation": operation,
-		"result":    result,
-	})
-	opCounter.Inc()
-
-	opDuration := icm.metrics.Histogram("cache_operation_duration_seconds",
-		[]float64{0.0001, 0.001, 0.01, 0.1, 1.0},
-		map[string]string{"operation": operation},
-	)
-	opDuration.Observe(duration.Seconds())
+func (icm *instrumentedCacheManager) transitionState(from, to State) bool {
+	return icm.state.CompareAndSwap(from, to)
 }

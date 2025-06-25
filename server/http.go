@@ -1,33 +1,80 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"github.com/valyala/fasthttp"
+	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
+	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/valyala/fasthttp"
-	"go.uber.org/zap"
-
 	"github.com/saiset-co/sai-service/types"
+	"github.com/saiset-co/sai-service/utils"
 )
 
+type State int32
+
+const (
+	StateStopped State = iota
+	StateStarting
+	StateRunning
+	StateStopping
+)
+
+var methodIndex = map[string]uint8{
+	"GET":     0,
+	"POST":    1,
+	"PUT":     2,
+	"DELETE":  3,
+	"PATCH":   4,
+	"HEAD":    5,
+	"OPTIONS": 6,
+	"TRACE":   7,
+}
+
+var (
+	getBytes     = []byte("GET")
+	postBytes    = []byte("POST")
+	putBytes     = []byte("PUT")
+	deleteBytes  = []byte("DELETE")
+	patchBytes   = []byte("PATCH")
+	headBytes    = []byte("HEAD")
+	optionsBytes = []byte("OPTIONS")
+	traceBytes   = []byte("TRACE")
+)
+
+type CompiledRoute struct {
+	methodIdx  uint8
+	pattern    string
+	handler    types.FastHTTPHandler
+	config     *types.RouteConfig
+	paramNames []string
+	segments   []string
+}
+
 type FastHTTPServer struct {
-	ctx                context.Context
-	config             types.ConfigManager
-	logger             types.Logger
-	metrics            types.MetricsManager
-	middlewares        types.MiddlewareManager
-	router             types.HTTPRouter
-	server             *fasthttp.Server
-	httpConfig         *types.HTTPConfig
-	tlsConfig          *types.TLSConfig
-	tlsManager         types.TLSManager
-	running            int32
-	responseWriterPool sync.Pool
-	requestWrapperPool sync.Pool
-	contextPool        sync.Pool
+	ctx             context.Context
+	cancel          context.CancelFunc
+	config          types.ConfigManager
+	logger          types.Logger
+	metrics         types.MetricsManager
+	middlewares     types.MiddlewareManager
+	router          types.HTTPRouter
+	server          *fasthttp.Server
+	listener        net.Listener
+	httpConfig      *types.HTTPConfig
+	tlsConfig       *types.TLSConfig
+	tlsManager      types.TLSManager
+	state           atomic.Value
+	shutdownTimeout time.Duration
+	staticRoutes    map[string]*types.RouteInfo
+	compiledRoutes  []*CompiledRoute
+	routingMu       sync.RWMutex
 }
 
 func NewHTTPServer(
@@ -38,49 +85,53 @@ func NewHTTPServer(
 	middlewares types.MiddlewareManager,
 	tlsManager types.TLSManager,
 	router types.HTTPRouter) (*FastHTTPServer, error) {
+	serverCtx, cancel := context.WithCancel(ctx)
+
 	server := &FastHTTPServer{
-		ctx:         ctx,
-		config:      config,
-		logger:      logger,
-		metrics:     metrics,
-		middlewares: middlewares,
-		tlsManager:  tlsManager,
-		router:      router,
-		httpConfig:  config.GetConfig().Server.HTTP,
-		tlsConfig:   config.GetConfig().Server.TLS,
-		responseWriterPool: sync.Pool{
-			New: func() interface{} {
-				return &types.FastResponseWriter{}
-			},
-		},
-		requestWrapperPool: sync.Pool{
-			New: func() interface{} {
-				return make(map[string]interface{}, 8)
-			},
-		},
-		contextPool: sync.Pool{
-			New: func() interface{} {
-				return &types.FastRequestContext{}
-			},
-		},
-		running: 0,
+		ctx:             serverCtx,
+		cancel:          cancel,
+		config:          config,
+		logger:          logger,
+		metrics:         metrics,
+		middlewares:     middlewares,
+		tlsManager:      tlsManager,
+		router:          router,
+		httpConfig:      config.GetConfig().Server.HTTP,
+		tlsConfig:       config.GetConfig().Server.TLS,
+		shutdownTimeout: 5 * time.Second,
+		staticRoutes:    make(map[string]*types.RouteInfo),
+		compiledRoutes:  make([]*CompiledRoute, 0),
 	}
+
+	server.state.Store(StateStopped)
 
 	return server, nil
 }
 
 func (h *FastHTTPServer) Start() error {
-	if !atomic.CompareAndSwapInt32(&h.running, 0, 1) {
+	if !h.transitionState(StateStopped, StateStarting) {
 		return types.ErrServerAlreadyRunning
 	}
 
+	defer func() {
+		if h.getState() == StateStarting {
+			h.setState(StateRunning)
+		}
+	}()
+
+	if err := h.compileRoutes(); err != nil {
+		h.setState(StateStopped)
+		return types.WrapError(err, "failed to compile routes")
+	}
+
 	h.server = &fasthttp.Server{
-		Handler:                       h.createMainHandler(),
+		Handler:                       h.mainHandler(),
 		ReadTimeout:                   time.Duration(h.httpConfig.ReadTimeout) * time.Second,
 		WriteTimeout:                  time.Duration(h.httpConfig.WriteTimeout) * time.Second,
 		IdleTimeout:                   time.Duration(h.httpConfig.IdleTimeout) * time.Second,
-		MaxConnsPerIP:                 1000000,
-		MaxRequestsPerConn:            1000000,
+		MaxConnsPerIP:                 100000000,
+		MaxRequestsPerConn:            100000000,
+		Concurrency:                   1000000,
 		TCPKeepalive:                  true,
 		ReduceMemoryUsage:             false,
 		DisablePreParseMultipartForm:  true,
@@ -98,19 +149,24 @@ func (h *FastHTTPServer) Start() error {
 	go func() {
 		var err error
 		if h.tlsConfig.Enabled {
-			ln, err := h.tlsManager.Serve(addr)
+			h.listener, err = h.tlsManager.Serve(addr)
 			if err != nil {
 				h.logger.Error("TLS HTTP server failed", zap.Error(err))
-				atomic.StoreInt32(&h.running, 0)
+				return
 			}
-			err = h.server.Serve(ln)
+			err = h.server.Serve(h.listener)
 		} else {
-			err = h.server.ListenAndServe(addr)
+			h.listener, err = net.Listen("tcp", addr)
+			if err != nil {
+				h.logger.Error("HTTP listener failed", zap.Error(err))
+				return
+			}
+			err = h.server.Serve(h.listener)
 		}
 
 		if err != nil {
 			h.logger.Error("HTTP server failed", zap.Error(err))
-			atomic.StoreInt32(&h.running, 0)
+			h.setState(StateStopped)
 		}
 	}()
 
@@ -122,239 +178,254 @@ func (h *FastHTTPServer) Start() error {
 }
 
 func (h *FastHTTPServer) Stop() error {
-	if !atomic.CompareAndSwapInt32(&h.running, 1, 0) {
+	if !h.transitionState(StateRunning, StateStopping) {
 		return types.ErrServerNotRunning
 	}
 
-	if err := h.server.Shutdown(); err != nil {
-		h.logger.Error("HTTP server shutdown error", zap.Error(err))
-		return err
+	defer func() {
+		h.setState(StateStopped)
+		h.cancel()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), h.shutdownTimeout)
+	defer cancel()
+
+	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		if h.server != nil {
+			if h.listener != nil {
+				if err := h.listener.Close(); err != nil {
+					h.logger.Error("Failed to close listener", zap.Error(err))
+				}
+			}
+
+			if err := h.server.ShutdownWithContext(ctx); err != nil {
+				return nil
+			}
+		}
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		select {
+		case <-gCtx.Done():
+			h.logger.Warn("Server stop timeout, some components may not have stopped gracefully")
+		default:
+			h.logger.Error("Error during server shutdown", zap.Error(err))
+		}
+	} else {
+		h.logger.Info("HTTP server stopped gracefully")
 	}
 
-	h.logger.Info("HTTP server stopped")
 	return nil
 }
 
 func (h *FastHTTPServer) IsRunning() bool {
-	return atomic.LoadInt32(&h.running) == 1
+	return h.getState() == StateRunning
 }
 
-func (h *FastHTTPServer) HandleRequest(ctx *fasthttp.RequestCtx, handler types.FastHTTPHandler, config *types.RouteConfig) {
-	start := time.Now()
+func (h *FastHTTPServer) getState() State {
+	return h.state.Load().(State)
+}
 
-	h.recordInFlightMetric(1)
-	defer h.recordInFlightMetric(-1)
+func (h *FastHTTPServer) setState(newState State) bool {
+	currentState := h.getState()
+	return h.state.CompareAndSwap(currentState, newState)
+}
 
+func (h *FastHTTPServer) transitionState(from, to State) bool {
+	return h.state.CompareAndSwap(from, to)
+}
+
+func (h *FastHTTPServer) compileRoutes() error {
+	lazyRouter := h.router.(*LazyHTTPRouter)
+	staticRoutes, dynamicRoutes := lazyRouter.GetCompiledRoutes()
+
+	h.routingMu.Lock()
+	defer h.routingMu.Unlock()
+
+	h.staticRoutes = make(map[string]*types.RouteInfo, len(staticRoutes))
+	for key, info := range staticRoutes {
+		h.staticRoutes[key] = info
+	}
+
+	h.compiledRoutes = make([]*CompiledRoute, 0, len(dynamicRoutes))
+	for _, route := range dynamicRoutes {
+		compiled := &CompiledRoute{
+			methodIdx:  route.MethodIdx,
+			pattern:    route.Pattern,
+			handler:    route.Handler,
+			config:     route.Config,
+			paramNames: h.extractParamNames(route.Pattern),
+			segments:   h.parsePathSegments(route.Pattern),
+		}
+		h.compiledRoutes = append(h.compiledRoutes, compiled)
+	}
+
+	return nil
+}
+
+func (h *FastHTTPServer) mainHandler() fasthttp.RequestHandler {
+	return func(ctx *fasthttp.RequestCtx) {
+		methodBytes := ctx.Method()
+		pathBytes := ctx.Path()
+
+		if handler, config := h.findStaticRoute(methodBytes, pathBytes); handler != nil {
+			h.executeHandler(&types.RequestCtx{RequestCtx: ctx}, handler, config)
+			return
+		}
+
+		if handler, config, params := h.findDynamicRoute(methodBytes, pathBytes); handler != nil {
+			if params != nil {
+				for name, value := range params {
+					ctx.SetUserValue(name, value)
+				}
+			}
+			h.executeHandler(&types.RequestCtx{RequestCtx: ctx}, handler, config)
+			return
+		}
+
+		ctx.Error("Not found", fasthttp.StatusNotFound)
+	}
+}
+
+func (h *FastHTTPServer) findStaticRoute(method, path []byte) (types.FastHTTPHandler, *types.RouteConfig) {
+	if bytes.ContainsAny(path, "{}:") {
+		return nil, nil
+	}
+
+	var buf [32]byte
+	n := copy(buf[:], method)
+	buf[n] = ':'
+	copy(buf[n+1:], path)
+
+	h.routingMu.RLock()
+	info := h.staticRoutes[string(buf[:n+1+len(path)])]
+	h.routingMu.RUnlock()
+
+	if info != nil {
+		return info.Handler, info.Config
+	}
+	return nil, nil
+}
+
+func (h *FastHTTPServer) findDynamicRoute(method, path []byte) (types.FastHTTPHandler, *types.RouteConfig, map[string]string) {
+	methodIdx := h.getMethodIndex(method)
+	if methodIdx == 255 {
+		return nil, nil, nil
+	}
+
+	pathStr := utils.BytesToString(path)
+	pathSegments := h.parsePathSegments(pathStr)
+
+	h.routingMu.RLock()
+	defer h.routingMu.RUnlock()
+
+	for _, route := range h.compiledRoutes {
+		if route.methodIdx == methodIdx {
+			if params := h.matchRoute(pathSegments, route); params != nil {
+				return route.handler, route.config, params
+			}
+		}
+	}
+
+	return nil, nil, nil
+}
+
+func (h *FastHTTPServer) getMethodIndex(method []byte) uint8 {
+	switch {
+	case bytes.Equal(method, getBytes):
+		return 0
+	case bytes.Equal(method, postBytes):
+		return 1
+	case bytes.Equal(method, putBytes):
+		return 2
+	case bytes.Equal(method, deleteBytes):
+		return 3
+	case bytes.Equal(method, patchBytes):
+		return 4
+	case bytes.Equal(method, headBytes):
+		return 5
+	case bytes.Equal(method, optionsBytes):
+		return 6
+	case bytes.Equal(method, traceBytes):
+		return 7
+	default:
+		return 255
+	}
+}
+
+func (h *FastHTTPServer) parsePathSegments(path string) []string {
+	if path == "/" {
+		return []string{}
+	}
+
+	path = strings.Trim(path, "/")
+	if path == "" {
+		return []string{}
+	}
+
+	return strings.Split(path, "/")
+}
+
+func (h *FastHTTPServer) extractParamNames(pattern string) []string {
+	segments := h.parsePathSegments(pattern)
+	var params []string
+
+	for _, seg := range segments {
+		if strings.HasPrefix(seg, "{") && strings.HasSuffix(seg, "}") {
+			params = append(params, seg[1:len(seg)-1])
+		} else if strings.HasPrefix(seg, ":") {
+			params = append(params, seg[1:])
+		}
+	}
+
+	return params
+}
+
+func (h *FastHTTPServer) matchRoute(pathSegments []string, route *CompiledRoute) map[string]string {
+	if len(pathSegments) != len(route.segments) {
+		return nil
+	}
+
+	var params map[string]string
+	paramIdx := 0
+
+	for i, routeSegment := range route.segments {
+		if strings.HasPrefix(routeSegment, "{") || strings.HasPrefix(routeSegment, ":") {
+			if params == nil {
+				params = make(map[string]string, len(route.paramNames))
+			}
+			if paramIdx < len(route.paramNames) {
+				params[route.paramNames[paramIdx]] = pathSegments[i]
+				paramIdx++
+			}
+		} else if routeSegment != pathSegments[i] {
+			return nil
+		}
+	}
+
+	return params
+}
+
+func (h *FastHTTPServer) executeHandler(ctx *types.RequestCtx, handler types.FastHTTPHandler, config *types.RouteConfig) {
 	if handler == nil {
 		ctx.Error("Path not found", fasthttp.StatusNotFound)
-		h.recordHTTPMetrics(ctx, 404, 0, time.Since(start), "path_not_found")
 		return
 	}
 
 	if config == nil {
 		ctx.Error("Internal server error", fasthttp.StatusInternalServerError)
-		h.recordHTTPMetrics(ctx, 500, 0, time.Since(start), "config_error")
 		return
 	}
 
 	if h.middlewares != nil {
-		finalHandler := func(ctx *fasthttp.RequestCtx) {
-			if config.Timeout > 0 {
-				h.executeWithTimeout(ctx, handler, config.Timeout)
-			} else {
-				handler(ctx)
-			}
-		}
-
-		h.middlewares.Execute(ctx, finalHandler, config)
-	} else {
-		if config.Timeout > 0 {
-			h.executeWithTimeout(ctx, handler, config.Timeout)
-		} else {
+		finalHandler := func(ctx *types.RequestCtx) {
 			handler(ctx)
 		}
-	}
-
-	duration := time.Since(start)
-	h.recordHTTPMetrics(ctx, ctx.Response.StatusCode(), int64(ctx.Response.Header.ContentLength()), duration, "completed")
-}
-
-func (h *FastHTTPServer) recordInFlightMetric(delta float64) {
-	if h.metrics == nil {
-		return
-	}
-
-	gauge := h.metrics.Gauge("http_server_requests_in_flight", nil)
-	if delta > 0 {
-		gauge.Inc()
+		h.middlewares.Execute(ctx, finalHandler, config)
 	} else {
-		gauge.Dec()
-	}
-}
-
-func (h *FastHTTPServer) createMainHandler() fasthttp.RequestHandler {
-	return func(ctx *fasthttp.RequestCtx) {
-		h.router.Handler(ctx, h)
-	}
-}
-
-func (h *FastHTTPServer) executeWithTimeout(ctx *fasthttp.RequestCtx, handler types.FastHTTPHandler, timeout time.Duration) {
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-
-	done := make(chan struct{})
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				h.logger.Error("Handler panicked", zap.Any("panic", r))
-				ctx.Error("Internal server error", fasthttp.StatusInternalServerError)
-			}
-			close(done)
-		}()
 		handler(ctx)
-	}()
-
-	select {
-	case <-done:
-	case <-timer.C:
-		ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
 	}
-}
-
-func (h *FastHTTPServer) recordHTTPMetrics(ctx *fasthttp.RequestCtx, statusCode int, responseSize int64, duration time.Duration, requestType string) {
-	if h.metrics == nil {
-		return
-	}
-
-	method := string(ctx.Method())
-	path := string(ctx.Path())
-	status := fmt.Sprintf("%d", statusCode)
-
-	statusClass := h.getStatusClass(statusCode)
-
-	counter := h.metrics.Counter("http_server_requests_total", map[string]string{
-		"method":       method,
-		"status":       status,
-		"status_class": statusClass,
-		"route":        path,
-		"type":         requestType,
-		"protocol":     h.getProtocol(ctx),
-	})
-	counter.Inc()
-
-	durationHist := h.metrics.Histogram("http_server_request_duration_seconds",
-		[]float64{0.001, 0.01, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0},
-		map[string]string{
-			"method":       method,
-			"route":        path,
-			"status_class": statusClass,
-			"protocol":     h.getProtocol(ctx),
-		})
-	durationHist.Observe(duration.Seconds())
-
-	if responseSize > 0 {
-		sizeHist := h.metrics.Histogram("http_server_response_size_bytes",
-			[]float64{100, 1000, 10000, 100000, 1000000},
-			map[string]string{
-				"method":   method,
-				"route":    path,
-				"protocol": h.getProtocol(ctx),
-			})
-		sizeHist.Observe(float64(responseSize))
-	}
-
-	h.recordMiddlewareMetrics(ctx, statusCode)
-
-	h.logger.Debug("HTTP request completed",
-		zap.String("method", method),
-		zap.String("route", path),
-		zap.String("status", status),
-		zap.String("type", requestType),
-		zap.String("protocol", h.getProtocol(ctx)),
-		zap.Duration("duration", duration),
-		zap.Int64("response_size", responseSize))
-}
-
-func (h *FastHTTPServer) getProtocol(ctx *fasthttp.RequestCtx) string {
-	if ctx.IsTLS() {
-		if string(ctx.Request.Header.Peek("HTTP2-Settings")) != "" {
-			return "http2"
-		}
-		return "https"
-	}
-	return "http"
-}
-
-func (h *FastHTTPServer) recordMiddlewareMetrics(ctx *fasthttp.RequestCtx, statusCode int) {
-	if h.metrics == nil {
-		return
-	}
-
-	if origin := string(ctx.Request.Header.Peek("Origin")); origin != "" {
-		corsResult := "allowed"
-		if statusCode == 403 {
-			corsResult = "blocked"
-		} else if string(ctx.Method()) == fasthttp.MethodOptions {
-			corsResult = "preflight"
-		}
-
-		corsCounter := h.metrics.Counter("cors_requests_total", map[string]string{
-			"result": corsResult,
-		})
-		corsCounter.Inc()
-	}
-
-	if hasAuthHeaders(ctx) {
-		authResult := "success"
-		if statusCode == 401 {
-			authResult = "failure"
-		}
-
-		authCounter := h.metrics.Counter("auth_requests_total", map[string]string{
-			"result": authResult,
-		})
-		authCounter.Inc()
-	}
-
-	if statusCode == fasthttp.StatusRequestEntityTooLarge {
-		bodyLimitCounter := h.metrics.Counter("body_limit_requests_total", map[string]string{
-			"result": "blocked",
-		})
-		bodyLimitCounter.Inc()
-	}
-
-	if statusCode == fasthttp.StatusTooManyRequests {
-		rateLimitCounter := h.metrics.Counter("rate_limit_requests_total", map[string]string{
-			"result": "blocked",
-		})
-		rateLimitCounter.Inc()
-	}
-}
-
-func (h *FastHTTPServer) getStatusClass(statusCode int) string {
-	switch {
-	case statusCode >= 200 && statusCode < 300:
-		return "2xx"
-	case statusCode >= 300 && statusCode < 400:
-		return "3xx"
-	case statusCode >= 400 && statusCode < 500:
-		return "4xx"
-	case statusCode >= 500:
-		return "5xx"
-	default:
-		return "1xx"
-	}
-}
-
-func (h *FastHTTPServer) GetCertificateStatus() map[string]types.CertificateStatus {
-	if h.tlsManager != nil {
-		return h.tlsManager.GetCertificateStatus()
-	}
-	return nil
-}
-
-func hasAuthHeaders(ctx *fasthttp.RequestCtx) bool {
-	return len(ctx.Request.Header.Peek("Authorization")) > 0 ||
-		len(ctx.Request.Header.Peek("X-API-Key")) > 0 ||
-		len(ctx.Request.Header.Peek("X-Auth-Token")) > 0
 }

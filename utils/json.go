@@ -2,14 +2,10 @@ package utils
 
 import (
 	"bytes"
+	"fmt"
 	"github.com/bytedance/sonic"
-	"github.com/saiset-co/sai-service/types"
 	"sync"
 )
-
-type JSONEncoderPool struct {
-	pool sync.Pool
-}
 
 type JSONBufferPool struct {
 	pool sync.Pool
@@ -56,7 +52,7 @@ func Unmarshal[T any](data []byte, target *T) error {
 
 func UnmarshalConfig[T any](config interface{}, target *T) error {
 	if config == nil {
-		return types.ErrConfigIsNil
+		return fmt.Errorf("config is nil")
 	}
 
 	if typed, ok := config.(*T); ok {

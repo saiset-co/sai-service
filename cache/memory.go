@@ -3,15 +3,29 @@ package cache
 import (
 	"context"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/saiset-co/sai-service/types"
 	"github.com/saiset-co/sai-service/utils"
+)
+
+type MemoryState int32
+
+const (
+	MemoryStateStopped MemoryState = iota
+	MemoryStateStarting
+	MemoryStateRunning
+	MemoryStateStopping
+)
+
+const (
+	MaxTTL     = 24 * time.Hour
+	DefaultTTL = 1 * time.Hour
 )
 
 type MemoryConfig struct {
@@ -23,30 +37,30 @@ type MemoryConfig struct {
 
 type MemoryCache struct {
 	ctx             context.Context
+	cancel          context.CancelFunc
 	config          *MemoryConfig
 	logger          types.Logger
 	health          types.HealthManager
 	data            map[string]*types.CacheEntry
 	revisions       map[string]uint64
 	dependencies    map[string][]string
-	accessTimes     map[string]int64
-	accessCounts    map[string]int64
 	hits            uint64
 	misses          uint64
 	evictions       uint64
 	mu              sync.RWMutex
 	revMu           sync.RWMutex
 	depMu           sync.RWMutex
+	state           atomic.Value
 	stopCleanup     chan struct{}
-	running         int32
+	cleanupDone     chan struct{}
 	entryPool       sync.Pool
 	stringSlicePool sync.Pool
 	keyBuilderPool  sync.Pool
+	shutdownTimeout time.Duration
 }
 
 type KeyBuilder struct {
-	buf    []byte
-	strBuf strings.Builder
+	buf []byte
 }
 
 func NewMemoryCache(ctx context.Context, logger types.Logger, config *types.CacheConfig, health types.HealthManager) (types.CacheManager, error) {
@@ -64,18 +78,20 @@ func NewMemoryCache(ctx context.Context, logger types.Logger, config *types.Cach
 		}
 	}
 
+	cacheCtx, cancel := context.WithCancel(ctx)
+
 	cache := &MemoryCache{
-		ctx:          ctx,
-		logger:       logger,
-		health:       health,
-		config:       memConfig,
-		data:         make(map[string]*types.CacheEntry),
-		revisions:    make(map[string]uint64),
-		dependencies: make(map[string][]string),
-		accessTimes:  make(map[string]int64),
-		accessCounts: make(map[string]int64),
-		stopCleanup:  make(chan struct{}),
-		running:      0,
+		ctx:             cacheCtx,
+		cancel:          cancel,
+		logger:          logger,
+		health:          health,
+		config:          memConfig,
+		data:            make(map[string]*types.CacheEntry),
+		revisions:       make(map[string]uint64),
+		dependencies:    make(map[string][]string),
+		stopCleanup:     make(chan struct{}),
+		cleanupDone:     make(chan struct{}),
+		shutdownTimeout: 10 * time.Second,
 		entryPool: sync.Pool{
 			New: func() interface{} {
 				return &types.CacheEntry{
@@ -93,6 +109,8 @@ func NewMemoryCache(ctx context.Context, logger types.Logger, config *types.Cach
 		},
 	}
 
+	cache.state.Store(MemoryStateStopped)
+
 	return cache, nil
 }
 
@@ -104,7 +122,6 @@ func (m *MemoryCache) Get(key string) (interface{}, bool) {
 	if !exists {
 		m.mu.RUnlock()
 		atomic.AddUint64(&m.misses, 1)
-		m.logger.Debug("Cache miss", zap.String("key", key))
 		return nil, false
 	}
 
@@ -112,7 +129,6 @@ func (m *MemoryCache) Get(key string) (interface{}, bool) {
 		m.mu.RUnlock()
 		m.mu.Lock()
 		if entry, exists := m.data[key]; exists && now > entry.ExpiresAt.UnixNano() {
-			m.logger.Debug("Cache entry expired", zap.String("key", key), zap.Time("expired_at", entry.ExpiresAt))
 			m.removeEntryUnsafe(key)
 			m.returnEntryToPool(entry)
 		}
@@ -127,12 +143,6 @@ func (m *MemoryCache) Get(key string) (interface{}, bool) {
 
 	atomic.AddUint64(&m.hits, 1)
 
-	m.mu.Lock()
-	m.accessTimes[key] = now
-	m.accessCounts[key]++
-	m.mu.Unlock()
-
-	m.logger.Debug("Cache hit", zap.String("key", key))
 	return value, true
 }
 
@@ -142,23 +152,23 @@ func (m *MemoryCache) Set(key string, value interface{}, ttl time.Duration) erro
 		return types.ErrCacheKeyEmpty
 	}
 
-	now := time.Now()
-	nowNano := now.UnixNano()
+	if ttl <= 0 {
+		ttl = DefaultTTL
+	}
+	if ttl > MaxTTL {
+		ttl = MaxTTL
+	}
 
+	now := time.Now()
 	entry := m.entryPool.Get().(*types.CacheEntry)
 	entry.Key = key
 	entry.Value = value
 	entry.TTL = ttl
 	entry.CreatedAt = now
+	entry.ExpiresAt = now.Add(ttl)
 
 	for k := range entry.Metadata {
 		delete(entry.Metadata, k)
-	}
-
-	if ttl > 0 {
-		entry.ExpiresAt = now.Add(ttl)
-	} else {
-		entry.ExpiresAt = time.Time{}
 	}
 
 	m.mu.Lock()
@@ -180,14 +190,6 @@ func (m *MemoryCache) Set(key string, value interface{}, ttl time.Duration) erro
 	}
 
 	m.data[key] = entry
-	m.accessTimes[key] = nowNano
-	m.accessCounts[key] = 1
-
-	m.logger.Debug("Cache entry set",
-		zap.String("key", key),
-		zap.Duration("ttl", ttl),
-		zap.Time("expires_at", entry.ExpiresAt))
-
 	return nil
 }
 
@@ -198,7 +200,6 @@ func (m *MemoryCache) Delete(key string) error {
 	if entry, exists := m.data[key]; exists {
 		m.removeDependenciesUnsafe(key, entry.Dependencies)
 		m.returnEntryToPool(entry)
-		m.logger.Debug("Cache entry deleted", zap.String("key", key))
 	}
 
 	m.removeEntryUnsafe(key)
@@ -206,22 +207,12 @@ func (m *MemoryCache) Delete(key string) error {
 }
 
 func (m *MemoryCache) Invalidate(keys ...string) error {
-	m.logger.Debug("Invalidating cache keys", zap.Strings("keys", keys))
-
 	for _, key := range keys {
 		oldRevision := m.GetRevision(key)
 		newRevision := oldRevision + 1
 		m.SetRevision(key, newRevision)
 
-		m.logger.Debug("Revision updated",
-			zap.String("key", key),
-			zap.Uint64("old_revision", oldRevision),
-			zap.Uint64("new_revision", newRevision))
-
 		if err := m.invalidateDependencies(key); err != nil {
-			m.logger.Error("Failed to invalidate dependencies",
-				zap.String("key", key),
-				zap.Error(err))
 			return err
 		}
 	}
@@ -241,7 +232,7 @@ func (m *MemoryCache) SetRevision(key string, revision uint64) {
 	m.revisions[key] = revision
 }
 
-func (m *MemoryCache) BuildCacheKey(requestPath string, dependencies []string, metadata map[string]string) string {
+func (m *MemoryCache) BuildCacheKey(requestPath []byte, dependencies []string, metadata map[string][]byte) string {
 	builder := m.keyBuilderPool.Get().(*KeyBuilder)
 	defer m.keyBuilderPool.Put(builder)
 
@@ -258,7 +249,7 @@ func (m *MemoryCache) BuildCacheKey(requestPath string, dependencies []string, m
 		builder.buf = append(builder.buf, '|')
 		builder.buf = append(builder.buf, dep...)
 		builder.buf = append(builder.buf, '|')
-		builder.buf = strconv.AppendUint(builder.buf, revision, 10) // Zero alloc
+		builder.buf = strconv.AppendUint(builder.buf, revision, 10)
 	}
 
 	for key, value := range metadata {
@@ -268,71 +259,120 @@ func (m *MemoryCache) BuildCacheKey(requestPath string, dependencies []string, m
 		builder.buf = append(builder.buf, value...)
 	}
 
-	cacheKey := string(builder.buf)
-
+	cacheKey := utils.BytesToString(builder.buf)
 	m.registerDependencies(cacheKey, dependencies)
-
-	m.logger.Debug("Built cache key",
-		zap.String("request_path", requestPath),
-		zap.Strings("dependencies", dependencies),
-		zap.String("cache_key", cacheKey))
 
 	return cacheKey
 }
 
 func (m *MemoryCache) Start() error {
-	if !atomic.CompareAndSwapInt32(&m.running, 0, 1) {
+	if !m.transitionState(MemoryStateStopped, MemoryStateStarting) {
 		m.logger.Warn("Cache manager is already running")
 		return types.ErrServerAlreadyRunning
 	}
+
+	defer func() {
+		if m.getState() == MemoryStateStarting {
+			m.setState(MemoryStateRunning)
+		}
+	}()
 
 	if m.config.CleanupInterval != "" {
 		go m.startCleanupRoutine()
 	}
 
 	m.logger.Info("Memory cache started")
-
 	return nil
 }
 
 func (m *MemoryCache) Stop() error {
-	if !atomic.CompareAndSwapInt32(&m.running, 1, 0) {
+	if !m.transitionState(MemoryStateRunning, MemoryStateStopping) {
 		m.logger.Warn("Memory cache is not running")
 		return types.ErrServerNotRunning
 	}
 
-	close(m.stopCleanup)
+	defer func() {
+		m.setState(MemoryStateStopped)
+	}()
 
-	m.mu.Lock()
-	m.revMu.Lock()
-	m.depMu.Lock()
+	m.cancel()
 
-	entriesCount := len(m.data)
-	dependenciesCount := len(m.dependencies)
+	ctx, cancel := context.WithTimeout(context.Background(), m.shutdownTimeout)
+	defer cancel()
 
-	for _, entry := range m.data {
-		m.returnEntryToPool(entry)
+	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		select {
+		case m.stopCleanup <- struct{}{}:
+		case <-time.After(time.Second):
+		}
+
+		select {
+		case <-m.cleanupDone:
+			m.logger.Debug("Cleanup routine stopped")
+		case <-time.After(5 * time.Second):
+			m.logger.Warn("Cleanup routine stop timeout")
+		}
+
+		return nil
+	})
+
+	g.Go(func() error {
+		m.mu.Lock()
+		m.revMu.Lock()
+		m.depMu.Lock()
+
+		entriesCount := len(m.data)
+		dependenciesCount := len(m.dependencies)
+
+		for _, entry := range m.data {
+			m.returnEntryToPool(entry)
+		}
+
+		m.data = make(map[string]*types.CacheEntry)
+		m.revisions = make(map[string]uint64)
+		m.dependencies = make(map[string][]string)
+
+		m.depMu.Unlock()
+		m.revMu.Unlock()
+		m.mu.Unlock()
+
+		m.logger.Info("Memory cache cleared",
+			zap.Int("cleared_entries", entriesCount),
+			zap.Int("cleared_dependencies", dependenciesCount))
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		select {
+		case <-gCtx.Done():
+			m.logger.Warn("Memory cache stop timeout, some components may not have stopped gracefully")
+		default:
+			m.logger.Error("Error during memory cache shutdown", zap.Error(err))
+		}
+	} else {
+		m.logger.Info("Memory cache stopped gracefully")
 	}
-
-	m.data = make(map[string]*types.CacheEntry)
-	m.revisions = make(map[string]uint64)
-	m.dependencies = make(map[string][]string)
-	m.accessTimes = make(map[string]int64)
-	m.accessCounts = make(map[string]int64)
-
-	m.depMu.Unlock()
-	m.revMu.Unlock()
-	m.mu.Unlock()
-
-	m.logger.Info("Memory cache closed",
-		zap.Int("cleared_entries", entriesCount),
-		zap.Int("cleared_dependencies", dependenciesCount))
 
 	return nil
 }
 
 func (m *MemoryCache) IsRunning() bool {
-	return atomic.LoadInt32(&m.running) == 1
+	return m.getState() == MemoryStateRunning
+}
+
+func (m *MemoryCache) getState() MemoryState {
+	return m.state.Load().(MemoryState)
+}
+
+func (m *MemoryCache) setState(newState MemoryState) bool {
+	currentState := m.getState()
+	return m.state.CompareAndSwap(currentState, newState)
+}
+
+func (m *MemoryCache) transitionState(from, to MemoryState) bool {
+	return m.state.CompareAndSwap(from, to)
 }
 
 func (m *MemoryCache) returnEntryToPool(entry *types.CacheEntry) {
@@ -368,6 +408,7 @@ func (m *MemoryCache) cleanup() error {
 		}
 	}
 
+	expiredCount := len(expired)
 	for _, key := range expired {
 		if entry := m.data[key]; entry != nil {
 			m.removeDependenciesUnsafe(key, entry.Dependencies)
@@ -376,20 +417,19 @@ func (m *MemoryCache) cleanup() error {
 		m.removeEntryUnsafe(key)
 	}
 
-	expiredCount := len(expired)
-	m.stringSlicePool.Put(expired)
-
+	m.stringSlicePool.Put(&expired)
 	m.mu.Unlock()
 
 	if expiredCount > 0 {
-		m.logger.Info("Cleanup completed",
-			zap.Int("expired_entries", expiredCount))
+		m.logger.Debug("Cleanup completed", zap.Int("expired_entries", expiredCount))
 	}
 
 	return nil
 }
 
 func (m *MemoryCache) startCleanupRoutine() {
+	defer close(m.cleanupDone)
+
 	cleanupInterval, err := time.ParseDuration(m.config.CleanupInterval)
 	if err != nil {
 		m.logger.Error("Invalid cleanup interval, using default 5m",
@@ -404,14 +444,15 @@ func (m *MemoryCache) startCleanupRoutine() {
 	for {
 		select {
 		case <-m.ctx.Done():
-			m.logger.Info("Cleanup routine stopped")
+			m.logger.Debug("Cleanup routine stopped by context")
+			return
+		case <-m.stopCleanup:
+			m.logger.Debug("Cleanup routine stopped by signal")
 			return
 		case <-ticker.C:
 			if err := m.cleanup(); err != nil {
 				m.logger.Error("Cleanup failed", zap.Error(err))
 			}
-		case <-m.stopCleanup:
-			return
 		}
 	}
 }
@@ -421,18 +462,7 @@ func (m *MemoryCache) evictOneUnsafe() error {
 		return nil
 	}
 
-	var victimKey string
-
-	switch m.config.EvictionPolicy {
-	case "lru":
-		victimKey = m.findLRUVictim()
-	case "lfu":
-		victimKey = m.findLFUVictim()
-	case "fifo":
-		fallthrough
-	default:
-		victimKey = m.findFIFOVictim()
-	}
+	victimKey := m.findFIFOVictim()
 
 	if victimKey != "" {
 		if entry := m.data[victimKey]; entry != nil {
@@ -441,41 +471,9 @@ func (m *MemoryCache) evictOneUnsafe() error {
 		}
 		m.removeEntryUnsafe(victimKey)
 		atomic.AddUint64(&m.evictions, 1)
-
-		m.logger.Debug("Cache entry evicted",
-			zap.String("key", victimKey),
-			zap.String("policy", m.config.EvictionPolicy))
 	}
 
 	return nil
-}
-
-func (m *MemoryCache) findLRUVictim() string {
-	var oldestKey string
-	var oldestTime int64 = -1
-
-	for key, accessTime := range m.accessTimes {
-		if oldestTime == -1 || accessTime < oldestTime {
-			oldestKey = key
-			oldestTime = accessTime
-		}
-	}
-
-	return oldestKey
-}
-
-func (m *MemoryCache) findLFUVictim() string {
-	var victimKey string
-	var minCount int64 = -1
-
-	for key, count := range m.accessCounts {
-		if minCount == -1 || count < minCount {
-			victimKey = key
-			minCount = count
-		}
-	}
-
-	return victimKey
 }
 
 func (m *MemoryCache) findFIFOVictim() string {
@@ -514,10 +512,6 @@ func (m *MemoryCache) invalidateDependencies(dependencyKey string) error {
 	m.depMu.Lock()
 	delete(m.dependencies, dependencyKey)
 	m.depMu.Unlock()
-
-	m.logger.Debug("Dependencies invalidated",
-		zap.String("dependency", dependencyKey),
-		zap.Strings("invalidated_keys", dependentKeys))
 
 	return nil
 }
@@ -582,6 +576,4 @@ func (m *MemoryCache) removeDependenciesUnsafe(cacheKey string, dependencies []s
 
 func (m *MemoryCache) removeEntryUnsafe(key string) {
 	delete(m.data, key)
-	delete(m.accessTimes, key)
-	delete(m.accessCounts, key)
 }

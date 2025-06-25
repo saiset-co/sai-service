@@ -1,27 +1,41 @@
 package middleware
 
 import (
-	"strings"
-	"time"
-
+	"bytes"
 	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
+	"sync"
+	"time"
 
 	"github.com/saiset-co/sai-service/types"
 	"github.com/saiset-co/sai-service/utils"
 )
 
 type CacheMiddleware struct {
-	config      types.ConfigManager
-	logger      types.Logger
-	metrics     types.MetricsManager
-	cache       types.CacheManager
-	cacheConfig *CacheConfig
+	config       types.ConfigManager
+	logger       types.Logger
+	metrics      types.MetricsManager
+	cache        types.CacheManager
+	cacheConfig  *CacheConfig
+	name         string
+	weight       int
+	stringPool   sync.Pool
+	headersPool  sync.Pool
+	metadataPool sync.Pool
+	methodGet    []byte
+	noCacheBytes []byte
+	noStoreBytes []byte
 }
 
 type CacheConfig struct {
 	Enabled    bool          `json:"enabled"`
 	DefaultTTL time.Duration `json:"default_ttl"`
+}
+
+type CachedResponse struct {
+	Status  int               `json:"status"`
+	Body    []byte            `json:"body"`
+	Headers map[string]string `json:"headers"`
 }
 
 func NewCacheMiddleware(config types.ConfigManager, logger types.Logger, metrics types.MetricsManager, cache types.CacheManager) *CacheMiddleware {
@@ -40,79 +54,80 @@ func NewCacheMiddleware(config types.ConfigManager, logger types.Logger, metrics
 	}
 
 	return &CacheMiddleware{
+		name:        "cache",
 		config:      config,
 		logger:      logger,
 		metrics:     metrics,
 		cache:       cache,
 		cacheConfig: cacheConfig,
+		weight:      config.GetConfig().Middlewares.Cache.Weight,
+
+		methodGet:    []byte(fasthttp.MethodGet),
+		noCacheBytes: []byte("no-cache"),
+		noStoreBytes: []byte("no-store"),
+
+		stringPool: sync.Pool{
+			New: func() interface{} {
+				return make([]byte, 0, 256)
+			},
+		},
+
+		headersPool: sync.Pool{
+			New: func() interface{} {
+				return make(map[string]string, 16)
+			},
+		},
+
+		metadataPool: sync.Pool{
+			New: func() interface{} {
+				return make(map[string][]byte, 2)
+			},
+		},
 	}
 }
 
-func (c *CacheMiddleware) Name() string { return "cache" }
-func (c *CacheMiddleware) Weight() int  { return 40 }
+func (c *CacheMiddleware) Name() string          { return c.name }
+func (c *CacheMiddleware) Weight() int           { return c.weight }
+func (c *CacheMiddleware) Provider() interface{} { return nil }
 
-func (c *CacheMiddleware) Handle(ctx *fasthttp.RequestCtx, next func(*fasthttp.RequestCtx), config *types.RouteConfig) {
-	if !c.cacheConfig.Enabled || c.cache == nil {
+func (c *CacheMiddleware) Handle(ctx *types.RequestCtx, next func(*types.RequestCtx), config *types.RouteConfig) {
+	if !bytes.Equal(ctx.Method(), c.methodGet) {
 		next(ctx)
 		return
 	}
 
-	if string(ctx.Method()) != fasthttp.MethodGet {
-		next(ctx)
-		return
-	}
-
-	if config == nil || config.Cache == nil || !config.Cache.Enabled {
-		next(ctx)
-		return
-	}
-
-	start := time.Now()
 	cacheKey := c.buildCacheKey(ctx, config)
 
 	if cached, exists := c.cache.Get(cacheKey); exists {
-		duration := time.Since(start)
-
-		c.logger.Debug("Cache hit",
-			zap.String("cache_key", cacheKey),
-			zap.String("path", string(ctx.Path())),
-			zap.Duration("duration", duration))
-
-		if cachedResp, ok := cached.(map[string]interface{}); ok {
+		if cachedResp, ok := cached.(*CachedResponse); ok {
 			c.restoreResponse(ctx, cachedResp)
+			return
 		}
-		return
 	}
 
+	next(ctx)
+
 	if c.shouldCacheResponse(ctx) {
-		responseData := map[string]interface{}{
-			"status":  ctx.Response.StatusCode(),
-			"body":    ctx.Response.Body(),
-			"headers": c.extractResponseHeaders(ctx),
+		responseData := &CachedResponse{
+			Status:  ctx.Response.StatusCode(),
+			Body:    append([]byte(nil), ctx.Response.Body()...),
+			Headers: c.extractResponseHeaders(ctx),
 		}
 
-		ttl := c.getTTL(config.Cache)
+		ttl := c.cacheConfig.DefaultTTL
+		if config.Cache != nil {
+			ttl = config.Cache.TTL
+		}
 
 		if setErr := c.cache.Set(cacheKey, responseData, ttl); setErr != nil {
 			c.logger.Error("Failed to set cache",
 				zap.String("cache_key", cacheKey),
 				zap.Error(setErr))
-		} else {
-			c.logger.Debug("Cache set",
-				zap.String("cache_key", cacheKey),
-				zap.String("path", string(ctx.Path())))
 		}
 	}
-
-	totalDuration := time.Since(start)
-
-	c.logger.Debug("Cache miss and set",
-		zap.String("cache_key", cacheKey),
-		zap.String("path", string(ctx.Path())),
-		zap.Duration("total_duration", totalDuration))
 }
 
-func (c *CacheMiddleware) shouldCacheResponse(ctx *fasthttp.RequestCtx) bool {
+func (c *CacheMiddleware) shouldCacheResponse(ctx *types.RequestCtx) bool {
 	statusCode := ctx.Response.StatusCode()
 	if statusCode < 200 || statusCode >= 300 {
 		return false
@@ -122,67 +137,67 @@ func (c *CacheMiddleware) shouldCacheResponse(ctx *fasthttp.RequestCtx) bool {
 		return false
 	}
 
-	cacheControl := string(ctx.Response.Header.Peek("Cache-Control"))
-	if strings.Contains(strings.ToLower(cacheControl), "no-cache") ||
-		strings.Contains(strings.ToLower(cacheControl), "no-store") {
-		return false
+	cacheControl := ctx.Response.Header.Peek("Cache-Control")
+	if len(cacheControl) > 0 {
+		lowerCacheControl := bytes.ToLower(cacheControl)
+		if bytes.Contains(lowerCacheControl, c.noCacheBytes) ||
+			bytes.Contains(lowerCacheControl, c.noStoreBytes) {
+			return false
+		}
 	}
 
 	return true
 }
 
-func (c *CacheMiddleware) buildCacheKey(ctx *fasthttp.RequestCtx, config *types.RouteConfig) string {
-	if config.Cache.Key != "" {
-		return config.Cache.Key
-	}
+func (c *CacheMiddleware) buildCacheKey(ctx *types.RequestCtx, config *types.RouteConfig) string {
+	metadata := c.metadataPool.Get().(map[string][]byte)
+	defer func() {
+		for k := range metadata {
+			delete(metadata, k)
+		}
+		c.metadataPool.Put(metadata)
+	}()
 
-	requestPath := string(ctx.Path())
-	if len(ctx.QueryArgs().QueryString()) > 0 {
-		requestPath += "?" + string(ctx.QueryArgs().QueryString())
-	}
+	requestPath := ctx.RequestURI()
+	metadata["method"] = ctx.Method()
 
-	metadata := map[string]string{
-		"method": string(ctx.Method()),
-	}
-
-	if userID := string(ctx.Request.Header.Peek("X-User-ID")); userID != "" {
+	if userID := ctx.Request.Header.Peek("X-User-ID"); len(userID) > 0 {
 		metadata["user_id"] = userID
 	}
 
-	return c.cache.BuildCacheKey(requestPath, config.Cache.Deps, metadata)
-}
-
-func (c *CacheMiddleware) getTTL(config *types.CacheHandlerConfig) time.Duration {
-	if config.TTL > 0 {
-		return time.Duration(config.TTL) * time.Second
+	var deps []string
+	if config.Cache != nil {
+		deps = config.Cache.Deps
 	}
-	return c.cacheConfig.DefaultTTL
+
+	return c.cache.BuildCacheKey(requestPath, deps, metadata)
 }
 
-func (c *CacheMiddleware) extractResponseHeaders(ctx *fasthttp.RequestCtx) map[string]string {
-	headers := make(map[string]string)
+func (c *CacheMiddleware) extractResponseHeaders(ctx *types.RequestCtx) map[string]string {
+	headers := c.headersPool.Get().(map[string]string)
+
+	for k := range headers {
+		delete(headers, k)
+	}
 
 	ctx.Response.Header.VisitAll(func(key, value []byte) {
 		headers[string(key)] = string(value)
 	})
 
-	return headers
+	result := make(map[string]string, len(headers))
+	for k, v := range headers {
+		result[k] = v
+	}
+
+	c.headersPool.Put(headers)
+	return result
 }
 
-func (c *CacheMiddleware) restoreResponse(ctx *fasthttp.RequestCtx, cachedResp map[string]interface{}) {
-	if status, ok := cachedResp["status"].(int); ok {
-		ctx.SetStatusCode(status)
-	}
+func (c *CacheMiddleware) restoreResponse(ctx *types.RequestCtx, cachedResp *CachedResponse) {
+	ctx.SetStatusCode(cachedResp.Status)
+	ctx.SetBody(cachedResp.Body)
 
-	if body, ok := cachedResp["body"].([]byte); ok {
-		ctx.SetBody(body)
-	} else if bodyStr, ok := cachedResp["body"].(string); ok {
-		ctx.SetBodyString(bodyStr)
-	}
-
-	if headers, ok := cachedResp["headers"].(map[string]string); ok {
-		for key, value := range headers {
-			ctx.Response.Header.Set(key, value)
-		}
+	for key, value := range cachedResp.Headers {
+		ctx.Response.Header.Set(key, value)
 	}
 }

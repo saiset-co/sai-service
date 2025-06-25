@@ -1,0 +1,43 @@
+name: "test"
+version: "1.0.0"
+
+logger:
+  output: "console"
+  level: "debug"
+
+server:
+  http:
+    port: 8081
+
+docs:
+  enabled: true
+
+actions:
+  broker:
+    type: "websocket"
+    enabled: false
+  webhooks:
+    enabled: true
+
+auth_providers:
+  token:
+    params:
+      token: "your-secret-token"
+  basic:
+    params:
+      username: "name"
+      password: "pass"
+
+client:
+  enabled: true
+  services:
+    simple:
+      url: "http://localhost:8080/"
+      auth:
+        provider: "basic"
+        payload:
+          username: "name"
+          password: "pass1"
+          token: "your-secret-token"
+      events:
+        - user.created

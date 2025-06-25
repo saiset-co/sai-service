@@ -1,11 +1,13 @@
 package middleware
 
 import (
+	"bytes"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
 
 	"github.com/saiset-co/sai-service/types"
@@ -13,11 +15,18 @@ import (
 )
 
 type LoggingMiddleware struct {
-	config        types.ConfigManager
-	logger        types.Logger
-	metrics       types.MetricsManager
-	loggingConfig *LoggingConfig
-	headerMapPool sync.Pool
+	config           types.ConfigManager
+	logger           types.Logger
+	metrics          types.MetricsManager
+	loggingConfig    *LoggingConfig
+	headerSlicePool  sync.Pool
+	fieldsPool       sync.Pool
+	sensitiveHeaders map[string]bool
+	logLevel         int
+	name             string
+	weight           int
+	serviceName      []byte
+	requestCounter   uint64
 }
 
 type LoggingConfig struct {
@@ -25,6 +34,12 @@ type LoggingConfig struct {
 	LogHeaders bool   `json:"log_headers"`
 	LogBody    bool   `json:"log_body"`
 }
+
+var (
+	arrowBytes      = []byte("->")
+	requestIDHeader = []byte("X-Request-ID")
+	prefix          = []byte("_n_")
+)
 
 func NewLoggingMiddleware(config types.ConfigManager, logger types.Logger, metrics types.MetricsManager) *LoggingMiddleware {
 	var loggingConfig = &LoggingConfig{
@@ -40,25 +55,58 @@ func NewLoggingMiddleware(config types.ConfigManager, logger types.Logger, metri
 		}
 	}
 
+	logLevel := 1
+	switch loggingConfig.LogLevel {
+	case "debug":
+		logLevel = 0
+	case "info":
+		logLevel = 1
+	case "warn":
+		logLevel = 2
+	case "error":
+		logLevel = 3
+	}
+
 	return &LoggingMiddleware{
+		name:          "logging",
+		weight:        config.GetConfig().Middlewares.Logging.Weight,
 		config:        config,
 		logger:        logger,
 		metrics:       metrics,
 		loggingConfig: loggingConfig,
-		headerMapPool: sync.Pool{
+		logLevel:      logLevel,
+		sensitiveHeaders: map[string]bool{
+			"authorization": true,
+			"x-api-key":     true,
+			"cookie":        true,
+			"set-cookie":    true,
+			"x-auth-token":  true,
+		},
+		headerSlicePool: sync.Pool{
 			New: func() interface{} {
-				return make(map[string]string, 16)
+				return make([][]byte, 0, 16)
+			},
+		},
+		fieldsPool: sync.Pool{
+			New: func() interface{} {
+				return make([]zap.Field, 0, 10)
 			},
 		},
 	}
 }
 
-func (l *LoggingMiddleware) Name() string { return "logging" }
-func (l *LoggingMiddleware) Weight() int  { return 20 }
+func (l *LoggingMiddleware) Name() string          { return l.name }
+func (l *LoggingMiddleware) Weight() int           { return l.weight }
+func (l *LoggingMiddleware) Provider() interface{} { return nil }
 
-func (l *LoggingMiddleware) Handle(ctx *fasthttp.RequestCtx, next func(*fasthttp.RequestCtx), _ *types.RouteConfig) {
+func (l *LoggingMiddleware) Handle(ctx *types.RequestCtx, next func(*types.RequestCtx), _ *types.RouteConfig) {
+	if requestID := ctx.Request.Header.Peek("X-Request-ID"); len(requestID) > 0 {
+		ctx.Request.Header.SetBytesKV(requestIDHeader, l.appendServiceToRequestID(requestID))
+	} else {
+		ctx.Request.Header.SetBytesKV(requestIDHeader, l.generateRequestID())
+	}
+
 	start := time.Now()
-
 	l.logRequest(ctx)
 
 	next(ctx)
@@ -67,123 +115,147 @@ func (l *LoggingMiddleware) Handle(ctx *fasthttp.RequestCtx, next func(*fasthttp
 	l.logResponse(ctx, duration)
 }
 
-func (l *LoggingMiddleware) logRequest(ctx *fasthttp.RequestCtx) {
-	fields := []zap.Field{
-		zap.String("method", string(ctx.Method())),
-		zap.String("path", string(ctx.Path())),
-		zap.String("remote_addr", l.getRemoteAddr(ctx)),
-		zap.String("user_agent", string(ctx.UserAgent())),
-	}
+func (l *LoggingMiddleware) logRequest(ctx *types.RequestCtx) {
+	fields := l.fieldsPool.Get().(*[]zap.Field)
+	defer func() {
+		*fields = (*fields)[:0]
+		l.fieldsPool.Put(fields)
+	}()
+
+	*fields = append(*fields,
+		zap.ByteString("method", ctx.Method()),
+		zap.ByteString("path", ctx.Path()),
+		zap.ByteString("remote_addr", l.getRemoteAddr(ctx)),
+		zap.ByteString("user_agent", ctx.UserAgent()),
+	)
 
 	if len(ctx.QueryArgs().QueryString()) > 0 {
-		fields = append(fields, zap.String("query", string(ctx.QueryArgs().QueryString())))
+		*fields = append(*fields, zap.ByteString("query", ctx.QueryArgs().QueryString()))
 	}
 
-	if userID := string(ctx.Request.Header.Peek("X-User-ID")); userID != "" {
-		fields = append(fields, zap.String("user_id", userID))
+	if userID := ctx.Request.Header.Peek("X-User-ID"); len(userID) > 0 {
+		*fields = append(*fields, zap.ByteString("user_id", userID))
 	}
 
-	if requestID := string(ctx.Request.Header.Peek("X-Request-ID")); requestID != "" {
-		fields = append(fields, zap.String("request_id", requestID))
+	if requestID := ctx.Request.Header.Peek("X-Request-ID"); len(requestID) > 0 {
+		*fields = append(*fields, zap.ByteString("request_id", requestID))
 	}
 
 	if l.loggingConfig.LogHeaders {
 		sanitizedHeaders := l.sanitizeHeaders(ctx)
-		fields = append(fields, zap.Any("headers", sanitizedHeaders))
+		if len(sanitizedHeaders) > 0 {
+			*fields = append(*fields, zap.Any("headers", sanitizedHeaders))
+		}
 	}
 
-	l.logWithLevel("Request started", fields...)
+	l.logWithLevel("Request started", *fields...)
 }
 
-func (l *LoggingMiddleware) logResponse(ctx *fasthttp.RequestCtx, duration time.Duration) {
-	fields := []zap.Field{
-		zap.Duration("duration", duration),
-	}
+func (l *LoggingMiddleware) logResponse(ctx *types.RequestCtx, duration time.Duration) {
+	fields := l.fieldsPool.Get().(*[]zap.Field)
+	defer func() {
+		*fields = (*fields)[:0]
+		l.fieldsPool.Put(fields)
+	}()
 
-	fields = append(fields,
-		zap.String("method", string(ctx.Method())),
-		zap.String("path", string(ctx.Path())),
+	*fields = append(*fields,
+		zap.Duration("duration", duration),
+		zap.ByteString("method", ctx.Method()),
+		zap.ByteString("path", ctx.Path()),
+		zap.Int("status", ctx.Response.StatusCode()),
 	)
 
-	if requestID := string(ctx.Request.Header.Peek("X-Request-ID")); requestID != "" {
-		fields = append(fields, zap.String("request_id", requestID))
+	if requestID := ctx.Request.Header.Peek("X-Request-ID"); len(requestID) > 0 {
+		*fields = append(*fields, zap.ByteString("request_id", requestID))
 	}
 
 	if l.loggingConfig.LogBody && len(ctx.Response.Body()) > 0 {
 		body := ctx.Response.Body()
 		if len(body) > 1000 {
-			fields = append(fields, zap.String("response", string(body[:1000])+"..."))
-			fields = append(fields, zap.Int("response_body_truncated", len(body)))
+			*fields = append(*fields,
+				zap.ByteString("response", body[:1000]),
+				zap.Int("response_body_truncated", len(body)),
+			)
 		} else {
-			fields = append(fields, zap.String("response", string(body)))
+			*fields = append(*fields, zap.ByteString("response", body))
 		}
 	}
 
-	if ctx.Response.StatusCode() >= 500 {
-		l.logger.Error("Request completed", fields...)
-	} else if ctx.Response.StatusCode() >= 400 {
-		l.logger.Warn("Request completed", fields...)
+	statusCode := ctx.Response.StatusCode()
+	if statusCode >= 500 {
+		l.logger.Error("Request completed", *fields...)
+	} else if statusCode >= 400 {
+		l.logger.Warn("Request completed", *fields...)
 	} else {
-		l.logWithLevel("Request completed", fields...)
+		l.logWithLevel("Request completed", *fields...)
 	}
 }
 
-func (l *LoggingMiddleware) sanitizeHeaders(ctx *fasthttp.RequestCtx) map[string]string {
-	sanitized := l.headerMapPool.Get().(map[string]string)
-	defer func() {
-		for k := range sanitized {
-			delete(sanitized, k)
-		}
-		l.headerMapPool.Put(sanitized)
-	}()
-
-	sensitiveHeaders := map[string]bool{
-		"authorization": true,
-		"x-api-key":     true,
-		"cookie":        true,
-		"set-cookie":    true,
-	}
+func (l *LoggingMiddleware) sanitizeHeaders(ctx *types.RequestCtx) map[string]string {
+	result := make(map[string]string, 8)
 
 	ctx.Request.Header.VisitAll(func(key, value []byte) {
 		keyStr := string(key)
 		lowerKey := strings.ToLower(keyStr)
 
-		if sensitiveHeaders[lowerKey] {
-			sanitized[keyStr] = "[REDACTED]"
+		if l.sensitiveHeaders[lowerKey] {
+			result[keyStr] = "[REDACTED]"
 		} else {
-			sanitized[keyStr] = string(value)
+			result[keyStr] = string(value)
 		}
 	})
 
-	return sanitized
+	return result
 }
 
-func (l *LoggingMiddleware) getRemoteAddr(ctx *fasthttp.RequestCtx) string {
-	if forwarded := string(ctx.Request.Header.Peek("X-Forwarded-For")); forwarded != "" {
-		if comma := strings.Index(forwarded, ","); comma > 0 {
-			return strings.TrimSpace(forwarded[:comma])
+func (l *LoggingMiddleware) getRemoteAddr(ctx *types.RequestCtx) []byte {
+	if forwarded := ctx.Request.Header.Peek("X-Forwarded-For"); len(forwarded) > 0 {
+		if comma := bytes.Index(forwarded, []byte(",")); comma > 0 {
+			return bytes.TrimSpace(forwarded[:comma])
 		}
 		return forwarded
 	}
 
-	if realIP := string(ctx.Request.Header.Peek("X-Real-IP")); realIP != "" {
+	if realIP := ctx.Request.Header.Peek("X-Real-IP"); len(realIP) > 0 {
 		return realIP
 	}
 
-	return ctx.RemoteIP().String()
+	return []byte(ctx.RemoteIP().String())
 }
 
 func (l *LoggingMiddleware) logWithLevel(msg string, fields ...zap.Field) {
-	switch l.loggingConfig.LogLevel {
-	case "debug":
+	switch l.logLevel {
+	case 0:
 		l.logger.Debug(msg, fields...)
-	case "info":
+	case 1:
 		l.logger.Info(msg, fields...)
-	case "warn":
+	case 2:
 		l.logger.Warn(msg, fields...)
-	case "error":
+	case 3:
 		l.logger.Error(msg, fields...)
 	default:
 		l.logger.Info(msg, fields...)
 	}
+}
+
+func (l *LoggingMiddleware) appendServiceToRequestID(existingID []byte) []byte {
+	result := make([]byte, 0, len(existingID)+2+len(l.serviceName))
+	result = append(result, existingID...)
+	result = append(result, arrowBytes...)
+	result = append(result, l.serviceName...)
+
+	return result
+}
+
+func (l *LoggingMiddleware) generateRequestID() []byte {
+	id := atomic.AddUint64(&l.requestCounter, 1)
+
+	totalSize := len(l.serviceName) + len(prefix) + 36
+	result := make([]byte, 0, totalSize)
+
+	result = append(result, l.serviceName...)
+	result = append(result, prefix...)
+	result = strconv.AppendUint(result, id, 10)
+
+	return result
 }

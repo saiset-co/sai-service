@@ -4,14 +4,14 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
+	"context"
 	"fmt"
-	"strconv"
+	"io"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/andybalholm/brotli"
-	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
 
 	"github.com/saiset-co/sai-service/types"
@@ -22,26 +22,31 @@ const (
 	AlgorithmGzip       = "gzip"
 	AlgorithmDeflate    = "deflate"
 	AlgorithmBrotli     = "br"
-	AlgorithmNone       = "none"
 	DefaultLevel        = 6
 	DefaultThreshold    = 1024
 	MinCompressionRatio = 0.05
+	SmallBufferSize     = 4096
+	MediumBufferSize    = 16384
+	LargeBufferSize     = 65536
+	StreamingThreshold  = 1024 * 1024
 )
 
-type EncodingInfo struct {
-	Name    string
-	Quality float64
-}
-
 type CompressionMiddleware struct {
-	config            types.ConfigManager
-	logger            types.Logger
-	metrics           types.MetricsManager
-	gzipWriterPool    sync.Pool
-	deflateWriterPool sync.Pool
-	brotliWriterPool  sync.Pool
-	bufferPool        sync.Pool
-	compressionConfig *CompressionConfig
+	config             types.ConfigManager
+	logger             types.Logger
+	metrics            types.MetricsManager
+	algorithm          []byte
+	compressionConfig  *CompressionConfig
+	name               string
+	weight             int
+	gzipWriterPool     sync.Pool
+	deflateWriterPool  sync.Pool
+	brotliWriterPool   sync.Pool
+	bufferPools        []*sync.Pool
+	stringPool         sync.Pool
+	varyHeaderValue    []byte
+	compressFunc       func([]byte, int) ([]byte, error)
+	streamCompressFunc func(io.Writer, io.Reader) error
 }
 
 type CompressionConfig struct {
@@ -49,24 +54,11 @@ type CompressionConfig struct {
 	Level        int      `json:"level"`
 	Threshold    int      `json:"threshold"`
 	AllowedTypes []string `json:"allowed_types"`
-	Enabled      bool     `json:"enabled"`
+	Timeout      int      `json:"timeout"`
 }
 
 func NewCompressionMiddleware(config types.ConfigManager, logger types.Logger, metrics types.MetricsManager) *CompressionMiddleware {
-	compressionConfig := &CompressionConfig{
-		Algorithm: AlgorithmGzip,
-		Level:     DefaultLevel,
-		Threshold: DefaultThreshold,
-		Enabled:   true,
-		AllowedTypes: []string{
-			"application/json",
-			"application/xml",
-			"application/javascript",
-			"text/*",
-			"application/rss+xml",
-			"application/atom+xml",
-		},
-	}
+	compressionConfig := &CompressionConfig{}
 
 	if config.GetConfig().Middlewares.Compression.Params != nil {
 		if err := utils.UnmarshalConfig(config.GetConfig().Middlewares.Compression.Params, compressionConfig); err != nil {
@@ -75,29 +67,47 @@ func NewCompressionMiddleware(config types.ConfigManager, logger types.Logger, m
 	}
 
 	if err := validateCompressionConfig(compressionConfig); err != nil {
-		logger.Error("Invalid compression config, using defaults", zap.Error(err))
+		logger.Warn("Invalid compression config, using defaults", zap.Error(err))
 		compressionConfig = &CompressionConfig{
-			Algorithm: AlgorithmGzip,
+			Algorithm: AlgorithmBrotli,
 			Level:     DefaultLevel,
 			Threshold: DefaultThreshold,
-			Enabled:   true,
+			Timeout:   30,
 			AllowedTypes: []string{
 				"application/json",
 				"application/xml",
 				"application/javascript",
 				"text/*",
+				"application/rss+xml",
+				"application/atom+xml",
 			},
 		}
 	}
 
 	cm := &CompressionMiddleware{
+		name:              "compression",
+		weight:            config.GetConfig().Middlewares.Compression.Weight,
 		config:            config,
 		logger:            logger,
 		metrics:           metrics,
 		compressionConfig: compressionConfig,
+		algorithm:         []byte(compressionConfig.Algorithm),
+		varyHeaderValue:   []byte("Accept-Encoding"),
 	}
 
 	cm.initializePools()
+
+	switch compressionConfig.Algorithm {
+	case AlgorithmGzip:
+		cm.compressFunc = cm.compressGzipOptimized
+		cm.streamCompressFunc = cm.streamCompressGzip
+	case AlgorithmDeflate:
+		cm.compressFunc = cm.compressDeflateOptimized
+		cm.streamCompressFunc = cm.streamCompressDeflate
+	case AlgorithmBrotli:
+		cm.compressFunc = cm.compressBrotliOptimized
+		cm.streamCompressFunc = cm.streamCompressBrotli
+	}
 
 	return cm
 }
@@ -121,293 +131,336 @@ func validateCompressionConfig(config *CompressionConfig) error {
 		return fmt.Errorf("unsupported algorithm: %s", config.Algorithm)
 	}
 
+	if config.Timeout <= 0 {
+		return fmt.Errorf("invalid timeout: %d (must be > 0)", config.Timeout)
+	}
+
 	return nil
 }
 
-func (c *CompressionMiddleware) Name() string { return "compression" }
-func (c *CompressionMiddleware) Weight() int  { return 45 }
+func (c *CompressionMiddleware) Name() string          { return c.name }
+func (c *CompressionMiddleware) Weight() int           { return c.weight }
+func (c *CompressionMiddleware) Provider() interface{} { return nil }
 
-func (c *CompressionMiddleware) Handle(ctx *fasthttp.RequestCtx, next func(*fasthttp.RequestCtx), _ *types.RouteConfig) {
-	if !c.compressionConfig.Enabled {
+func (c *CompressionMiddleware) Handle(ctx *types.RequestCtx, next func(*types.RequestCtx), _ *types.RouteConfig) {
+	acceptEncoding := ctx.Request.Header.Peek("Accept-Encoding")
+	if !c.supportsCompression(acceptEncoding) {
 		next(ctx)
 		return
 	}
 
-	acceptEncoding := string(ctx.Request.Header.Peek("Accept-Encoding"))
-	bestEncoding := c.selectBestEncoding(acceptEncoding)
-	if bestEncoding == AlgorithmNone {
-		c.recordMetric(AlgorithmNone, "no_encoding_accepted")
-		next(ctx)
-		return
-	}
-
-	start := time.Now()
 	next(ctx)
 
-	compressionApplied, compressionStats := c.compressResponse(ctx, bestEncoding)
-	duration := time.Since(start)
-
-	if compressionApplied {
-		c.recordMetric(bestEncoding, "compressed")
-		c.recordCompressionRatio(bestEncoding, compressionStats.Ratio)
-		c.recordDuration(bestEncoding, compressionStats.Duration)
-
-		c.logger.Debug("Response compressed successfully",
-			zap.String("algorithm", bestEncoding),
-			zap.Int("original_size", compressionStats.OriginalSize),
-			zap.Int("compressed_size", compressionStats.CompressedSize),
-			zap.Float64("ratio", compressionStats.Ratio),
-			zap.Duration("compression_time", compressionStats.Duration),
-			zap.Duration("total_time", duration))
-	} else {
-		c.recordMetric(bestEncoding, "skipped")
+	if len(ctx.Response.Header.Peek("Content-Encoding")) > 0 {
+		return
 	}
+
+	contentType := ctx.Response.Header.Peek("Content-Type")
+	if !c.shouldCompress(contentType) {
+		return
+	}
+
+	c.compressResponse(ctx)
 }
 
-type CompressionStats struct {
-	OriginalSize   int
-	CompressedSize int
-	Ratio          float64
-	Duration       time.Duration
-}
-
-func (c *CompressionMiddleware) selectBestEncoding(acceptEncoding string) string {
-	if acceptEncoding == "" {
-		return AlgorithmNone
-	}
-
-	encodings := c.parseAcceptEncoding(acceptEncoding)
-	if len(encodings) == 0 {
-		return AlgorithmNone
-	}
-
-	for i := 0; i < len(encodings)-1; i++ {
-		for j := i + 1; j < len(encodings); j++ {
-			if encodings[i].Quality < encodings[j].Quality {
-				encodings[i], encodings[j] = encodings[j], encodings[i]
-			}
-		}
-	}
-
-	for _, encoding := range encodings {
-		if encoding.Name == c.compressionConfig.Algorithm && encoding.Quality > 0 {
-			return encoding.Name
-		}
-	}
-
-	supportedAlgorithms := map[string]bool{
-		AlgorithmBrotli:  true,
-		AlgorithmGzip:    true,
-		AlgorithmDeflate: true,
-	}
-
-	for _, encoding := range encodings {
-		if supportedAlgorithms[encoding.Name] && encoding.Quality > 0 {
-			return encoding.Name
-		}
-	}
-
-	return AlgorithmNone
-}
-
-func (c *CompressionMiddleware) parseAcceptEncoding(acceptEncoding string) []EncodingInfo {
-	var encodings []EncodingInfo
-
-	if acceptEncoding == "" {
-		return encodings
-	}
-
-	parts := strings.Split(acceptEncoding, ",")
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-
-		encoding := part
-		quality := 1.0
-
-		if qIndex := strings.Index(part, ";q="); qIndex != -1 {
-			encoding = strings.TrimSpace(part[:qIndex])
-			if q, err := strconv.ParseFloat(strings.TrimSpace(part[qIndex+3:]), 64); err == nil && q >= 0 && q <= 1 {
-				quality = q
-			}
-		}
-
-		switch encoding {
-		case AlgorithmGzip, AlgorithmBrotli, AlgorithmDeflate:
-			encodings = append(encodings, EncodingInfo{
-				Name:    encoding,
-				Quality: quality,
-			})
-		}
-	}
-
-	return encodings
-}
-
-func (c *CompressionMiddleware) compressResponse(ctx *fasthttp.RequestCtx, algorithm string) (bool, CompressionStats) {
-	var stats CompressionStats
-
-	bodyBytes := ctx.Response.Body()
-	stats.OriginalSize = len(bodyBytes)
-
-	if len(bodyBytes) < c.compressionConfig.Threshold {
-		c.logger.Debug("Response too small for compression",
-			zap.Int("size", len(bodyBytes)),
-			zap.Int("threshold", c.compressionConfig.Threshold))
-		return false, stats
-	}
-
-	if !c.shouldCompress(ctx) {
-		c.logger.Debug("Content type not suitable for compression")
-		return false, stats
-	}
-
-	start := time.Now()
-	compressedData, err := c.compress(bodyBytes, algorithm)
-	stats.Duration = time.Since(start)
-
-	if err != nil {
-		c.logger.Error("Compression failed",
-			zap.String("algorithm", algorithm),
-			zap.Error(err))
-		return false, stats
-	}
-
-	stats.CompressedSize = len(compressedData)
-	stats.Ratio = float64(stats.CompressedSize) / float64(stats.OriginalSize)
-
-	if 1.0-stats.Ratio < MinCompressionRatio {
-		c.logger.Debug("Compression not effective",
-			zap.Float64("ratio", stats.Ratio),
-			zap.Float64("min_compression", MinCompressionRatio))
-		return false, stats
-	}
-
-	c.updateResponseHeaders(ctx, algorithm, len(compressedData))
-	ctx.Response.SetBody(compressedData)
-
-	return true, stats
-}
-
-func (c *CompressionMiddleware) shouldCompress(ctx *fasthttp.RequestCtx) bool {
-	contentType := string(ctx.Response.Header.ContentType())
-	if contentType == "" {
+func (c *CompressionMiddleware) supportsCompression(acceptEncoding []byte) bool {
+	if len(acceptEncoding) == 0 {
 		return false
 	}
 
-	if semicolon := strings.Index(contentType, ";"); semicolon != -1 {
-		contentType = contentType[:semicolon]
-	}
-	contentType = strings.TrimSpace(strings.ToLower(contentType))
-
-	return c.isContentTypeAllowed(contentType)
+	return bytes.Contains(acceptEncoding, c.algorithm)
 }
 
-func (c *CompressionMiddleware) isContentTypeAllowed(contentType string) bool {
-	for _, allowedType := range c.compressionConfig.AllowedTypes {
-		allowedType = strings.ToLower(allowedType)
+func (c *CompressionMiddleware) shouldCompress(contentType []byte) bool {
+	if len(contentType) == 0 {
+		return false
+	}
 
-		if contentType == allowedType {
+	ctStr := string(contentType)
+
+	if semicolon := strings.Index(ctStr, ";"); semicolon != -1 {
+		ctStr = ctStr[:semicolon]
+	}
+	ctStr = strings.TrimSpace(strings.ToLower(ctStr))
+
+	for _, allowedType := range c.compressionConfig.AllowedTypes {
+		if allowedType == ctStr {
 			return true
 		}
-
 		if strings.HasSuffix(allowedType, "*") {
 			prefix := strings.TrimSuffix(allowedType, "*")
-			if strings.HasPrefix(contentType, prefix) {
+			if strings.HasPrefix(ctStr, prefix) {
 				return true
 			}
 		}
 	}
-
 	return false
 }
 
-func (c *CompressionMiddleware) updateResponseHeaders(ctx *fasthttp.RequestCtx, algorithm string, compressedSize int) {
-	ctx.Response.Header.Set("Content-Encoding", algorithm)
-	ctx.Response.Header.Set("Content-Length", strconv.Itoa(compressedSize))
+func (c *CompressionMiddleware) compressResponse(ctx *types.RequestCtx) {
+	bodyBytes := ctx.Response.Body()
+	originalSize := len(bodyBytes)
 
-	if existingVary := string(ctx.Response.Header.Peek("Vary")); existingVary != "" {
-		if !strings.Contains(existingVary, "Accept-Encoding") {
-			ctx.Response.Header.Set("Vary", existingVary+", Accept-Encoding")
-		}
+	if originalSize < c.compressionConfig.Threshold {
+		return
+	}
+
+	timeoutCtx, cancel := context.WithTimeout(context.Background(),
+		time.Duration(c.compressionConfig.Timeout)*time.Second)
+	defer cancel()
+
+	if originalSize > StreamingThreshold {
+		c.compressResponseStreaming(ctx, bodyBytes, timeoutCtx)
 	} else {
-		ctx.Response.Header.Set("Vary", "Accept-Encoding")
+		c.compressResponseInMemory(ctx, bodyBytes, timeoutCtx)
 	}
 }
 
-func (c *CompressionMiddleware) compress(data []byte, algorithm string) ([]byte, error) {
-	switch algorithm {
-	case AlgorithmGzip:
-		return c.compressGzip(data)
-	case AlgorithmDeflate:
-		return c.compressDeflate(data)
-	case AlgorithmBrotli:
-		return c.compressBrotli(data)
-	default:
-		return nil, fmt.Errorf("unsupported compression algorithm: %s", algorithm)
+func (c *CompressionMiddleware) compressResponseInMemory(ctx *types.RequestCtx, bodyBytes []byte, timeoutCtx context.Context) {
+	originalSize := len(bodyBytes)
+
+	done := make(chan struct {
+		data []byte
+		err  error
+	}, 1)
+
+	go func() {
+		data, err := c.compressFunc(bodyBytes, originalSize)
+		done <- struct {
+			data []byte
+			err  error
+		}{data, err}
+	}()
+
+	select {
+	case result := <-done:
+		if result.err != nil {
+			return
+		}
+
+		compressedSize := len(result.data)
+		ratio := float64(compressedSize) / float64(originalSize)
+
+		if 1.0-ratio < MinCompressionRatio {
+			return
+		}
+
+		c.updateResponseHeaders(ctx, compressedSize)
+		ctx.Response.SetBody(result.data)
+
+	case <-timeoutCtx.Done():
+		c.logger.Warn("Compression timeout", zap.Int("size", originalSize))
+		return
 	}
 }
 
-func (c *CompressionMiddleware) compressGzip(data []byte) ([]byte, error) {
-	buf := c.getBuffer()
-	defer c.putBuffer(buf)
+func (c *CompressionMiddleware) compressResponseStreaming(ctx *types.RequestCtx, bodyBytes []byte, timeoutCtx context.Context) {
+	originalSize := len(bodyBytes)
+
+	done := make(chan struct {
+		buf *bytes.Buffer
+		err error
+	}, 1)
+
+	go func() {
+		buf := c.getBuffer(originalSize / 2)
+		defer c.putBuffer(buf, originalSize/2)
+
+		reader := bytes.NewReader(bodyBytes)
+		err := c.streamCompressFunc(buf, reader)
+
+		result := struct {
+			buf *bytes.Buffer
+			err error
+		}{buf, err}
+		done <- result
+	}()
+
+	select {
+	case result := <-done:
+		if result.err != nil {
+			return
+		}
+
+		compressedSize := result.buf.Len()
+		ratio := float64(compressedSize) / float64(originalSize)
+
+		if 1.0-ratio < MinCompressionRatio {
+			return
+		}
+
+		c.updateResponseHeaders(ctx, compressedSize)
+		ctx.Response.SetBody(result.buf.Bytes())
+
+	case <-timeoutCtx.Done():
+		c.logger.Warn("Streaming compression timeout", zap.Int("size", originalSize))
+		return
+	}
+}
+
+func (c *CompressionMiddleware) compressGzipOptimized(data []byte, size int) ([]byte, error) {
+	estimatedSize := size / 3
+	buf := c.getBufferWithCapacity(estimatedSize)
+	defer c.putBuffer(buf, estimatedSize)
 
 	writer := c.getGzipWriter(buf)
 	defer c.putGzipWriter(writer)
 
 	if _, err := writer.Write(data); err != nil {
-		return nil, fmt.Errorf("gzip write error: %w", err)
+		return nil, err
 	}
 
 	if err := writer.Close(); err != nil {
-		return nil, fmt.Errorf("gzip close error: %w", err)
+		return nil, err
 	}
 
-	result := make([]byte, buf.Len())
-	copy(result, buf.Bytes())
-	return result, nil
+	result := buf.Bytes()
+	return append([]byte(nil), result...), nil
 }
 
-func (c *CompressionMiddleware) compressDeflate(data []byte) ([]byte, error) {
-	buf := c.getBuffer()
-	defer c.putBuffer(buf)
+func (c *CompressionMiddleware) compressDeflateOptimized(data []byte, size int) ([]byte, error) {
+	estimatedSize := size / 3
+	buf := c.getBufferWithCapacity(estimatedSize)
+	defer c.putBuffer(buf, estimatedSize)
 
 	writer := c.getDeflateWriter(buf)
 	defer c.putDeflateWriter(writer)
 
 	if _, err := writer.Write(data); err != nil {
-		return nil, fmt.Errorf("deflate write error: %w", err)
+		return nil, err
 	}
 
 	if err := writer.Close(); err != nil {
-		return nil, fmt.Errorf("deflate close error: %w", err)
+		return nil, err
 	}
 
-	result := make([]byte, buf.Len())
-	copy(result, buf.Bytes())
-	return result, nil
+	result := buf.Bytes()
+	return append([]byte(nil), result...), nil
 }
 
-func (c *CompressionMiddleware) compressBrotli(data []byte) ([]byte, error) {
-	buf := c.getBuffer()
-	defer c.putBuffer(buf)
+func (c *CompressionMiddleware) compressBrotliOptimized(data []byte, size int) ([]byte, error) {
+	estimatedSize := size / 4
+	buf := c.getBufferWithCapacity(estimatedSize)
+	defer c.putBuffer(buf, estimatedSize)
 
 	writer := c.getBrotliWriter(buf)
 	defer c.putBrotliWriter(writer)
 
 	if _, err := writer.Write(data); err != nil {
-		return nil, fmt.Errorf("brotli write error: %w", err)
+		return nil, err
 	}
 
 	if err := writer.Close(); err != nil {
-		return nil, fmt.Errorf("brotli close error: %w", err)
+		return nil, err
 	}
 
-	result := make([]byte, buf.Len())
-	copy(result, buf.Bytes())
-	return result, nil
+	result := buf.Bytes()
+	return append([]byte(nil), result...), nil
+}
+
+func (c *CompressionMiddleware) streamCompressGzip(w io.Writer, r io.Reader) error {
+	writer, err := gzip.NewWriterLevel(w, c.compressionConfig.Level)
+	if err != nil {
+		return err
+	}
+	defer func(writer *gzip.Writer) {
+		err := writer.Close()
+		if err != nil {
+			c.logger.Error("Failed to close writer", zap.Error(err))
+		}
+	}(writer)
+
+	_, err = io.Copy(writer, r)
+	return err
+}
+
+func (c *CompressionMiddleware) streamCompressDeflate(w io.Writer, r io.Reader) error {
+	writer, err := flate.NewWriter(w, c.compressionConfig.Level)
+	if err != nil {
+		return err
+	}
+
+	defer func(writer *flate.Writer) {
+		err := writer.Close()
+		if err != nil {
+			c.logger.Error("Failed to close writer", zap.Error(err))
+		}
+	}(writer)
+
+	_, err = io.Copy(writer, r)
+	return err
+}
+
+func (c *CompressionMiddleware) streamCompressBrotli(w io.Writer, r io.Reader) error {
+	writer := brotli.NewWriterLevel(w, c.compressionConfig.Level)
+
+	defer func(writer *brotli.Writer) {
+		err := writer.Close()
+		if err != nil {
+			c.logger.Error("Failed to close writer", zap.Error(err))
+		}
+	}(writer)
+
+	_, err := io.Copy(writer, r)
+	return err
+}
+
+func (c *CompressionMiddleware) updateResponseHeaders(ctx *types.RequestCtx, compressedSize int) {
+	ctx.Response.Header.SetContentEncoding(c.compressionConfig.Algorithm)
+	ctx.Response.Header.SetContentLength(compressedSize)
+
+	existingVary := ctx.Response.Header.Peek("Vary")
+	if len(existingVary) > 0 {
+		if !bytes.Contains(existingVary, c.varyHeaderValue) {
+			buf := c.stringPool.Get().(*[]byte)
+			defer func() {
+				*buf = (*buf)[:0]
+				c.stringPool.Put(buf)
+			}()
+
+			*buf = append(*buf, existingVary...)
+			*buf = append(*buf, ", "...)
+			*buf = append(*buf, c.varyHeaderValue...)
+			ctx.Response.Header.SetBytesV("Vary", *buf)
+		}
+	} else {
+		ctx.Response.Header.SetBytesV("Vary", c.varyHeaderValue)
+	}
+}
+
+func (c *CompressionMiddleware) getBuffer(dataSize int) *bytes.Buffer {
+	poolIndex := c.getPoolIndex(dataSize)
+	buf := c.bufferPools[poolIndex].Get().(*bytes.Buffer)
+	buf.Reset()
+	return buf
+}
+
+func (c *CompressionMiddleware) getBufferWithCapacity(estimatedSize int) *bytes.Buffer {
+	poolIndex := c.getPoolIndex(estimatedSize)
+	buf := c.bufferPools[poolIndex].Get().(*bytes.Buffer)
+	buf.Reset()
+
+	if buf.Cap() < estimatedSize {
+		buf.Grow(estimatedSize - buf.Cap())
+	}
+
+	return buf
+}
+
+func (c *CompressionMiddleware) putBuffer(buf *bytes.Buffer, dataSize int) {
+	poolIndex := c.getPoolIndex(dataSize)
+	c.bufferPools[poolIndex].Put(buf)
+}
+
+func (c *CompressionMiddleware) getPoolIndex(size int) int {
+	if size <= SmallBufferSize {
+		return 0
+	} else if size <= MediumBufferSize {
+		return 1
+	} else if size <= LargeBufferSize {
+		return 2
+	}
+	return 3
 }
 
 func (c *CompressionMiddleware) initializePools() {
@@ -431,21 +484,37 @@ func (c *CompressionMiddleware) initializePools() {
 		},
 	}
 
-	c.bufferPool = sync.Pool{
+	c.bufferPools = make([]*sync.Pool, 4)
+
+	c.bufferPools[0] = &sync.Pool{
 		New: func() interface{} {
-			return &bytes.Buffer{}
+			return bytes.NewBuffer(make([]byte, 0, SmallBufferSize))
 		},
 	}
-}
 
-func (c *CompressionMiddleware) getBuffer() *bytes.Buffer {
-	buf := c.bufferPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	return buf
-}
+	c.bufferPools[1] = &sync.Pool{
+		New: func() interface{} {
+			return bytes.NewBuffer(make([]byte, 0, MediumBufferSize))
+		},
+	}
 
-func (c *CompressionMiddleware) putBuffer(buf *bytes.Buffer) {
-	c.bufferPool.Put(buf)
+	c.bufferPools[2] = &sync.Pool{
+		New: func() interface{} {
+			return bytes.NewBuffer(make([]byte, 0, LargeBufferSize))
+		},
+	}
+
+	c.bufferPools[3] = &sync.Pool{
+		New: func() interface{} {
+			return bytes.NewBuffer(make([]byte, 0, LargeBufferSize*4))
+		},
+	}
+
+	c.stringPool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, 0, 256)
+		},
+	}
 }
 
 func (c *CompressionMiddleware) getGzipWriter(buf *bytes.Buffer) *gzip.Writer {
@@ -479,38 +548,4 @@ func (c *CompressionMiddleware) getBrotliWriter(buf *bytes.Buffer) *brotli.Write
 func (c *CompressionMiddleware) putBrotliWriter(writer *brotli.Writer) {
 	writer.Reset(nil)
 	c.brotliWriterPool.Put(writer)
-}
-
-func (c *CompressionMiddleware) recordMetric(algorithm, result string) {
-	if c.metrics == nil {
-		return
-	}
-
-	counter := c.metrics.Counter("compression_requests_total", map[string]string{
-		"algorithm": algorithm,
-		"result":    result,
-	})
-	counter.Inc()
-}
-
-func (c *CompressionMiddleware) recordCompressionRatio(algorithm string, ratio float64) {
-	if c.metrics == nil {
-		return
-	}
-
-	histogram := c.metrics.Histogram("compression_ratio",
-		[]float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9},
-		map[string]string{"algorithm": algorithm})
-	histogram.Observe(ratio)
-}
-
-func (c *CompressionMiddleware) recordDuration(algorithm string, duration time.Duration) {
-	if c.metrics == nil {
-		return
-	}
-
-	histogram := c.metrics.Histogram("compression_duration_seconds",
-		[]float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0},
-		map[string]string{"algorithm": algorithm})
-	histogram.Observe(duration.Seconds())
 }
