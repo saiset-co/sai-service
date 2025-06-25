@@ -3,17 +3,19 @@ package service
 import (
 	"context"
 	"fmt"
-	"github.com/saiset-co/sai-service/tls"
 	"os"
 	"os/signal"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/saiset-co/sai-service/action"
+	"github.com/saiset-co/sai-service/auth_providers"
 	"github.com/saiset-co/sai-service/cache"
 	"github.com/saiset-co/sai-service/client"
 	"github.com/saiset-co/sai-service/config"
@@ -25,16 +27,29 @@ import (
 	"github.com/saiset-co/sai-service/middleware"
 	"github.com/saiset-co/sai-service/sai"
 	"github.com/saiset-co/sai-service/server"
+	"github.com/saiset-co/sai-service/tls"
 	"github.com/saiset-co/sai-service/types"
 )
 
+type State int32
+
+const (
+	StateStopped State = iota
+	StateStarting
+	StateRunning
+	StateStopping
+)
+
 type Service struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	configPath string
-	done       chan struct{}
-	wg         sync.WaitGroup
-	running    int32
+	ctx             context.Context
+	cancel          context.CancelFunc
+	configPath      string
+	done            chan struct{}
+	wg              sync.WaitGroup
+	state           atomic.Value
+	shutdownTimeout time.Duration
+	startTimeout    time.Duration
+	container       *sai.Container
 }
 
 func NewService(ctx context.Context, configPath string) (*Service, error) {
@@ -51,12 +66,16 @@ func NewService(ctx context.Context, configPath string) (*Service, error) {
 	container := sai.InitContainer()
 
 	service := &Service{
-		ctx:        serviceCtx,
-		cancel:     cancel,
-		configPath: configPath,
-		done:       make(chan struct{}),
-		running:    0,
+		ctx:             serviceCtx,
+		cancel:          cancel,
+		configPath:      configPath,
+		container:       container,
+		done:            make(chan struct{}),
+		shutdownTimeout: 30 * time.Second,
+		startTimeout:    60 * time.Second,
 	}
+
+	service.state.Store(StateStopped)
 
 	if err := registerProviders(container, ctx, configPath); err != nil {
 		cancel()
@@ -64,12 +83,11 @@ func NewService(ctx context.Context, configPath string) (*Service, error) {
 	}
 
 	sai.SetContainer(container)
-
 	return service, nil
 }
 
-func (s *Service) Run() error {
-	if !atomic.CompareAndSwapInt32(&s.running, 0, 1) {
+func (s *Service) Start() error {
+	if !s.transitionState(StateStopped, StateStarting) {
 		sai.Logger().Warn("Service is already running")
 		return types.ErrServerAlreadyRunning
 	}
@@ -80,9 +98,9 @@ func (s *Service) Run() error {
 			if r := recover(); r != nil {
 				buf := make([]byte, 4096)
 				n := runtime.Stack(buf, false)
-				runErr = fmt.Errorf("%v", r)
-				sai.Logger().Error("Service run", zap.Stack(string(buf[:n])))
-				atomic.StoreInt32(&s.running, 0)
+				runErr = fmt.Errorf("service panic: %v", r)
+				sai.Logger().Error("Service run panic", zap.Stack(string(buf[:n])))
+				s.setState(StateStopped)
 			}
 		}()
 
@@ -95,11 +113,15 @@ func (s *Service) Run() error {
 func (s *Service) run() error {
 	sai.Logger().Info("Starting service")
 
-	if err := s.startComponents(); err != nil {
-		atomic.StoreInt32(&s.running, 0)
+	ctx, cancel := context.WithTimeout(s.ctx, s.startTimeout)
+	defer cancel()
+
+	if err := s.startComponents(ctx); err != nil {
+		s.setState(StateStopped)
 		return types.WrapError(err, "failed to start components")
 	}
 
+	s.setState(StateRunning)
 	s.setupSignalHandling()
 
 	s.wg.Add(1)
@@ -114,21 +136,19 @@ func (s *Service) run() error {
 	}
 
 	s.wg.Wait()
-
-	atomic.StoreInt32(&s.running, 0)
+	s.setState(StateStopped)
 
 	sai.Logger().Info("Service stopped gracefully")
 	return nil
 }
 
 func (s *Service) Stop() error {
-	if !atomic.CompareAndSwapInt32(&s.running, 1, 0) {
+	if !s.transitionState(StateRunning, StateStopping) {
 		sai.Logger().Warn("Service is not running")
 		return types.ErrServiceIsNotRunning
 	}
 
 	sai.Logger().Info("Stopping service...")
-
 	s.cancel()
 
 	return nil
@@ -147,158 +167,407 @@ func (s *Service) Context() context.Context {
 }
 
 func (s *Service) IsRunning() bool {
-	return atomic.LoadInt32(&s.running) == 1
+	return s.getState() == StateRunning
 }
 
-func (s *Service) startComponents() error {
+func (s *Service) getState() State {
+	return s.state.Load().(State)
+}
+
+func (s *Service) setState(newState State) bool {
+	currentState := s.getState()
+	return s.state.CompareAndSwap(currentState, newState)
+}
+
+func (s *Service) transitionState(from, to State) bool {
+	return s.state.CompareAndSwap(from, to)
+}
+
+func (s *Service) startComponents(ctx context.Context) error {
 	_config := sai.Config().GetConfig()
 
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		if ptr := s.container.Config.Load(); ptr != nil {
+			manager := (*ptr).(types.LifecycleManager)
+			if err := manager.Start(); err != nil {
+				return types.WrapError(err, "failed to start config manager")
+			}
+		}
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		if ptr := s.container.Logger.Load(); ptr != nil {
+			manager := (*ptr).(types.LifecycleManager)
+			if err := manager.Start(); err != nil {
+				return types.WrapError(err, "failed to start logger")
+			}
+		}
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		if ptr := s.container.AuthProvider.Load(); ptr != nil {
+			manager := (*ptr).(types.LifecycleManager)
+			if err := manager.Start(); err != nil {
+				sai.Logger().Error("Failed to start auth provider", zap.Error(err))
+			}
+		}
+	}
+
 	if _config.Health.Enabled {
-		if err := sai.Health().Start(); err != nil {
-			sai.Logger().Error("Failed to start health manager", zap.Error(err))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			if ptr := s.container.Health.Load(); ptr != nil {
+				manager := (*ptr).(types.LifecycleManager)
+				if err := manager.Start(); err != nil {
+					sai.Logger().Error("Failed to start health manager", zap.Error(err))
+				}
+			}
 		}
 	}
 
 	if _config.Middlewares.Enabled {
-		if err := sai.Middlewares().RegisterMiddlewares(); err != nil {
-			return fmt.Errorf("failed to register middlewares: %w", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			if ptr := s.container.Middlewares.Load(); ptr != nil {
+				manager := (*ptr).(types.LifecycleManager)
+				if err := manager.Start(); err != nil {
+					sai.Logger().Error("Failed to start middleware manager", zap.Error(err))
+				}
+			}
 		}
 	}
 
+	g, gCtx := errgroup.WithContext(ctx)
+
 	if _config.Docs.Enabled {
-		if err := sai.Documentation().Start(); err != nil {
-			sai.Logger().Error("Failed to generate documentation", zap.Error(err))
-		}
+		g.Go(func() error {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+				if ptr := s.container.Documentation.Load(); ptr != nil {
+					manager := (*ptr).(types.LifecycleManager)
+					if err := manager.Start(); err != nil {
+						sai.Logger().Error("Failed to start documentation manager", zap.Error(err))
+					}
+				}
+				return nil
+			}
+		})
 	}
 
 	if _config.Metrics.Enabled {
-		if err := sai.Metrics().Start(); err != nil {
-			sai.Logger().Error("Failed to start metrics manager", zap.Error(err))
-		}
-	}
-
-	if _config.Actions.Enabled {
-		if err := sai.Actions().Start(); err != nil {
-			sai.Logger().Error("Failed to start action broker", zap.Error(err))
-		}
-	}
-
-	if _config.Server.TLS.Enabled {
-		if err := sai.TLSManager().Start(); err != nil {
-			sai.Logger().Error("Failed to start TLS manager", zap.Error(err))
-		}
-	}
-
-	if err := sai.Router().FinalizePendingRoutes(); err != nil {
-		return types.WrapError(err, "failed to finalize routes")
-	}
-
-	if err := sai.HTTPServer().Start(); err != nil {
-		return types.WrapError(err, "failed to start HTTP server")
-	}
-
-	if _config.Cron.Enabled {
-		if err := sai.Cron().Start(); err != nil {
-			sai.Logger().Error("Failed to start cron manager", zap.Error(err))
-		}
+		g.Go(func() error {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+				if ptr := s.container.Metrics.Load(); ptr != nil {
+					manager := (*ptr).(types.LifecycleManager)
+					if err := manager.Start(); err != nil {
+						sai.Logger().Error("Failed to start metrics manager", zap.Error(err))
+					}
+				}
+				return nil
+			}
+		})
 	}
 
 	if _config.Cache.Enabled {
-		if err := sai.Cache().Start(); err != nil {
-			sai.Logger().Error("Failed to start cache manager", zap.Error(err))
+		g.Go(func() error {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+				if ptr := s.container.Cache.Load(); ptr != nil {
+					manager := (*ptr).(types.LifecycleManager)
+					if err := manager.Start(); err != nil {
+						sai.Logger().Error("Failed to start cache manager", zap.Error(err))
+					}
+				}
+				return nil
+			}
+		})
+	}
+
+	if _config.Server.TLS.Enabled {
+		g.Go(func() error {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+				if ptr := s.container.TLSManager.Load(); ptr != nil {
+					manager := (*ptr).(types.LifecycleManager)
+					if err := manager.Start(); err != nil {
+						sai.Logger().Error("Failed to start tls manager", zap.Error(err))
+					}
+				}
+				return nil
+			}
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		select {
+		case <-ctx.Done():
+			return types.NewErrorf("component startup timeout: %v", ctx.Err())
+		default:
+			return err
 		}
 	}
 
 	if _config.Client.Enabled {
-		if err := sai.ClientManager().Start(); err != nil {
-			sai.Logger().Error("Failed to start client manager", zap.Error(err))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			if ptr := s.container.ClientManager.Load(); ptr != nil {
+				if err := (*ptr).(types.LifecycleManager).Start(); err != nil {
+					sai.Logger().Error("Failed to start client manager", zap.Error(err))
+				}
+			}
+		}
+	}
+
+	if _config.Actions != nil && (_config.Actions.Broker != nil || _config.Actions.Webhooks != nil) && _config.Actions.Broker.Enabled {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			if ptr := s.container.Actions.Load(); ptr != nil {
+				if err := (*ptr).(types.LifecycleManager).Start(); err != nil {
+					sai.Logger().Error("Failed to start action dispatcher", zap.Error(err))
+				}
+			}
+		}
+	}
+
+	if ptr := s.container.Router.Load(); ptr != nil {
+		if err := (*ptr).(types.LifecycleManager).Start(); err != nil {
+			return types.WrapError(err, "failed to start router")
+		}
+	}
+
+	if ptr := s.container.HTTPServer.Load(); ptr != nil {
+		_server := *ptr
+		if err := _server.Start(); err != nil {
+			sai.Logger().Error("Failed to start HTTP server", zap.Error(err))
+		}
+	}
+
+	if _config.Cron.Enabled {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			if ptr := s.container.Cron.Load(); ptr != nil {
+				if err := (*ptr).(types.LifecycleManager).Start(); err != nil {
+					sai.Logger().Error("Failed to start cron manager", zap.Error(err))
+				}
+			}
 		}
 	}
 
 	sai.Logger().Info("All components started successfully")
-
 	return nil
 }
 
 func (s *Service) stopComponents() error {
-	var _errors []error
-	_config := sai.Config().GetConfig()
+	ctx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
+	defer cancel()
+
+	var errors []error
 
 	sai.Logger().Info("Stopping service components...")
 
-	if _config.Actions.Enabled && sai.Actions() != nil {
-		if err := sai.Actions().Stop(); err != nil {
-			sai.Logger().Error("Failed to stop action broker", zap.Error(err))
-			_errors = append(_errors, err)
+	g, gCtx := errgroup.WithContext(ctx)
+
+	if ptr := s.container.Cron.Load(); ptr != nil {
+		manager := (*ptr).(types.LifecycleManager)
+		g.Go(func() error {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+				if err := manager.Stop(); err != nil {
+					sai.Logger().Error("Failed to stop action dispatcher", zap.Error(err))
+					return err
+				}
+				return nil
+			}
+		})
+	}
+
+	if ptr := s.container.Cron.Load(); ptr != nil {
+		manager := (*ptr).(types.LifecycleManager)
+		g.Go(func() error {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+				if err := manager.Stop(); err != nil {
+					sai.Logger().Error("Failed to stop cron manager", zap.Error(err))
+					return err
+				}
+				return nil
+			}
+		})
+	}
+
+	if ptr := s.container.ClientManager.Load(); ptr != nil {
+		manager := (*ptr).(types.LifecycleManager)
+		g.Go(func() error {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+				if err := manager.Stop(); err != nil {
+					sai.Logger().Error("Failed to stop client manager", zap.Error(err))
+					return err
+				}
+				return nil
+			}
+		})
+	}
+
+	if ptr := s.container.Documentation.Load(); ptr != nil {
+		manager := (*ptr).(types.LifecycleManager)
+		g.Go(func() error {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+				if err := manager.Stop(); err != nil {
+					sai.Logger().Error("Failed to stop documentation manager", zap.Error(err))
+					return err
+				}
+				return nil
+			}
+		})
+	}
+
+	if ptr := s.container.Middlewares.Load(); ptr != nil {
+		manager := (*ptr).(types.LifecycleManager)
+		g.Go(func() error {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+				if err := manager.Stop(); err != nil {
+					sai.Logger().Error("Failed to stop middleware manager", zap.Error(err))
+					return err
+				}
+				return nil
+			}
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		select {
+		case <-ctx.Done():
+			sai.Logger().Warn("Component shutdown timeout, some components may not have stopped gracefully")
+		default:
+			errors = append(errors, err)
 		}
 	}
 
-	if _config.Cron.Enabled && sai.Cron() != nil {
-		if err := sai.Cron().Stop(); err != nil {
-			sai.Logger().Error("Failed to stop cron manager", zap.Error(err))
-			_errors = append(_errors, err)
+	if ptr := s.container.AuthProvider.Load(); ptr != nil {
+		manager := (*ptr).(types.LifecycleManager)
+		if err := manager.Stop(); err != nil {
+			sai.Logger().Error("Failed to stop auth provider", zap.Error(err))
+			errors = append(errors, err)
 		}
 	}
 
-	if sai.HTTPServer() != nil {
-		if err := sai.HTTPServer().Stop(); err != nil {
+	if ptr := s.container.Router.Load(); ptr != nil {
+		if err := (*ptr).(types.LifecycleManager).Stop(); err != nil {
+			return types.WrapError(err, "failed to start router")
+		}
+	}
+
+	if ptr := s.container.HTTPServer.Load(); ptr != nil {
+		manager := (*ptr).(types.LifecycleManager)
+		if err := manager.Stop(); err != nil {
 			sai.Logger().Error("Failed to stop HTTP server", zap.Error(err))
-			_errors = append(_errors, err)
+			errors = append(errors, err)
 		}
 	}
 
-	if _config.Server.TLS.Enabled && sai.TLSManager() != nil {
-		if err := sai.TLSManager().Stop(); err != nil {
-			sai.Logger().Error("Failed to stop TLS manager", zap.Error(err))
-			_errors = append(_errors, err)
+	g, gCtx = errgroup.WithContext(context.Background())
+
+	if ptr := s.container.TLSManager.Load(); ptr != nil {
+		manager := (*ptr).(types.LifecycleManager)
+		g.Go(func() error {
+			if err := manager.Stop(); err != nil {
+				sai.Logger().Error("Failed to stop TLS manager", zap.Error(err))
+				return err
+			}
+			return nil
+		})
+	}
+
+	if ptr := s.container.Cache.Load(); ptr != nil {
+		manager := (*ptr).(types.LifecycleManager)
+		g.Go(func() error {
+			if err := manager.Stop(); err != nil {
+				sai.Logger().Error("Failed to stop cache manager", zap.Error(err))
+				return err
+			}
+			return nil
+		})
+	}
+
+	if ptr := s.container.Metrics.Load(); ptr != nil {
+		manager := (*ptr).(types.LifecycleManager)
+		g.Go(func() error {
+			if err := manager.Stop(); err != nil {
+				sai.Logger().Error("Failed to stop metrics manager", zap.Error(err))
+				return err
+			}
+			return nil
+		})
+	}
+
+	if ptr := s.container.Health.Load(); ptr != nil {
+		manager := (*ptr).(types.LifecycleManager)
+		g.Go(func() error {
+			if err := manager.Stop(); err != nil {
+				sai.Logger().Error("Failed to stop health manager", zap.Error(err))
+				return err
+			}
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		errors = append(errors, err)
+	}
+
+	if ptr := s.container.Config.Load(); ptr != nil {
+		if err := (*ptr).(types.LifecycleManager).Stop(); err != nil {
+			sai.Logger().Error("Failed to stop config manager", zap.Error(err))
+			errors = append(errors, err)
 		}
 	}
 
-	if _config.Client.Enabled && sai.ClientManager() != nil {
-		if err := sai.ClientManager().Stop(); err != nil {
-			sai.Logger().Error("Failed to stop client manager", zap.Error(err))
-			_errors = append(_errors, err)
-		}
-	}
-
-	if _config.Cache.Enabled && sai.Cache() != nil {
-		if err := sai.Cache().Stop(); err != nil {
-			sai.Logger().Error("Failed to stop cache", zap.Error(err))
-			_errors = append(_errors, err)
-		}
-	}
-
-	if _config.Metrics.Enabled && sai.Metrics() != nil {
-		if err := sai.Metrics().Stop(); err != nil {
-			sai.Logger().Error("Failed to stop metrics manager", zap.Error(err))
-			_errors = append(_errors, err)
-		}
-	}
-
-	if _config.Health.Enabled && sai.Health() != nil {
-		if err := sai.Health().Stop(); err != nil {
-			sai.Logger().Error("Failed to stop health manager", zap.Error(err))
-			_errors = append(_errors, err)
-		}
-	}
-
-	if _config.Docs.Enabled && sai.Documentation() != nil {
-		if err := sai.Documentation().Stop(); err != nil {
-			sai.Logger().Error("Failed to stop documentation manager", zap.Error(err))
-			_errors = append(_errors, err)
-		}
-	}
-
-	if _config.Middlewares.Enabled && sai.Middlewares() != nil {
-		sai.Middlewares().Clear()
-	}
-
-	if len(_errors) > 0 {
-		return types.NewErrorf("errors during shutdown: %v", _errors)
+	if len(errors) > 0 {
+		return types.NewErrorf("errors during shutdown: %v", errors)
 	}
 
 	sai.Logger().Info("All components stopped successfully")
-
 	return nil
 }
 
@@ -317,11 +586,16 @@ func (s *Service) setupSignalHandling() {
 		select {
 		case sig := <-sigChan:
 			sai.Logger().Info("Received shutdown signal", zap.String("signal", sig.String()))
-			s.cancel()
+			if s.transitionState(StateRunning, StateStopping) {
+				s.cancel()
+			}
 
 		case <-s.ctx.Done():
 			sai.Logger().Info("Service context cancelled")
 		}
+
+		signal.Stop(sigChan)
+		close(sigChan)
 	}()
 }
 
@@ -347,8 +621,9 @@ func registerProviders(container *sai.Container, ctx context.Context, configPath
 	var middlewareManager types.MiddlewareManager
 	var healthManager types.HealthManager
 	var tlsManager types.TLSManager
+	var clientManager types.ClientManager
 
-	configManager, err := config.NewConfigurationManager(configPath)
+	configManager, err := config.NewConfigurationManager(ctx, configPath)
 	if err != nil {
 		return types.WrapError(err, "failed to register config manager")
 	}
@@ -356,33 +631,37 @@ func registerProviders(container *sai.Container, ctx context.Context, configPath
 
 	_config := configManager.GetConfig()
 
-	loggerManager, err := logger.NewLogger(configManager)
+	loggerManager, err := logger.NewManager(ctx, configManager)
 	if err != nil {
 		return types.WrapError(err, "failed to register logger")
 	}
 	container.SetLogger(loggerManager)
 
-	router, err := server.NewFastHTTPRouter()
+	router, err := server.NewFastHTTPRouter(ctx, loggerManager)
 	if err != nil {
 		return types.WrapError(err, "failed to register router")
 	}
 	container.SetRouter(router)
 
+	authProvider, err := auth_providers.NewAuthProviderManager(ctx, configManager, loggerManager)
+	if err != nil {
+		return types.WrapError(err, "failed to register auth provider")
+	}
+	container.SetAuthProvider(authProvider)
+
 	if _config.Health.Enabled {
-		healthManager, err = health.NewManager(ctx, configManager, loggerManager)
+		healthManager, err = health.NewManager(ctx, configManager, loggerManager, router)
 		if err != nil {
 			return types.WrapError(err, "failed to register health manager")
 		}
-		healthManager.RegisterRoutes(router)
 		container.SetHealth(healthManager)
 	}
 
 	if _config.Metrics.Enabled {
-		metricsManager, err = metrics.NewMetricsManager(ctx, configManager, loggerManager, healthManager)
+		metricsManager, err = metrics.NewManager(ctx, configManager, loggerManager, router, healthManager)
 		if err != nil {
 			return types.WrapError(err, "failed to register metrics manager")
 		}
-		metricsManager.RegisterRoutes(router)
 		container.SetMetrics(metricsManager)
 	}
 
@@ -392,7 +671,6 @@ func registerProviders(container *sai.Container, ctx context.Context, configPath
 			return types.WrapError(err, "failed to register TLS manager")
 		}
 		container.SetTLSManager(tlsManager)
-		//registerTLSRoutes(router, tlsManager, loggerManager)
 	}
 
 	if _config.Cron.Enabled {
@@ -401,32 +679,6 @@ func registerProviders(container *sai.Container, ctx context.Context, configPath
 			return types.WrapError(err, "failed to register cron manager")
 		}
 		container.SetCron(cronManager)
-	}
-
-	if _config.Actions.Enabled {
-		actionBroker, err := action.NewActionBroker(ctx, configManager, loggerManager, metricsManager, healthManager)
-		if err != nil {
-			return types.WrapError(err, "failed to register action broker")
-		}
-		actionBroker.RegisterRoutes(router)
-		container.SetActions(actionBroker)
-	}
-
-	if _config.Docs.Enabled {
-		documentationManager, err := documentations.NewDocumentationManager(configManager, loggerManager, healthManager, router)
-		if err != nil {
-			return types.WrapError(err, "failed to register documentation manager")
-		}
-		documentationManager.RegisterRoutes(router)
-		container.SetDocumentation(documentationManager)
-	}
-
-	if _config.Client.Enabled {
-		clientManager, err := client.NewManager(ctx, configManager, loggerManager, metricsManager, healthManager)
-		if err != nil {
-			return types.WrapError(err, "failed to register client manager")
-		}
-		container.SetClientManager(clientManager)
 	}
 
 	if _config.Cache.Enabled {
@@ -438,18 +690,41 @@ func registerProviders(container *sai.Container, ctx context.Context, configPath
 	}
 
 	if _config.Middlewares.Enabled {
-		middlewareManager, err = middleware.NewManager(ctx, configManager, loggerManager, metricsManager, cacheManager, healthManager)
+		middlewareManager, err = middleware.NewManager(ctx, configManager, loggerManager, metricsManager, cacheManager, healthManager, authProvider)
 		if err != nil {
 			return types.WrapError(err, "failed to register middleware manager")
 		}
 		container.SetMiddlewares(middlewareManager)
 	}
 
+	if _config.Client.Enabled {
+		clientManager, err = client.NewManager(ctx, configManager, loggerManager, metricsManager, healthManager, middlewareManager, authProvider)
+		if err != nil {
+			return types.WrapError(err, "failed to register client manager")
+		}
+		container.SetClientManager(clientManager)
+	}
+
+	if _config.Actions != nil && (_config.Actions.Broker != nil || _config.Actions.Webhooks != nil) {
+		actionDispatcher, err := action.NewDispatcher(ctx, configManager, loggerManager, router, metricsManager, healthManager, clientManager)
+		if err != nil {
+			return types.WrapError(err, "failed to register unified event dispatcher")
+		}
+		container.SetActions(actionDispatcher)
+	}
+
+	if _config.Docs.Enabled {
+		documentationManager, err := documentations.NewDocumentationManager(configManager, loggerManager, healthManager, router)
+		if err != nil {
+			return types.WrapError(err, "failed to register documentation manager")
+		}
+		container.SetDocumentation(documentationManager)
+	}
+
 	httpServer, err := server.NewHTTPServer(ctx, configManager, loggerManager, metricsManager, middlewareManager, tlsManager, router)
 	if err != nil {
 		return types.WrapError(err, "failed to register HTTP server")
 	}
-
 	container.SetHTTPServer(httpServer)
 
 	return nil

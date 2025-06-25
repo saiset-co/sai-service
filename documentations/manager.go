@@ -1,6 +1,7 @@
 package documentations
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -11,130 +12,299 @@ import (
 
 	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/saiset-co/sai-service/types"
 	"github.com/saiset-co/sai-service/utils"
 )
 
+type State int32
+
+const (
+	StateStopped State = iota
+	StateStarting
+	StateRunning
+	StateStopping
+)
+
 type DocumentationManager struct {
-	config  types.ConfigManager
-	logger  types.Logger
-	health  types.HealthManager
-	router  types.HTTPRouter
-	mu      sync.RWMutex
-	routes  map[string]*types.RouteDocumentation
-	spec    *types.OpenAPISpec
-	running int32
+	ctx             context.Context
+	cancel          context.CancelFunc
+	config          types.ConfigManager
+	logger          types.Logger
+	health          types.HealthManager
+	router          types.HTTPRouter
+	mu              sync.RWMutex
+	spec            *types.OpenAPISpec
+	state           atomic.Value
+	shutdownTimeout time.Duration
+	generateTimeout time.Duration
 }
 
 func NewDocumentationManager(config types.ConfigManager, logger types.Logger, health types.HealthManager, router types.HTTPRouter) (types.DocumentationManager, error) {
-	return &DocumentationManager{
-		config:  config,
-		logger:  logger,
-		health:  health,
-		router:  router,
-		routes:  make(map[string]*types.RouteDocumentation),
-		running: 0,
-	}, nil
+	ctx, cancel := context.WithCancel(context.Background())
+
+	dm := &DocumentationManager{
+		ctx:             ctx,
+		cancel:          cancel,
+		config:          config,
+		logger:          logger,
+		health:          health,
+		router:          router,
+		shutdownTimeout: 10 * time.Second,
+		generateTimeout: 30 * time.Second,
+	}
+
+	dm.state.Store(StateStopped)
+
+	return dm, nil
 }
 
-func (dm *DocumentationManager) AddRoute(config *types.RouteConfig) error {
-	dm.mu.Lock()
-	defer dm.mu.Unlock()
-
-	routeKey := config.Doc.Method + " " + config.Doc.Path
-
-	var tags []string
-	if config.Doc.DocTag != "" {
-		tags = append(tags, config.Doc.DocTag)
+func (dm *DocumentationManager) Start() error {
+	if !dm.transitionState(StateStopped, StateStarting) {
+		dm.logger.Warn("Documentation manager is already running")
+		return types.ErrServerAlreadyRunning
 	}
 
-	route := &types.RouteDocumentation{
-		Method:       config.Doc.Method,
-		Path:         config.Doc.Path,
-		Title:        config.Doc.DocTitle,
-		Description:  config.Doc.DocDescription,
-		Tags:         tags,
-		RequestType:  config.Doc.DocRequestType,
-		ResponseType: config.Doc.DocResponseType,
-		CreatedAt:    time.Now(),
+	defer func() {
+		if dm.getState() == StateStarting {
+			dm.setState(StateRunning)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(dm.ctx, 30*time.Second)
+	defer cancel()
+
+	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		select {
+		case <-gCtx.Done():
+			return gCtx.Err()
+		default:
+			dm.registerRoutes()
+			return nil
+		}
+	})
+
+	if err := g.Wait(); err != nil {
+		dm.setState(StateStopped)
+		return types.WrapError(err, "failed to start documentation manager")
 	}
 
-	dm.routes[routeKey] = route
+	dm.logger.Info("Documentation manager started")
+	return nil
+}
+
+func (dm *DocumentationManager) Stop() error {
+	if !dm.transitionState(StateRunning, StateStopping) {
+		dm.logger.Warn("Documentation manager is not running")
+		return types.ErrServerNotRunning
+	}
+
+	defer func() {
+		dm.setState(StateStopped)
+		dm.cancel()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), dm.shutdownTimeout)
+	defer cancel()
+
+	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		dm.mu.Lock()
+		defer dm.mu.Unlock()
+		dm.spec = nil
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		select {
+		case <-gCtx.Done():
+			dm.logger.Warn("Documentation manager stop timeout, some components may not have stopped gracefully")
+		default:
+			dm.logger.Error("Error during documentation manager shutdown", zap.Error(err))
+		}
+	} else {
+		dm.logger.Info("Documentation manager stopped gracefully")
+	}
 
 	return nil
 }
 
-func (dm *DocumentationManager) RegisterRoutes(router types.HTTPRouter) {
+func (dm *DocumentationManager) IsRunning() bool {
+	return dm.getState() == StateRunning
+}
+
+func (dm *DocumentationManager) getState() State {
+	return dm.state.Load().(State)
+}
+
+func (dm *DocumentationManager) setState(newState State) bool {
+	currentState := dm.getState()
+	return dm.state.CompareAndSwap(currentState, newState)
+}
+
+func (dm *DocumentationManager) transitionState(from, to State) bool {
+	return dm.state.CompareAndSwap(from, to)
+}
+
+func (dm *DocumentationManager) registerRoutes() {
 	config := &types.RouteConfig{
 		Cache: &types.CacheHandlerConfig{
 			Enabled: false,
 		},
 		Timeout:             time.Duration(5) * time.Second,
-		DisabledMiddlewares: []string{"Auth", "BodyLimit", "Cache"},
-		Doc:                 nil, //TODO: add docs?
+		DisabledMiddlewares: []string{"cache"},
+		Doc:                 nil,
 	}
 
-	router.Add("GET", dm.config.GetConfig().Docs.Path, dm.handleDocs, config)
-	router.Add("GET", "/openapi.json", dm.handleOpenAPIJSON, config)
+	dm.router.Add("GET", dm.config.GetConfig().Docs.Path, dm.handleDocs, config)
+	dm.router.Add("GET", "/openapi.json", dm.handleOpenAPIJSON, config)
 }
 
-func (dm *DocumentationManager) Generate() error {
-	dm.mu.RLock()
-	routes := make(map[string]*types.RouteInfo)
-	for k, v := range dm.router.GetAllRoutes() {
-		routes[k] = v
-	}
-	dm.mu.RUnlock()
-
-	config := dm.config.GetConfig()
-
-	spec := &types.OpenAPISpec{
-		OpenAPI: "3.0.3",
-		Info: types.SpecInfo{
-			Title:       config.Name,
-			Version:     config.Version,
-			Description: fmt.Sprintf("%s API documentation", config.Name),
-		},
-		Servers: dm.generateServers(),
-		Paths:   make(map[string]*types.RoutePathItem),
-		Tags:    dm.generateTags(routes),
-		Components: &types.SpecComponents{
-			Schemas:         dm.generateSchemas(routes),
-			SecuritySchemes: dm.generateSecuritySchemes(),
-		},
+func (dm *DocumentationManager) generate() error {
+	if !dm.IsRunning() {
+		return types.ErrActionNotInitialized
 	}
 
-	for _, route := range routes {
-		if route.Config.Doc == nil {
-			continue
-		}
+	generateCtx, cancel := context.WithTimeout(dm.ctx, dm.generateTimeout)
+	defer cancel()
 
-		pathItem := dm.generatePathItem(route)
-		if pathItem != nil {
-			if pathItemExists, ok := spec.Paths[route.Config.Doc.Path]; ok {
-				if pathItem.Get != nil {
-					pathItemExists.Get = pathItem.Get
-				}
-				if pathItem.Post != nil {
-					pathItemExists.Post = pathItem.Post
-				}
-				if pathItem.Put != nil {
-					pathItemExists.Put = pathItem.Put
-				}
-				if pathItem.Delete != nil {
-					pathItemExists.Delete = pathItem.Delete
-				}
-				if pathItem.Patch != nil {
-					pathItemExists.Patch = pathItem.Patch
-				}
+	g, gCtx := errgroup.WithContext(generateCtx)
 
-				spec.Paths[route.Config.Doc.Path] = pathItemExists
-			} else {
-				spec.Paths[route.Config.Doc.Path] = pathItem
+	var routes map[string]*types.RouteInfo
+	var config *types.ServiceConfig
+	var spec *types.OpenAPISpec
+
+	g.Go(func() error {
+		select {
+		case <-gCtx.Done():
+			return gCtx.Err()
+		default:
+			dm.mu.RLock()
+			routes = make(map[string]*types.RouteInfo)
+			for k, v := range dm.router.GetAllRoutes() {
+				routes[k] = v
 			}
+			dm.mu.RUnlock()
+			return nil
+		}
+	})
+
+	g.Go(func() error {
+		select {
+		case <-gCtx.Done():
+			return gCtx.Err()
+		default:
+			config = dm.config.GetConfig()
+			return nil
+		}
+	})
+
+	if err := g.Wait(); err != nil {
+		select {
+		case <-generateCtx.Done():
+			return types.NewErrorf("documentation generation timeout")
+		default:
+			return types.WrapError(err, "failed to prepare generation data")
 		}
 	}
+
+	g, gCtx = errgroup.WithContext(generateCtx)
+
+	g.Go(func() error {
+		select {
+		case <-gCtx.Done():
+			return gCtx.Err()
+		default:
+			spec = &types.OpenAPISpec{
+				OpenAPI: "3.0.3",
+				Info: types.SpecInfo{
+					Title:       config.Name,
+					Version:     config.Version,
+					Description: fmt.Sprintf("%s API documentation", config.Name),
+				},
+				Servers: dm.generateServers(),
+				Paths:   make(map[string]*types.RoutePathItem),
+				Tags:    dm.generateTags(routes),
+				Components: &types.SpecComponents{
+					Schemas:         dm.generateSchemas(routes),
+					SecuritySchemes: dm.generateSecuritySchemes(),
+				},
+			}
+			return nil
+		}
+	})
+
+	var processedPaths map[string]*types.RoutePathItem
+
+	g.Go(func() error {
+		select {
+		case <-gCtx.Done():
+			return gCtx.Err()
+		default:
+			processedPaths = make(map[string]*types.RoutePathItem)
+
+			pathG, pathGCtx := errgroup.WithContext(gCtx)
+			pathMu := sync.Mutex{}
+
+			for _, route := range routes {
+				if route.Config.Doc == nil {
+					continue
+				}
+
+				r := route
+				pathG.Go(func() error {
+					select {
+					case <-pathGCtx.Done():
+						return pathGCtx.Err()
+					default:
+						pathItem := dm.generatePathItem(r)
+						if pathItem != nil {
+							pathMu.Lock()
+							if existingItem, ok := processedPaths[r.Config.Doc.Path]; ok {
+								if pathItem.Get != nil {
+									existingItem.Get = pathItem.Get
+								}
+								if pathItem.Post != nil {
+									existingItem.Post = pathItem.Post
+								}
+								if pathItem.Put != nil {
+									existingItem.Put = pathItem.Put
+								}
+								if pathItem.Delete != nil {
+									existingItem.Delete = pathItem.Delete
+								}
+								if pathItem.Patch != nil {
+									existingItem.Patch = pathItem.Patch
+								}
+								processedPaths[r.Config.Doc.Path] = existingItem
+							} else {
+								processedPaths[r.Config.Doc.Path] = pathItem
+							}
+							pathMu.Unlock()
+						}
+						return nil
+					}
+				})
+			}
+
+			return pathG.Wait()
+		}
+	})
+
+	if err := g.Wait(); err != nil {
+		select {
+		case <-generateCtx.Done():
+			return types.NewErrorf("documentation generation timeout")
+		default:
+			return types.WrapError(err, "failed to generate documentation")
+		}
+	}
+
+	spec.Paths = processedPaths
 
 	dm.mu.Lock()
 	dm.spec = spec
@@ -149,34 +319,10 @@ func (dm *DocumentationManager) Generate() error {
 	return nil
 }
 
-func (dm *DocumentationManager) GetSpec() *types.OpenAPISpec {
+func (dm *DocumentationManager) getSpec() *types.OpenAPISpec {
 	dm.mu.RLock()
 	defer dm.mu.RUnlock()
 	return dm.spec
-}
-
-func (dm *DocumentationManager) Start() error {
-	if !atomic.CompareAndSwapInt32(&dm.running, 0, 1) {
-		dm.logger.Warn("Documentation manager is already running")
-		return types.ErrServerAlreadyRunning
-	}
-
-	dm.logger.Info("Documentation manager started")
-
-	return nil
-}
-
-func (dm *DocumentationManager) Stop() error {
-	if !atomic.CompareAndSwapInt32(&dm.running, 1, 0) {
-		dm.logger.Warn("Documentation manager is not running")
-		return types.ErrServerNotRunning
-	}
-
-	return nil
-}
-
-func (dm *DocumentationManager) IsRunning() bool {
-	return atomic.LoadInt32(&dm.running) == 1
 }
 
 func (dm *DocumentationManager) generateServers() []types.SpecServer {
@@ -388,21 +534,46 @@ func (dm *DocumentationManager) generateResponses(route *types.RouteInfo) map[st
 
 func (dm *DocumentationManager) generateSchemas(routes map[string]*types.RouteInfo) map[string]*types.RouteSchema {
 	schemas := make(map[string]*types.RouteSchema)
+	schemasMu := sync.Mutex{}
+
+	g, ctx := errgroup.WithContext(dm.ctx)
 
 	for _, route := range routes {
 		if route.Config.Doc == nil {
 			continue
 		}
 
-		if route.Config.Doc.DocRequestType != nil {
-			schemaName := dm.getTypeName(route.Config.Doc.DocRequestType)
-			schemas[schemaName] = dm.generateSchemaFromType(route.Config.Doc.DocRequestType)
-		}
+		r := route
+		g.Go(func() error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				localSchemas := make(map[string]*types.RouteSchema)
 
-		if route.Config.Doc.DocResponseType != nil {
-			schemaName := dm.getTypeName(route.Config.Doc.DocResponseType)
-			schemas[schemaName] = dm.generateSchemaFromType(route.Config.Doc.DocResponseType)
-		}
+				if r.Config.Doc.DocRequestType != nil {
+					schemaName := dm.getTypeName(r.Config.Doc.DocRequestType)
+					localSchemas[schemaName] = dm.generateSchemaFromType(r.Config.Doc.DocRequestType)
+				}
+
+				if r.Config.Doc.DocResponseType != nil {
+					schemaName := dm.getTypeName(r.Config.Doc.DocResponseType)
+					localSchemas[schemaName] = dm.generateSchemaFromType(r.Config.Doc.DocResponseType)
+				}
+
+				schemasMu.Lock()
+				for k, v := range localSchemas {
+					schemas[k] = v
+				}
+				schemasMu.Unlock()
+
+				return nil
+			}
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		dm.logger.Error("Failed to generate some schemas", zap.Error(err))
 	}
 
 	schemas["ErrorResponse"] = dm.getErrorSchema()
@@ -812,7 +983,12 @@ func (dm *DocumentationManager) generateParamExample(paramName string) interface
 	}
 }
 
-func (dm *DocumentationManager) handleDocs(ctx *fasthttp.RequestCtx) {
+func (dm *DocumentationManager) handleDocs(ctx *types.RequestCtx) {
+	if !dm.IsRunning() {
+		ctx.Error("Documentation service unavailable", fasthttp.StatusServiceUnavailable)
+		return
+	}
+
 	swaggerHTML := `<!DOCTYPE html>
 <html>
 <head>
@@ -856,16 +1032,21 @@ func (dm *DocumentationManager) handleDocs(ctx *fasthttp.RequestCtx) {
 	}
 }
 
-func (dm *DocumentationManager) handleOpenAPIJSON(ctx *fasthttp.RequestCtx) {
-	spec := dm.GetSpec()
+func (dm *DocumentationManager) handleOpenAPIJSON(ctx *types.RequestCtx) {
+	if !dm.IsRunning() {
+		ctx.Error("Documentation service unavailable", fasthttp.StatusServiceUnavailable)
+		return
+	}
+
+	spec := dm.getSpec()
 
 	if spec == nil {
-		if err := dm.Generate(); err != nil {
+		if err := dm.generate(); err != nil {
 			dm.logger.Error("Failed to generate documentation", zap.Error(err))
 			ctx.Error("Internal server error", fasthttp.StatusInternalServerError)
 			return
 		}
-		spec = dm.GetSpec()
+		spec = dm.getSpec()
 	}
 
 	ctx.SetContentType("application/json")
@@ -875,11 +1056,12 @@ func (dm *DocumentationManager) handleOpenAPIJSON(ctx *fasthttp.RequestCtx) {
 	if err != nil {
 		dm.logger.Error("Failed to encode OpenAPI spec", zap.Error(err))
 		ctx.Error("Internal server error", fasthttp.StatusInternalServerError)
+		return
 	}
 
 	_, err = ctx.Write(specData)
 	if err != nil {
-		dm.logger.Error("Failed to encode OpenAPI spec", zap.Error(err))
+		dm.logger.Error("Failed to write OpenAPI spec", zap.Error(err))
 		ctx.Error("Internal server error", fasthttp.StatusInternalServerError)
 		return
 	}

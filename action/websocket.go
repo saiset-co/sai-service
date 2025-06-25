@@ -9,9 +9,20 @@ import (
 
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/saiset-co/sai-service/types"
 	"github.com/saiset-co/sai-service/utils"
+)
+
+type BrokerState int32
+
+const (
+	BrokerStateStopped BrokerState = iota
+	BrokerStateStarting
+	BrokerStateRunning
+	BrokerStateStopping
+	BrokerStateReconnecting
 )
 
 type WebSocketConfig struct {
@@ -24,25 +35,25 @@ type WebSocketConfig struct {
 }
 
 type WebSocketBroker struct {
-	ctx           context.Context
-	logger        types.Logger
-	health        types.HealthManager
-	config        *WebSocketConfig
-	conn          *websocket.Conn
-	connMu        sync.RWMutex
-	subscriptions map[string][]types.ActionHandler
-	subsMu        sync.RWMutex
-	send          chan *types.ActionMessage
-	running       int32
-	reconnectCh   chan struct{}
-	stopCh        chan struct{}
-	messageIDGen  int64
-	readDone      chan struct{}
-	writeDone     chan struct{}
-	reconnectDone chan struct{}
+	ctx               context.Context
+	cancel            context.CancelFunc
+	logger            types.Logger
+	health            types.HealthManager
+	config            *WebSocketConfig
+	conn              *websocket.Conn
+	connMu            sync.RWMutex
+	subscriptions     map[string][]types.ActionHandler
+	subsMu            sync.RWMutex
+	send              chan *types.ActionMessage
+	reconnectCh       chan struct{}
+	state             atomic.Value
+	shutdownTimeout   time.Duration
+	messageIDGen      int64
+	reconnectAttempts int32
+	metrics           types.MetricsManager
 }
 
-func NewWebSocketBroker(ctx context.Context, logger types.Logger, config *types.ActionsConfig, health types.HealthManager) (types.ActionBroker, error) {
+func NewWebSocketBroker(ctx context.Context, logger types.Logger, config *types.BrokerConfig, health types.HealthManager) (types.ActionBroker, error) {
 	wsConfig := &WebSocketConfig{
 		URL:            "ws://localhost:8081/ws",
 		ReconnectDelay: 5 * time.Second,
@@ -55,20 +66,25 @@ func NewWebSocketBroker(ctx context.Context, logger types.Logger, config *types.
 	if config.Config != nil {
 		err := utils.UnmarshalConfig(config.Config, wsConfig)
 		if err != nil {
-			return nil, types.WrapError(err, "failed to marshal WebSocket config")
+			return nil, types.WrapError(err, "failed to unmarshal WebSocket config")
 		}
 	}
 
+	brokerCtx, cancel := context.WithCancel(ctx)
+
 	broker := &WebSocketBroker{
-		ctx:           ctx,
-		logger:        logger,
-		health:        health,
-		config:        wsConfig,
-		subscriptions: make(map[string][]types.ActionHandler),
-		send:          make(chan *types.ActionMessage, 256),
-		reconnectCh:   make(chan struct{}, 1),
-		stopCh:        make(chan struct{}),
+		ctx:             brokerCtx,
+		cancel:          cancel,
+		logger:          logger,
+		health:          health,
+		config:          wsConfig,
+		subscriptions:   make(map[string][]types.ActionHandler),
+		send:            make(chan *types.ActionMessage, 256),
+		reconnectCh:     make(chan struct{}, 1),
+		shutdownTimeout: 10 * time.Second,
 	}
+
+	broker.state.Store(BrokerStateStopped)
 
 	logger.Info("WebSocket broker initialized",
 		zap.String("url", wsConfig.URL),
@@ -80,10 +96,13 @@ func NewWebSocketBroker(ctx context.Context, logger types.Logger, config *types.
 
 func (w *WebSocketBroker) Publish(action string, payload interface{}) error {
 	if !w.IsRunning() {
-		w.logger.Warn("Attempted to publish message while broker is not running",
-			zap.String("action", action))
 		return types.ErrActionNotInitialized
 	}
+
+	start := time.Now()
+	defer func() {
+		w.recordMetric("publish", "attempt", action, time.Since(start))
+	}()
 
 	message := &types.ActionMessage{
 		Action:    action,
@@ -98,22 +117,33 @@ func (w *WebSocketBroker) Publish(action string, payload interface{}) error {
 		w.logger.Debug("Message queued for publishing",
 			zap.String("action", action),
 			zap.String("message_id", message.MessageID))
+		w.recordMetric("publish", "success", action, time.Since(start))
 		return nil
+	case <-w.ctx.Done():
+		w.recordMetric("publish", "canceled", action, time.Since(start))
+		return types.ErrActionNotInitialized
 	default:
 		w.logger.Error("Send channel is full, dropping message",
 			zap.String("action", action),
 			zap.String("message_id", message.MessageID))
+		w.recordMetric("publish", "dropped", action, time.Since(start))
 		return types.ErrActionPublishFailed
 	}
 }
 
 func (w *WebSocketBroker) Subscribe(action string, handler types.ActionHandler) error {
 	if action == "" || handler == nil {
-		w.logger.Error("Invalid subscription parameters",
-			zap.String("action", action),
-			zap.Bool("handler_nil", handler == nil))
 		return types.ErrActionConfigInvalid
 	}
+
+	if w.IsRunning() {
+		return types.ErrActionIsRunning
+	}
+
+	start := time.Now()
+	defer func() {
+		w.recordMetric("subscribe", "success", action, time.Since(start))
+	}()
 
 	w.subsMu.Lock()
 	defer w.subsMu.Unlock()
@@ -122,7 +152,8 @@ func (w *WebSocketBroker) Subscribe(action string, handler types.ActionHandler) 
 		w.subscriptions[action] = make([]types.ActionHandler, 0)
 	}
 
-	w.subscriptions[action] = append(w.subscriptions[action], handler)
+	wrappedHandler := w.wrapHandler(action, handler)
+	w.subscriptions[action] = append(w.subscriptions[action], wrappedHandler)
 
 	w.logger.Debug("Subscribed to action",
 		zap.String("action", action),
@@ -132,6 +163,15 @@ func (w *WebSocketBroker) Subscribe(action string, handler types.ActionHandler) 
 }
 
 func (w *WebSocketBroker) Unsubscribe(action string) error {
+	if !w.IsRunning() {
+		return types.ErrActionNotInitialized
+	}
+
+	start := time.Now()
+	defer func() {
+		w.recordMetric("unsubscribe", "success", action, time.Since(start))
+	}()
+
 	w.subsMu.Lock()
 	defer w.subsMu.Unlock()
 
@@ -146,30 +186,47 @@ func (w *WebSocketBroker) Unsubscribe(action string) error {
 }
 
 func (w *WebSocketBroker) Start() error {
-	if !atomic.CompareAndSwapInt32(&w.running, 0, 1) {
-		w.logger.Warn("WebSocket broker is already running")
+	if !w.transitionState(BrokerStateStopped, BrokerStateStarting) {
 		return types.ErrServerAlreadyRunning
 	}
 
+	defer func() {
+		if w.getState() == BrokerStateStarting {
+			w.setState(BrokerStateRunning)
+		}
+	}()
+
 	if err := w.connect(); err != nil {
-		atomic.StoreInt32(&w.running, 0)
+		w.setState(BrokerStateStopped)
 		w.logger.Error("Failed to establish initial connection", zap.Error(err))
-		return types.ErrActionConnectionFailed
+		return types.WrapError(err, "failed to establish initial connection")
 	}
 
-	go func() {
-		defer close(w.readDone)
+	ctx, cancel := context.WithTimeout(w.ctx, 30*time.Second)
+	defer cancel()
+
+	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
 		w.readPump()
-	}()
+		return nil
+	})
 
-	go func() {
-		defer close(w.writeDone)
+	g.Go(func() error {
 		w.writePump()
-	}()
+		return nil
+	})
+
+	g.Go(func() error {
+		w.reconnectLoop()
+		return nil
+	})
 
 	go func() {
-		defer close(w.reconnectDone)
-		w.reconnectLoop()
+		select {
+		case <-gCtx.Done():
+		case <-time.After(100 * time.Millisecond):
+		}
 	}()
 
 	w.logger.Info("WebSocket broker started successfully")
@@ -177,149 +234,187 @@ func (w *WebSocketBroker) Start() error {
 }
 
 func (w *WebSocketBroker) Stop() error {
-	if !atomic.CompareAndSwapInt32(&w.running, 1, 0) {
-		w.logger.Warn("WebSocket broker is not running")
+	if !w.transitionState(BrokerStateRunning, BrokerStateStopping) &&
+		!w.transitionState(BrokerStateReconnecting, BrokerStateStopping) {
 		return types.ErrServerNotRunning
 	}
 
-	close(w.stopCh)
+	defer func() {
+		w.setState(BrokerStateStopped)
+		w.cancel()
+	}()
 
-	timeout := time.NewTimer(5 * time.Second)
-	defer timeout.Stop()
+	ctx, cancel := context.WithTimeout(context.Background(), w.shutdownTimeout)
+	defer cancel()
 
-	select {
-	case <-w.readDone:
-	case <-w.writeDone:
-	case <-w.reconnectDone:
-	case <-timeout.C:
-		w.logger.Warn("WebSocket broker stop timeout, some goroutines may not have finished")
-	}
+	g, gCtx := errgroup.WithContext(ctx)
 
-	w.connMu.Lock()
-	if w.conn != nil {
-		err := w.conn.Close()
-		if err != nil {
-			w.logger.Error("Failed to close connection", zap.Error(err))
+	g.Go(func() error {
+		w.connMu.Lock()
+		defer w.connMu.Unlock()
+
+		if w.conn != nil {
+			if err := w.conn.Close(); err != nil {
+				w.logger.Error("Failed to close connection", zap.Error(err))
+				return err
+			}
+			w.conn = nil
 		}
-		w.conn = nil
-	}
-	w.connMu.Unlock()
+		return nil
+	})
 
-	w.logger.Info("WebSocket broker stopped")
+	g.Go(func() error {
+		select {
+		case <-gCtx.Done():
+			return gCtx.Err()
+		default:
+			close(w.send)
+			close(w.reconnectCh)
+			return nil
+		}
+	})
+
+	if err := g.Wait(); err != nil {
+		select {
+		case <-ctx.Done():
+			w.logger.Warn("WebSocket broker stop timeout, some components may not have stopped gracefully")
+		default:
+			w.logger.Error("Error during broker shutdown", zap.Error(err))
+		}
+	} else {
+		w.logger.Info("WebSocket broker stopped gracefully")
+	}
+
 	return nil
 }
 
 func (w *WebSocketBroker) IsRunning() bool {
-	return atomic.LoadInt32(&w.running) == 1
+	state := w.getState()
+	return state == BrokerStateRunning || state == BrokerStateReconnecting
 }
 
-func (w *WebSocketBroker) RegisterRoutes(_ types.HTTPRouter) {
+func (w *WebSocketBroker) RegisterRoutes(_ types.HTTPRouter) {}
+
+func (w *WebSocketBroker) getState() BrokerState {
+	return w.state.Load().(BrokerState)
+}
+
+func (w *WebSocketBroker) setState(newState BrokerState) bool {
+	currentState := w.getState()
+	return w.state.CompareAndSwap(currentState, newState)
+}
+
+func (w *WebSocketBroker) transitionState(from, to BrokerState) bool {
+	return w.state.CompareAndSwap(from, to)
 }
 
 func (w *WebSocketBroker) connect() error {
 	w.logger.Debug("Attempting to connect to WebSocket server",
 		zap.String("url", w.config.URL))
 
+	dialCtx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
+	defer cancel()
+
 	dialer := websocket.DefaultDialer
-	conn, _, err := dialer.Dial(w.config.URL, nil)
+	conn, _, err := dialer.DialContext(dialCtx, w.config.URL, nil)
 	if err != nil {
-		w.logger.Error("Failed to dial WebSocket server",
-			zap.String("url", w.config.URL),
-			zap.Error(err))
-		return err
+		return types.WrapError(err, "failed to dial WebSocket server")
 	}
 
 	w.connMu.Lock()
 	if w.conn != nil {
-		err = w.conn.Close()
-		if err != nil {
-			w.logger.Error("Failed to close connection", zap.Error(err))
-		}
+		_ = w.conn.Close()
 	}
 	w.conn = conn
 	w.connMu.Unlock()
 
-	err = conn.SetReadDeadline(time.Now().Add(w.config.PongWait))
-	if err != nil {
-		w.logger.Error("Failed to set read deadline", zap.Error(err))
-		return err
-	}
-
+	_ = conn.SetReadDeadline(time.Now().Add(w.config.PongWait))
 	conn.SetPongHandler(func(string) error {
 		w.logger.Debug("Received pong from server")
-		return conn.SetReadDeadline(time.Now().Add(w.config.PongWait))
+		_ = conn.SetReadDeadline(time.Now().Add(w.config.PongWait))
+		return nil
 	})
+
+	atomic.StoreInt32(&w.reconnectAttempts, 0)
 
 	w.logger.Info("Successfully connected to WebSocket server")
 	return nil
 }
 
 func (w *WebSocketBroker) reconnectLoop() {
-	retryCount := 0
+	defer w.logger.Debug("Reconnect loop stopped")
 
 	for {
 		select {
+		case <-w.ctx.Done():
+			return
 		case <-w.reconnectCh:
 			if !w.IsRunning() {
 				return
 			}
 
+			if w.getState() == BrokerStateRunning {
+				w.setState(BrokerStateReconnecting)
+			}
+
+			retryCount := atomic.LoadInt32(&w.reconnectAttempts)
+
 			w.logger.Info("Starting reconnection attempt",
-				zap.Int("attempt", retryCount+1),
+				zap.Int32("attempt", retryCount+1),
 				zap.Int("max_retries", w.config.MaxRetries))
 
-			if retryCount >= w.config.MaxRetries {
-				w.logger.Error("Max reconnection attempts reached, stopping broker",
-					zap.Int("max_retries", w.config.MaxRetries))
-				err := w.Stop()
-				if err != nil {
-					w.logger.Error("Failed to stop broker", zap.Error(err))
+			if int(retryCount) >= w.config.MaxRetries {
+				w.logger.Error("Max reconnection attempts reached, stopping broker")
+
+				if w.transitionState(BrokerStateReconnecting, BrokerStateStopping) {
+					w.cancel()
 				}
 				return
 			}
 
-			time.Sleep(w.config.ReconnectDelay)
+			select {
+			case <-time.After(w.config.ReconnectDelay):
+			case <-w.ctx.Done():
+				return
+			}
+
+			atomic.AddInt32(&w.reconnectAttempts, 1)
 
 			if err := w.connect(); err != nil {
-				retryCount++
 				w.logger.Error("Reconnection attempt failed",
-					zap.Int("attempt", retryCount),
+					zap.Int32("attempt", atomic.LoadInt32(&w.reconnectAttempts)),
 					zap.Error(err))
 
-				select {
-				case w.reconnectCh <- struct{}{}:
-				default:
-				}
+				w.safeReconnectTrigger()
 				continue
 			}
 
-			retryCount = 0
+			w.setState(BrokerStateRunning)
 			w.logger.Info("Successfully reconnected to WebSocket server")
 
-			go func() {
-				defer close(w.readDone)
+			ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
+			g, _ := errgroup.WithContext(ctx)
+
+			g.Go(func() error {
 				w.readPump()
-			}()
+				return nil
+			})
 
-			go func() {
-				defer close(w.writeDone)
+			g.Go(func() error {
 				w.writePump()
-			}()
+				return nil
+			})
 
-		case <-w.stopCh:
-			return
-		case <-w.ctx.Done():
-			return
+			cancel()
 		}
 	}
 }
 
-func (w *WebSocketBroker) triggerReconnect() {
+func (w *WebSocketBroker) safeReconnectTrigger() {
 	select {
 	case w.reconnectCh <- struct{}{}:
-		w.logger.Debug("Reconnection triggered")
+	case <-w.ctx.Done():
 	default:
-		w.logger.Debug("Reconnection already in progress")
 	}
 }
 
@@ -329,23 +424,29 @@ func (w *WebSocketBroker) readPump() {
 	for {
 		select {
 		case <-w.ctx.Done():
-		case <-w.stopCh:
 			return
 		default:
-			if !w.withConnection(func(conn *websocket.Conn) error {
-				err := conn.SetReadDeadline(time.Now().Add(time.Second * 10))
-				if err != nil {
-					w.logger.Error("WebSocket failed to set read deadline", zap.Error(err))
-				}
+			if !w.IsRunning() {
+				return
+			}
+
+			success := w.withConnection(func(conn *websocket.Conn) error {
+				readCtx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
+				defer cancel()
+
+				_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 
 				_, messageData, err := conn.ReadMessage()
 				if err != nil {
-					if websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-						w.logger.Debug("WebSocket connection closed", zap.Error(err))
-						w.triggerReconnect()
+					select {
+					case <-readCtx.Done():
+						return types.WrapError(readCtx.Err(), "read timeout")
+					default:
+						if websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+							w.logger.Debug("WebSocket connection closed", zap.Error(err))
+						}
 						return err
 					}
-					return err
 				}
 
 				var message types.ActionMessage
@@ -356,8 +457,98 @@ func (w *WebSocketBroker) readPump() {
 
 				w.handleIncomingMessage(&message)
 				return nil
-			}) {
-				w.triggerReconnect()
+			})
+
+			if !success && w.IsRunning() {
+				w.safeReconnectTrigger()
+				return
+			}
+		}
+	}
+}
+
+func (w *WebSocketBroker) writePump() {
+	ticker := time.NewTicker(w.config.PingInterval)
+	defer func() {
+		ticker.Stop()
+		w.logger.Debug("Write pump stopped")
+	}()
+
+	for {
+		select {
+		case <-w.ctx.Done():
+			return
+		case message, ok := <-w.send:
+			if !ok {
+				return
+			}
+
+			if !w.IsRunning() {
+				w.logger.Debug("Dropping message - broker stopping",
+					zap.String("action", message.Action))
+				return
+			}
+
+			success := w.withConnection(func(conn *websocket.Conn) error {
+				writeCtx, cancel := context.WithTimeout(w.ctx, w.config.WriteWait)
+				defer cancel()
+
+				_ = conn.SetWriteDeadline(time.Now().Add(w.config.WriteWait))
+
+				data, err := utils.Marshal(message)
+				if err != nil {
+					w.logger.Error("Failed to marshal outgoing message",
+						zap.Error(err),
+						zap.String("action", message.Action))
+					return nil
+				}
+
+				select {
+				case <-writeCtx.Done():
+					return types.WrapError(writeCtx.Err(), "write timeout")
+				default:
+					if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+						return err
+					}
+				}
+
+				w.logger.Debug("Message sent successfully",
+					zap.String("action", message.Action),
+					zap.String("message_id", message.MessageID))
+				return nil
+			})
+
+			if !success && w.IsRunning() {
+				w.safeReconnectTrigger()
+				return
+			}
+
+		case <-ticker.C:
+			if !w.IsRunning() {
+				return
+			}
+
+			success := w.withConnection(func(conn *websocket.Conn) error {
+				pingCtx, cancel := context.WithTimeout(w.ctx, w.config.WriteWait)
+				defer cancel()
+
+				_ = conn.SetWriteDeadline(time.Now().Add(w.config.WriteWait))
+
+				select {
+				case <-pingCtx.Done():
+					return types.WrapError(pingCtx.Err(), "ping timeout")
+				default:
+					if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+						return err
+					}
+				}
+
+				w.logger.Debug("Ping sent to server")
+				return nil
+			})
+
+			if !success && w.IsRunning() {
+				w.safeReconnectTrigger()
 				return
 			}
 		}
@@ -366,107 +557,33 @@ func (w *WebSocketBroker) readPump() {
 
 func (w *WebSocketBroker) withConnection(fn func(*websocket.Conn) error) bool {
 	w.connMu.RLock()
-	conn := w.conn
-	w.connMu.RUnlock()
+	defer w.connMu.RUnlock()
 
-	if conn == nil {
+	if w.conn == nil {
 		return false
 	}
 
-	if err := fn(conn); err != nil {
-		if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway) {
-			w.logger.Error("WebSocket error", zap.Error(err))
-		}
+	if err := fn(w.conn); err != nil {
+		w.logger.Error("WebSocket operation failed", zap.Error(err))
 		return false
 	}
 
 	return true
 }
 
-func (w *WebSocketBroker) writePump() {
-	ticker := time.NewTicker(w.config.PingInterval)
-	defer func() {
-		ticker.Stop()
-		w.logger.Debug("Write pump stopped")
-
-		if w.IsRunning() {
-			w.triggerReconnect()
-		}
-	}()
-
-	for {
-		select {
-		case message := <-w.send:
-			w.connMu.RLock()
-			conn := w.conn
-			w.connMu.RUnlock()
-
-			if conn == nil {
-				w.logger.Debug("Connection is nil in write pump, dropping message",
-					zap.String("action", message.Action),
-					zap.String("message_id", message.MessageID))
-				return
-			}
-
-			err := conn.SetWriteDeadline(time.Now().Add(w.config.WriteWait))
-			if err != nil {
-				w.logger.Error("Failed to set write deadline", zap.Error(err))
-				return
-			}
-
-			data, err := utils.Marshal(message)
-			if err != nil {
-				w.logger.Error("Failed to marshal outgoing message",
-					zap.Error(err),
-					zap.String("action", message.Action),
-					zap.String("message_id", message.MessageID))
-				continue
-			}
-
-			if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
-				w.logger.Error("Failed to write message to WebSocket",
-					zap.Error(err),
-					zap.String("action", message.Action),
-					zap.String("message_id", message.MessageID))
-				return
-			}
-
-			w.logger.Debug("Message sent successfully",
-				zap.String("action", message.Action),
-				zap.String("message_id", message.MessageID))
-
-		case <-ticker.C:
-			w.connMu.RLock()
-			conn := w.conn
-			w.connMu.RUnlock()
-
-			if conn == nil {
-				w.logger.Debug("Connection is nil, skipping ping")
-				return
-			}
-
-			_ = conn.SetWriteDeadline(time.Now().Add(w.config.WriteWait))
-			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				w.logger.Error("Failed to send ping", zap.Error(err))
-				return
-			}
-			w.logger.Debug("Ping sent to server")
-		case <-w.stopCh:
-		case <-w.ctx.Done():
-			return
-		}
-	}
-}
-
 func (w *WebSocketBroker) handleIncomingMessage(message *types.ActionMessage) {
+	start := time.Now()
+
 	w.subsMu.RLock()
-	handlers := w.subscriptions[message.Action]
+	handlers := make([]types.ActionHandler, len(w.subscriptions[message.Action]))
+	copy(handlers, w.subscriptions[message.Action])
 	w.subsMu.RUnlock()
 
 	if len(handlers) == 0 {
 		w.logger.Debug("No handlers found for action",
 			zap.String("action", message.Action),
 			zap.String("message_id", message.MessageID))
+		w.recordMetric("handle", "no_handlers", message.Action, time.Since(start))
 		return
 	}
 
@@ -475,25 +592,86 @@ func (w *WebSocketBroker) handleIncomingMessage(message *types.ActionMessage) {
 		zap.String("message_id", message.MessageID),
 		zap.Int("handler_count", len(handlers)))
 
+	ctx, cancel := context.WithTimeout(w.ctx, 30*time.Second)
+	defer cancel()
+
+	g, gCtx := errgroup.WithContext(ctx)
+
 	for i, handler := range handlers {
-		go func(h types.ActionHandler, handlerIndex int) {
-			if err := h(message); err != nil {
-				w.logger.Error("Action handler failed",
-					zap.String("action", message.Action),
-					zap.String("message_id", message.MessageID),
-					zap.Int("handler_index", handlerIndex),
-					zap.Error(err))
-			} else {
-				w.logger.Debug("Action handler completed successfully",
-					zap.String("action", message.Action),
-					zap.String("message_id", message.MessageID),
-					zap.Int("handler_index", handlerIndex))
+		h := handler
+		handlerIndex := i
+
+		g.Go(func() error {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+				if err := h(message); err != nil {
+					w.logger.Error("Action handler failed",
+						zap.String("action", message.Action),
+						zap.String("message_id", message.MessageID),
+						zap.Int("handler_index", handlerIndex),
+						zap.Error(err))
+					return err
+				}
+				return nil
 			}
-		}(handler, i)
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		w.recordMetric("handle", "error", message.Action, time.Since(start))
+	} else {
+		w.recordMetric("handle", "success", message.Action, time.Since(start))
+	}
+}
+
+func (w *WebSocketBroker) wrapHandler(action string, handler types.ActionHandler) types.ActionHandler {
+	return func(payload *types.ActionMessage) error {
+		start := time.Now()
+
+		defer func() {
+			if r := recover(); r != nil {
+				w.logger.Error("Handler panicked",
+					zap.String("action", action),
+					zap.Any("panic", r))
+				w.recordMetric("handle", "panic", action, time.Since(start))
+			}
+		}()
+
+		err := handler(payload)
+		duration := time.Since(start)
+
+		result := "success"
+		if err != nil {
+			result = "error"
+		}
+
+		w.recordMetric("handle", result, action, duration)
+		return err
 	}
 }
 
 func (w *WebSocketBroker) generateMessageID() string {
 	id := atomic.AddInt64(&w.messageIDGen, 1)
 	return fmt.Sprintf("ws-%d-%d", time.Now().Unix(), id)
+}
+
+func (w *WebSocketBroker) recordMetric(operation, result, action string, duration time.Duration) {
+	if w.metrics == nil {
+		return
+	}
+
+	counter := w.metrics.Counter("websocket_operations_total", map[string]string{
+		"operation": operation,
+		"result":    result,
+		"action":    action,
+	})
+	counter.Inc()
+
+	histogram := w.metrics.Histogram("websocket_operation_duration_seconds",
+		[]float64{0.001, 0.01, 0.1, 1.0, 5.0, 10.0, 30.0},
+		map[string]string{"operation": operation, "action": action},
+	)
+	histogram.Observe(duration.Seconds())
 }

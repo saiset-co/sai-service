@@ -11,9 +11,19 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/saiset-co/sai-service/types"
 	"github.com/saiset-co/sai-service/utils"
+)
+
+type RedisState int32
+
+const (
+	RedisStateStopped RedisState = iota
+	RedisStateStarting
+	RedisStateRunning
+	RedisStateStopping
 )
 
 type RedisConfig struct {
@@ -32,17 +42,18 @@ type RedisConfig struct {
 }
 
 type RedisCache struct {
-	ctx          context.Context
-	logger       types.Logger
-	health       types.HealthManager
-	config       *RedisConfig
-	client       *redis.Client
-	revisions    map[string]uint64
-	dependencies map[string][]string
-	shutdownCh   chan struct{}
-	revMu        sync.RWMutex
-	depMu        sync.RWMutex
-	started      int32
+	ctx             context.Context
+	logger          types.Logger
+	health          types.HealthManager
+	config          *RedisConfig
+	client          *redis.Client
+	revisions       map[string]uint64
+	dependencies    map[string][]string
+	shutdownCh      chan struct{}
+	revMu           sync.RWMutex
+	depMu           sync.RWMutex
+	state           atomic.Value
+	shutdownTimeout time.Duration
 }
 
 func NewRedisCache(ctx context.Context, logger types.Logger, config *types.CacheConfig, health types.HealthManager) (types.CacheManager, error) {
@@ -69,15 +80,17 @@ func NewRedisCache(ctx context.Context, logger types.Logger, config *types.Cache
 	}
 
 	cache := &RedisCache{
-		ctx:          ctx,
-		logger:       logger,
-		health:       health,
-		config:       redisConfig,
-		revisions:    make(map[string]uint64),
-		dependencies: make(map[string][]string),
-		shutdownCh:   make(chan struct{}),
-		started:      0,
+		ctx:             ctx,
+		logger:          logger,
+		health:          health,
+		config:          redisConfig,
+		revisions:       make(map[string]uint64),
+		dependencies:    make(map[string][]string),
+		shutdownCh:      make(chan struct{}),
+		shutdownTimeout: 10 * time.Second,
 	}
+
+	cache.state.Store(RedisStateStopped)
 
 	if err := cache.initRedisClient(); err != nil {
 		return nil, types.WrapError(err, "failed to initialize redis client")
@@ -265,13 +278,9 @@ func (r *RedisCache) SetRevision(key string, revision uint64) {
 	r.revMu.Unlock()
 }
 
-func (r *RedisCache) BuildCacheKey(requestPath string, dependencies []string, metadata map[string]string) string {
-	if requestPath == "" {
-		return ""
-	}
-
+func (r *RedisCache) BuildCacheKey(requestPath []byte, dependencies []string, metadata map[string][]byte) string {
 	var keyParts []string
-	keyParts = append(keyParts, requestPath)
+	keyParts = append(keyParts, string(requestPath))
 
 	for _, dep := range dependencies {
 		if dep != "" {
@@ -281,7 +290,7 @@ func (r *RedisCache) BuildCacheKey(requestPath string, dependencies []string, me
 	}
 
 	for key, value := range metadata {
-		if key != "" && value != "" {
+		if key != "" && len(value) > 0 {
 			keyParts = append(keyParts, fmt.Sprintf("%s:%s", key, value))
 		}
 	}
@@ -294,9 +303,15 @@ func (r *RedisCache) BuildCacheKey(requestPath string, dependencies []string, me
 }
 
 func (r *RedisCache) Start() error {
-	if !atomic.CompareAndSwapInt32(&r.started, 0, 1) {
-		return nil
+	if !r.transitionState(RedisStateStopped, RedisStateStarting) {
+		return types.ErrServerAlreadyRunning
 	}
+
+	defer func() {
+		if r.getState() == RedisStateStarting {
+			r.setState(RedisStateRunning)
+		}
+	}()
 
 	go r.startCleanupWorker()
 
@@ -306,50 +321,68 @@ func (r *RedisCache) Start() error {
 }
 
 func (r *RedisCache) Stop() error {
-	if !atomic.CompareAndSwapInt32(&r.started, 1, 0) {
-		return nil
+	if !r.transitionState(RedisStateRunning, RedisStateStopping) {
+		return types.ErrServerNotRunning
 	}
 
-	select {
-	case <-r.shutdownCh:
-	default:
-		close(r.shutdownCh)
-	}
-
-	shutdownTimeout := time.NewTimer(5 * time.Second)
-	defer shutdownTimeout.Stop()
-
-	done := make(chan struct{})
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		close(done)
+	defer func() {
+		r.setState(RedisStateStopped)
 	}()
 
-	select {
-	case <-done:
-		r.logger.Info("Cache cleanup worker stopped gracefully")
-	case <-shutdownTimeout.C:
-		r.logger.Warn("Cache cleanup worker shutdown timeout")
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), r.shutdownTimeout)
+	defer cancel()
 
-	if r.client != nil {
-		if err := r.client.Close(); err != nil {
-			r.logger.Error("Failed to close Redis client", zap.Error(err))
-			return types.WrapError(err, "failed to close redis client")
+	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		select {
+		case <-gCtx.Done():
+			return gCtx.Err()
+		default:
+			close(r.shutdownCh)
+			return nil
 		}
+	})
+
+	g.Go(func() error {
+		if r.client != nil {
+			if err := r.client.Close(); err != nil {
+				r.logger.Error("Failed to close Redis client", zap.Error(err))
+				return err
+			}
+		}
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		select {
+		case <-gCtx.Done():
+			r.logger.Warn("Redis cache stop timeout, some components may not have stopped gracefully")
+		default:
+			r.logger.Error("Error during redis cache shutdown", zap.Error(err))
+		}
+	} else {
+		r.logger.Info("Redis cache stopped gracefully")
 	}
 
-	r.logger.Info("Redis cache closed successfully")
 	return nil
 }
 
 func (r *RedisCache) IsRunning() bool {
-	return atomic.LoadInt32(&r.started) == 1
+	return r.getState() == RedisStateRunning
 }
 
-func (r *RedisCache) cleanup() error {
-	r.clearLocalCache()
-	return nil
+func (r *RedisCache) getState() RedisState {
+	return r.state.Load().(RedisState)
+}
+
+func (r *RedisCache) setState(newState RedisState) bool {
+	currentState := r.getState()
+	return r.state.CompareAndSwap(currentState, newState)
+}
+
+func (r *RedisCache) transitionState(from, to RedisState) bool {
+	return r.state.CompareAndSwap(from, to)
 }
 
 func (r *RedisCache) initRedisClient() error {
@@ -498,16 +531,6 @@ func (r *RedisCache) cleanupDependenciesForKey(cacheKey string) {
 			r.dependencies[dep] = newDependents
 		}
 	}
-}
-
-func (r *RedisCache) clearLocalCache() {
-	r.revMu.Lock()
-	r.revisions = make(map[string]uint64)
-	r.revMu.Unlock()
-
-	r.depMu.Lock()
-	r.dependencies = make(map[string][]string)
-	r.depMu.Unlock()
 }
 
 func (r *RedisCache) cleanupExpiredDependencies() {

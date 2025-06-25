@@ -7,10 +7,7 @@ import (
 )
 
 type CronManager interface {
-	LifecycleManager
-	GetJobs() map[string]*JobEntry
 	Add(jobName, spec string, job func()) error
-	Remove(name string) error
 }
 
 type JobEntry struct {

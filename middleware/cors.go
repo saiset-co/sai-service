@@ -1,22 +1,41 @@
 package middleware
 
 import (
-	"strconv"
-	"strings"
-	"time"
-
+	"bytes"
 	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
+	"strconv"
+	"strings"
 
 	"github.com/saiset-co/sai-service/types"
 	"github.com/saiset-co/sai-service/utils"
 )
 
+var (
+	trueBytes        = []byte("true")
+	asteriskBytes    = []byte("*")
+	optionsBytes     = []byte("OPTIONS")
+	varyOriginStr    = []byte("Origin")
+	varyPreflightStr = []byte("Origin, Access-Control-Request-Method, Access-Control-Request-Headers")
+)
+
 type CORSMiddleware struct {
-	config     types.ConfigManager
-	logger     types.Logger
-	metrics    types.MetricsManager
-	corsConfig *CORSConfig
+	config             types.ConfigManager
+	logger             types.Logger
+	metrics            types.MetricsManager
+	corsConfig         *CORSConfig
+	name               string
+	weight             int
+	allowsAll          bool
+	allowedOriginsMap  map[string]bool
+	wildcardDomains    []string
+	allowedMethodsStr  []byte
+	allowedHeadersStr  []byte
+	exposedHeadersStr  []byte
+	maxAgeStr          []byte
+	errorResponseBytes []byte
+	allowCredentials   bool
+	hasExposedHeaders  bool
 }
 
 type CORSConfig struct {
@@ -45,125 +64,161 @@ func NewCORSMiddleware(config types.ConfigManager, logger types.Logger, metrics 
 		}
 	}
 
-	return &CORSMiddleware{
-		config:     config,
-		logger:     logger,
-		metrics:    metrics,
-		corsConfig: corsConfig,
+	cm := &CORSMiddleware{
+		name:               "cors",
+		weight:             config.GetConfig().Middlewares.CORS.Weight,
+		config:             config,
+		logger:             logger,
+		metrics:            metrics,
+		corsConfig:         corsConfig,
+		allowCredentials:   corsConfig.AllowCredentials,
+		hasExposedHeaders:  len(corsConfig.ExposedHeaders) > 0,
+		errorResponseBytes: []byte(`{"error":"CORS policy violation","message":"Origin not allowed"}`),
 	}
+
+	cm.precompileConfiguration()
+
+	return cm
 }
 
-func (c *CORSMiddleware) Name() string { return "cors" }
-func (c *CORSMiddleware) Weight() int  { return 15 }
+func (c *CORSMiddleware) Name() string          { return c.name }
+func (c *CORSMiddleware) Weight() int           { return c.weight }
+func (c *CORSMiddleware) Provider() interface{} { return nil }
 
-func (c *CORSMiddleware) Handle(ctx *fasthttp.RequestCtx, next func(*fasthttp.RequestCtx), _ *types.RouteConfig) {
-	start := time.Now()
-
-	origin := string(ctx.Request.Header.Peek("Origin"))
-	if origin == "" {
+func (c *CORSMiddleware) Handle(ctx *types.RequestCtx, next func(*types.RequestCtx), _ *types.RouteConfig) {
+	origin := ctx.Request.Header.Peek("Origin")
+	if len(origin) == 0 {
 		next(ctx)
 		return
 	}
 
-	if !c.isOriginAllowed(origin) {
-		duration := time.Since(start)
-
+	if !c.isOriginAllowedFast(origin) {
 		c.logger.Warn("CORS request blocked",
-			zap.String("origin", origin),
-			zap.String("method", string(ctx.Method())),
-			zap.String("path", string(ctx.Path())),
-			zap.Duration("duration", duration))
+			zap.ByteString("origin", origin),
+			zap.ByteString("method", ctx.Method()),
+			zap.ByteString("path", ctx.Path()))
 
-		c.createCORSErrorResponse(ctx)
+		c.createCORSErrorResponseFast(ctx)
 		return
 	}
 
-	if string(ctx.Method()) == fasthttp.MethodOptions {
-		duration := time.Since(start)
-
-		c.logger.Debug("CORS preflight request",
-			zap.String("origin", origin),
-			zap.String("method", string(ctx.Request.Header.Peek("Access-Control-Request-Method"))),
-			zap.String("headers", string(ctx.Request.Header.Peek("Access-Control-Request-Headers"))),
-			zap.Duration("duration", duration))
-
-		c.createPreflightResponse(ctx, origin)
+	if c.isOptionsMethod(ctx.Method()) {
+		c.createPreflightResponseFast(ctx, origin)
 		return
 	}
 
-	c.addCORSHeaders(ctx, origin)
-
+	c.addCORSHeadersFast(ctx, origin)
 	next(ctx)
-
-	duration := time.Since(start)
-
-	c.logger.Debug("CORS request processed",
-		zap.String("origin", origin),
-		zap.String("method", string(ctx.Method())),
-		zap.String("path", string(ctx.Path())),
-		zap.Duration("duration", duration))
 }
 
-func (c *CORSMiddleware) isOriginAllowed(origin string) bool {
-	for _, allowedOrigin := range c.corsConfig.AllowedOrigins {
-		if allowedOrigin == "*" {
-			return true
-		}
-		if allowedOrigin == origin {
-			return true
-		}
+func (c *CORSMiddleware) isOptionsMethod(method []byte) bool {
+	return bytes.Equal(method, optionsBytes)
+}
 
-		if strings.HasPrefix(allowedOrigin, "*.") {
-			domain := strings.TrimPrefix(allowedOrigin, "*.")
-			if strings.HasSuffix(origin, "."+domain) || strings.HasSuffix(origin, domain) {
-				return true
-			}
+func (c *CORSMiddleware) isOriginAllowedFast(origin []byte) bool {
+	if c.allowsAll {
+		return true
+	}
+
+	originStr := string(origin)
+
+	if c.allowedOriginsMap[originStr] {
+		return true
+	}
+
+	for _, domain := range c.wildcardDomains {
+		if c.matchesWildcardDomain(originStr, domain) {
+			return true
 		}
 	}
+
 	return false
 }
 
-func (c *CORSMiddleware) addCORSHeaders(ctx *fasthttp.RequestCtx, origin string) {
-	if len(c.corsConfig.AllowedOrigins) == 1 && c.corsConfig.AllowedOrigins[0] == "*" {
-		ctx.Response.Header.Set("Access-Control-Allow-Origin", "*")
-	} else {
-		ctx.Response.Header.Set("Access-Control-Allow-Origin", origin)
+func (c *CORSMiddleware) matchesWildcardDomain(origin, domain string) bool {
+	if origin == domain {
+		return true
 	}
 
-	if len(c.corsConfig.ExposedHeaders) > 0 {
-		ctx.Response.Header.Set("Access-Control-Expose-Headers", strings.Join(c.corsConfig.ExposedHeaders, ", "))
+	suffix := "." + domain
+	if strings.HasSuffix(origin, suffix) {
+		prefixLen := len(origin) - len(suffix)
+		if prefixLen > 0 {
+			return origin[prefixLen-1] != '.'
+		}
 	}
 
-	if c.corsConfig.AllowCredentials {
-		ctx.Response.Header.Set("Access-Control-Allow-Credentials", "true")
-	}
-
-	ctx.Response.Header.Add("Vary", "Origin")
+	return false
 }
 
-func (c *CORSMiddleware) createPreflightResponse(ctx *fasthttp.RequestCtx, origin string) {
+func (c *CORSMiddleware) addCORSHeadersFast(ctx *types.RequestCtx, origin []byte) {
+	if c.allowsAll {
+		ctx.Response.Header.SetBytesV("Access-Control-Allow-Origin", asteriskBytes)
+	} else {
+		ctx.Response.Header.SetBytesV("Access-Control-Allow-Origin", origin)
+	}
+
+	if c.hasExposedHeaders {
+		ctx.Response.Header.SetBytesV("Access-Control-Expose-Headers", c.exposedHeadersStr)
+	}
+
+	if c.allowCredentials {
+		ctx.Response.Header.SetBytesV("Access-Control-Allow-Credentials", trueBytes)
+	}
+
+	ctx.Response.Header.AddBytesV("Vary", varyOriginStr)
+}
+
+func (c *CORSMiddleware) createPreflightResponseFast(ctx *types.RequestCtx, origin []byte) {
 	ctx.SetStatusCode(fasthttp.StatusOK)
 
-	if len(c.corsConfig.AllowedOrigins) == 1 && c.corsConfig.AllowedOrigins[0] == "*" {
-		ctx.Response.Header.Set("Access-Control-Allow-Origin", "*")
+	if c.allowsAll {
+		ctx.Response.Header.SetBytesV("Access-Control-Allow-Origin", asteriskBytes)
 	} else {
-		ctx.Response.Header.Set("Access-Control-Allow-Origin", origin)
+		ctx.Response.Header.SetBytesV("Access-Control-Allow-Origin", origin)
 	}
 
-	ctx.Response.Header.Set("Access-Control-Allow-Methods", strings.Join(c.corsConfig.AllowedMethods, ", "))
-	ctx.Response.Header.Set("Access-Control-Allow-Headers", strings.Join(c.corsConfig.AllowedHeaders, ", "))
-	ctx.Response.Header.Set("Access-Control-Max-Age", strconv.Itoa(c.corsConfig.MaxAge))
+	ctx.Response.Header.SetBytesV("Access-Control-Allow-Methods", c.allowedMethodsStr)
+	ctx.Response.Header.SetBytesV("Access-Control-Allow-Headers", c.allowedHeadersStr)
+	ctx.Response.Header.SetBytesV("Access-Control-Max-Age", c.maxAgeStr)
 
-	if c.corsConfig.AllowCredentials {
-		ctx.Response.Header.Set("Access-Control-Allow-Credentials", "true")
+	if c.allowCredentials {
+		ctx.Response.Header.SetBytesV("Access-Control-Allow-Credentials", trueBytes)
 	}
 
-	ctx.Response.Header.Set("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers")
-	ctx.SetBodyString("")
+	ctx.Response.Header.SetBytesV("Vary", varyPreflightStr)
+	ctx.SetBody(nil)
 }
 
-func (c *CORSMiddleware) createCORSErrorResponse(ctx *fasthttp.RequestCtx) {
+func (c *CORSMiddleware) createCORSErrorResponseFast(ctx *types.RequestCtx) {
 	ctx.SetStatusCode(fasthttp.StatusForbidden)
-	ctx.SetContentType("application/json")
-	ctx.SetBodyString(`{"error":"CORS policy violation","message":"Origin not allowed"}`)
+	ctx.Response.Header.SetContentType("application/json")
+	ctx.SetBody(c.errorResponseBytes)
+}
+
+func (c *CORSMiddleware) precompileConfiguration() {
+	c.allowsAll = len(c.corsConfig.AllowedOrigins) == 1 && c.corsConfig.AllowedOrigins[0] == "*"
+
+	if !c.allowsAll {
+		c.allowedOriginsMap = make(map[string]bool, len(c.corsConfig.AllowedOrigins))
+		c.wildcardDomains = make([]string, 0)
+
+		for _, origin := range c.corsConfig.AllowedOrigins {
+			if strings.HasPrefix(origin, "*.") {
+				domain := strings.TrimPrefix(origin, "*.")
+				c.wildcardDomains = append(c.wildcardDomains, domain)
+			} else {
+				c.allowedOriginsMap[origin] = true
+			}
+		}
+	}
+
+	c.allowedMethodsStr = []byte(strings.Join(c.corsConfig.AllowedMethods, ", "))
+	c.allowedHeadersStr = []byte(strings.Join(c.corsConfig.AllowedHeaders, ", "))
+
+	if c.hasExposedHeaders {
+		c.exposedHeadersStr = []byte(strings.Join(c.corsConfig.ExposedHeaders, ", "))
+	}
+
+	c.maxAgeStr = []byte(strconv.Itoa(c.corsConfig.MaxAge))
 }

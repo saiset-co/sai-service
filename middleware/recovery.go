@@ -1,11 +1,9 @@
 package middleware
 
 import (
-	"runtime"
-	"time"
-
-	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
+	"runtime"
+	"sync"
 
 	"github.com/saiset-co/sai-service/types"
 	"github.com/saiset-co/sai-service/utils"
@@ -16,6 +14,12 @@ type RecoveryMiddleware struct {
 	logger         types.Logger
 	metrics        types.MetricsManager
 	recoveryConfig *RecoveryConfig
+	name           string
+	weight         int
+	stackBufPool   sync.Pool
+	fieldsPool     sync.Pool
+	panicLabels    map[string]string
+	durationLabels map[string]string
 }
 
 type RecoveryConfig struct {
@@ -35,86 +39,104 @@ func NewRecoveryMiddleware(config types.ConfigManager, logger types.Logger, metr
 	}
 
 	return &RecoveryMiddleware{
+		name:           "recovery",
+		weight:         config.GetConfig().Middlewares.Recovery.Weight,
 		config:         config,
 		logger:         logger,
 		metrics:        metrics,
 		recoveryConfig: recoveryConfig,
+
+		stackBufPool: sync.Pool{
+			New: func() interface{} {
+				return make([]byte, 4096)
+			},
+		},
+
+		fieldsPool: sync.Pool{
+			New: func() interface{} {
+				return make([]zap.Field, 0, 8)
+			},
+		},
+
+		panicLabels: map[string]string{
+			"middleware": "recovery",
+		},
+		durationLabels: map[string]string{
+			"middleware": "recovery",
+		},
 	}
 }
 
-func (r *RecoveryMiddleware) Name() string { return "recovery" }
-func (r *RecoveryMiddleware) Weight() int  { return 10 }
+func (r *RecoveryMiddleware) Name() string          { return r.name }
+func (r *RecoveryMiddleware) Weight() int           { return r.weight }
+func (r *RecoveryMiddleware) Provider() interface{} { return nil }
 
-func (r *RecoveryMiddleware) Handle(ctx *fasthttp.RequestCtx, next func(*fasthttp.RequestCtx), _ *types.RouteConfig) {
-	start := time.Now()
-
+func (r *RecoveryMiddleware) Handle(ctx *types.RequestCtx, next func(*types.RequestCtx), _ *types.RouteConfig) {
 	defer func() {
 		if rec := recover(); rec != nil {
-			duration := time.Since(start)
-			r.recordPanicMetrics(duration)
 
 			var stack string
 			if r.recoveryConfig.StackTrace {
 				stack = r.getStackTrace()
 			}
 
-			r.logPanic(rec, stack, duration, ctx)
-
-			utils.CreateErrorResponse(ctx)
+			r.logPanic(rec, stack, ctx)
+			types.CreateErrorResponse(ctx)
 		}
 	}()
 
 	next(ctx)
 }
 
-func (r *RecoveryMiddleware) recordPanicMetrics(duration time.Duration) {
-	if r.metrics == nil {
-		return
-	}
+func (r *RecoveryMiddleware) logPanic(rec interface{}, stack string, ctx *types.RequestCtx) {
+	fields := r.fieldsPool.Get().(*[]zap.Field)
+	defer func() {
+		*fields = (*fields)[:0]
+		r.fieldsPool.Put(fields)
+	}()
 
-	counter := r.metrics.Counter("middleware_panics_total", map[string]string{
-		"middleware": "recovery",
-	})
-	counter.Inc()
-
-	histogram := r.metrics.Histogram("panic_recovery_duration_seconds",
-		[]float64{0.001, 0.01, 0.1, 0.5, 1.0},
-		map[string]string{"middleware": "recovery"})
-	histogram.Observe(duration.Seconds())
-}
-
-func (r *RecoveryMiddleware) logPanic(rec interface{}, stack string, duration time.Duration, ctx *fasthttp.RequestCtx) {
-	fields := []zap.Field{
+	*fields = append(*fields,
 		zap.Any("panic", rec),
-		zap.Duration("duration", duration),
-		zap.String("method", string(ctx.Method())),
-		zap.String("path", string(ctx.Path())),
-		zap.String("remote_addr", ctx.RemoteIP().String()),
-	}
+		zap.ByteString("method", ctx.Method()),
+		zap.ByteString("path", ctx.Path()),
+		zap.ByteString("remote_addr", ctx.RemoteIP()),
+	)
 
 	if r.recoveryConfig.StackTrace && stack != "" {
-		fields = append(fields, zap.String("stack", stack))
+		*fields = append(*fields, zap.String("stack", stack))
 	}
 
-	if requestID := string(ctx.Request.Header.Peek("X-Request-ID")); requestID != "" {
-		fields = append(fields, zap.String("request_id", requestID))
+	if requestID := ctx.Request.Header.Peek("X-Request-ID"); len(requestID) > 0 {
+		*fields = append(*fields, zap.ByteString("request_id", requestID))
 	}
 
-	if userAgent := string(ctx.UserAgent()); userAgent != "" {
-		fields = append(fields, zap.String("user_agent", userAgent))
+	if userAgent := ctx.UserAgent(); len(userAgent) > 0 {
+		*fields = append(*fields, zap.ByteString("user_agent", userAgent))
 	}
 
-	r.logger.Error("Recovered from panic", fields...)
+	r.logger.Error("Recovered from panic", *fields...)
 }
 
 func (r *RecoveryMiddleware) getStackTrace() string {
-	buf := make([]byte, 4096)
-	n := runtime.Stack(buf, false)
+	buf := r.stackBufPool.Get().(*[]byte)
+	defer func() {
+		*buf = (*buf)[:0]
+		r.stackBufPool.Put(buf)
+	}()
 
-	if n == len(buf) {
-		buf = make([]byte, 16384)
-		n = runtime.Stack(buf, false)
+	n := runtime.Stack(*buf, false)
+
+	if n == len(*buf) {
+		newBuf := make([]byte, 16384)
+		n = runtime.Stack(newBuf, false)
+
+		if n == len(newBuf) {
+			newBuf = make([]byte, 65536)
+			n = runtime.Stack(newBuf, false)
+		}
+
+		return utils.BytesToString(newBuf[:n])
 	}
 
-	return utils.Intern(buf[:n])
+	return utils.BytesToString((*buf)[:n])
 }

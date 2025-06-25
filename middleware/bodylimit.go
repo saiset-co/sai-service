@@ -1,8 +1,8 @@
 package middleware
 
 import (
+	"bytes"
 	"fmt"
-	"time"
 
 	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
@@ -16,14 +16,21 @@ type BodyLimitMiddleware struct {
 	logger          types.Logger
 	metrics         types.MetricsManager
 	bodyLimitConfig *BodyLimitConfig
+	name            string
+	weight          int
+	errorResponse   []byte
 }
 
 type BodyLimitConfig struct {
 	MaxBodySize int64 `json:"max_body_size"`
 }
 
+var methods = []byte("POSTPUTPATCHDELETE")
+
 func NewBodyLimitMiddleware(config types.ConfigManager, logger types.Logger, metrics types.MetricsManager) *BodyLimitMiddleware {
-	var bodyLimitConfig = &BodyLimitConfig{}
+	var bodyLimitConfig = &BodyLimitConfig{
+		MaxBodySize: 1024 * 1024,
+	}
 
 	if config.GetConfig().Middlewares.BodyLimit.Params != nil {
 		err := utils.UnmarshalConfig(config.GetConfig().Middlewares.BodyLimit.Params, bodyLimitConfig)
@@ -32,54 +39,45 @@ func NewBodyLimitMiddleware(config types.ConfigManager, logger types.Logger, met
 		}
 	}
 
-	return &BodyLimitMiddleware{
+	bl := &BodyLimitMiddleware{
+		name:            "body-limit",
 		config:          config,
 		logger:          logger,
 		metrics:         metrics,
 		bodyLimitConfig: bodyLimitConfig,
+		weight:          config.GetConfig().Middlewares.BodyLimit.Weight,
 	}
+
+	bl.errorResponse = []byte(fmt.Sprintf(
+		`{"error":"Request entity too large","message":"Request body exceeds maximum size of %d bytes","max_size":%d,"error_code":"BODY_TOO_LARGE"}`,
+		bodyLimitConfig.MaxBodySize, bodyLimitConfig.MaxBodySize))
+
+	return bl
 }
 
-func (bl *BodyLimitMiddleware) Name() string { return "body-limit" }
-func (bl *BodyLimitMiddleware) Weight() int  { return 35 }
+func (bl *BodyLimitMiddleware) Name() string          { return bl.name }
+func (bl *BodyLimitMiddleware) Weight() int           { return bl.weight }
+func (bl *BodyLimitMiddleware) Provider() interface{} { return nil }
 
-func (bl *BodyLimitMiddleware) Handle(ctx *fasthttp.RequestCtx, next func(*fasthttp.RequestCtx), _ *types.RouteConfig) {
-	start := time.Now()
-
-	method := ctx.Method()
-	if !bl.hasBody(method) {
+func (bl *BodyLimitMiddleware) Handle(ctx *types.RequestCtx, next func(*types.RequestCtx), _ *types.RouteConfig) {
+	if !bytes.Contains(methods, ctx.Method()) {
 		next(ctx)
 		return
 	}
 
 	contentLength := ctx.Request.Header.ContentLength()
-	if contentLength > 0 && int64(contentLength) > bl.bodyLimitConfig.MaxBodySize {
-		duration := time.Since(start)
 
-		bl.logger.Warn("Request body too large",
-			zap.String("method", string(method)),
-			zap.String("path", string(ctx.Path())),
-			zap.Int("content_length", contentLength),
-			zap.Int64("max_allowed", bl.bodyLimitConfig.MaxBodySize),
-			zap.Duration("duration", duration))
-
-		bl.createBodyLimitResponse(ctx, bl.bodyLimitConfig.MaxBodySize)
-		return
+	if contentLength > 0 {
+		if int64(contentLength) > bl.bodyLimitConfig.MaxBodySize {
+			bl.createBodyLimitResponse(ctx)
+			return
+		}
 	}
 
 	if contentLength <= 0 || bl.isChunkedEncoding(ctx) {
 		bodySize := int64(len(ctx.PostBody()))
 		if bodySize > bl.bodyLimitConfig.MaxBodySize {
-			duration := time.Since(start)
-
-			bl.logger.Warn("Request body too large during streaming",
-				zap.String("method", string(method)),
-				zap.String("path", string(ctx.Path())),
-				zap.Int64("body_size", bodySize),
-				zap.Int64("max_allowed", bl.bodyLimitConfig.MaxBodySize),
-				zap.Duration("duration", duration))
-
-			bl.createBodyLimitResponse(ctx, bl.bodyLimitConfig.MaxBodySize)
+			bl.createBodyLimitResponse(ctx)
 			return
 		}
 	}
@@ -87,31 +85,23 @@ func (bl *BodyLimitMiddleware) Handle(ctx *fasthttp.RequestCtx, next func(*fasth
 	next(ctx)
 }
 
-func (bl *BodyLimitMiddleware) hasBody(method []byte) bool {
-	switch string(method) {
-	case fasthttp.MethodPost, fasthttp.MethodPut, fasthttp.MethodPatch:
-		return true
-	case fasthttp.MethodDelete:
-		return true
-	case fasthttp.MethodGet, fasthttp.MethodHead, fasthttp.MethodOptions:
+func (bl *BodyLimitMiddleware) isChunkedEncoding(ctx *types.RequestCtx) bool {
+	transferEncoding := ctx.Request.Header.Peek("Transfer-Encoding")
+	if len(transferEncoding) == 0 {
 		return false
-	default:
-		return true
 	}
+
+	return len(transferEncoding) == 7 &&
+		transferEncoding[0] == 'c' && transferEncoding[1] == 'h' &&
+		transferEncoding[2] == 'u' && transferEncoding[3] == 'n' &&
+		transferEncoding[4] == 'k' && transferEncoding[5] == 'e' &&
+		transferEncoding[6] == 'd'
 }
 
-func (bl *BodyLimitMiddleware) isChunkedEncoding(ctx *fasthttp.RequestCtx) bool {
-	transferEncoding := string(ctx.Request.Header.Peek("Transfer-Encoding"))
-	return transferEncoding == "chunked"
-}
-
-func (bl *BodyLimitMiddleware) createBodyLimitResponse(ctx *fasthttp.RequestCtx, limit int64) {
+func (bl *BodyLimitMiddleware) createBodyLimitResponse(ctx *types.RequestCtx) {
 	ctx.SetStatusCode(fasthttp.StatusRequestEntityTooLarge)
 	ctx.SetContentType("application/json")
 	ctx.SetConnectionClose()
 
-	response := fmt.Sprintf(`{"error":"Request entity too large","message":"Request body exceeds maximum size of %d bytes","max_size":%d,"error_code":"BODY_TOO_LARGE"}`,
-		limit, limit)
-
-	ctx.SetBodyString(response)
+	ctx.SetBody(bl.errorResponse)
 }

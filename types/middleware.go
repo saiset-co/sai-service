@@ -1,16 +1,13 @@
 package types
 
-import "github.com/valyala/fasthttp"
-
 type MiddlewareManager interface {
-	RegisterMiddlewares() error
+	LifecycleManager
 	Register(middleware Middleware) error
-	Execute(ctx *fasthttp.RequestCtx, handler func(*fasthttp.RequestCtx), config *RouteConfig)
-	Clear()
+	Execute(ctx *RequestCtx, handler func(*RequestCtx), config *RouteConfig)
 }
 
 type Middleware interface {
-	Handle(ctx *fasthttp.RequestCtx, next func(*fasthttp.RequestCtx), config *RouteConfig)
+	Handle(ctx *RequestCtx, next func(*RequestCtx), config *RouteConfig)
 	Name() string
 	Weight() int
 }

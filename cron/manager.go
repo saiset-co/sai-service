@@ -9,25 +9,38 @@ import (
 
 	"github.com/robfig/cron/v3"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/saiset-co/sai-service/types"
 )
 
+type State int32
+
+const (
+	StateStopped State = iota
+	StateStarting
+	StateRunning
+	StateStopping
+)
+
 type Manager struct {
-	ctx          context.Context
-	config       types.ConfigManager
-	logger       types.Logger
-	metrics      types.MetricsManager
-	health       types.HealthManager
-	cron         *cron.Cron
-	timezone     *time.Location
-	jobs         map[string]*types.JobEntry
-	running      int32
-	mu           sync.RWMutex
-	activeJobs   map[string]context.CancelFunc
-	activeJobsMu sync.RWMutex
-	shutdown     chan struct{}
-	shutdownOnce sync.Once
+	ctx             context.Context
+	cancel          context.CancelFunc
+	config          types.ConfigManager
+	logger          types.Logger
+	metrics         types.MetricsManager
+	health          types.HealthManager
+	cron            *cron.Cron
+	timezone        *time.Location
+	jobs            map[string]*types.JobEntry
+	state           atomic.Value
+	mu              sync.RWMutex
+	activeJobs      map[string]context.CancelFunc
+	activeJobsMu    sync.RWMutex
+	shutdown        chan struct{}
+	shutdownOnce    sync.Once
+	shutdownTimeout time.Duration
+	jobTimeout      time.Duration
 }
 
 func NewManager(ctx context.Context, config types.ConfigManager, logger types.Logger, metrics types.MetricsManager, health types.HealthManager) (types.CronManager, error) {
@@ -47,19 +60,25 @@ func NewManager(ctx context.Context, config types.ConfigManager, logger types.Lo
 		cron.WithChain(cron.Recover(cronL)),
 	}
 
+	managerCtx, cancel := context.WithCancel(ctx)
+
 	manager := &Manager{
-		ctx:        ctx,
-		config:     config,
-		logger:     logger,
-		metrics:    metrics,
-		health:     health,
-		cron:       cron.New(cronOptions...),
-		jobs:       make(map[string]*types.JobEntry),
-		timezone:   timezone,
-		running:    0,
-		activeJobs: make(map[string]context.CancelFunc),
-		shutdown:   make(chan struct{}),
+		ctx:             managerCtx,
+		cancel:          cancel,
+		config:          config,
+		logger:          logger,
+		metrics:         metrics,
+		health:          health,
+		cron:            cron.New(cronOptions...),
+		jobs:            make(map[string]*types.JobEntry),
+		timezone:        timezone,
+		activeJobs:      make(map[string]context.CancelFunc),
+		shutdown:        make(chan struct{}),
+		shutdownTimeout: 10 * time.Second,
+		jobTimeout:      30 * time.Minute,
 	}
+
+	manager.state.Store(StateStopped)
 
 	return manager, nil
 }
@@ -82,30 +101,46 @@ func (m *Manager) Add(jobName, spec string, job func()) error {
 	return m.addJob(jobName, spec, wrappedJob)
 }
 
-func (m *Manager) Remove(name string) error {
-	return m.removeJob(name)
-}
-
 func (m *Manager) Start() error {
-	err := m.start()
-
-	if err == nil {
-		m.setSchedulerStatus(1)
-		m.logger.Info("Cron manager started")
+	if !m.transitionState(StateStopped, StateStarting) {
+		return types.ErrCronIsRunning
 	}
 
-	return err
+	defer func() {
+		if m.getState() == StateStarting {
+			m.setState(StateRunning)
+		}
+	}()
+
+	if err := m.start(); err != nil {
+		m.setState(StateStopped)
+		return err
+	}
+
+	m.setSchedulerStatus(1)
+	m.logger.Info("Cron manager started")
+	return nil
 }
 
 func (m *Manager) Stop() error {
+	if !m.transitionState(StateRunning, StateStopping) &&
+		!m.transitionState(StateStarting, StateStopping) {
+		return types.ErrServerNotRunning
+	}
+
 	var err error
 	m.shutdownOnce.Do(func() {
+		defer func() {
+			m.setState(StateStopped)
+			m.cancel()
+		}()
+
 		err = m.stop()
 		m.setSchedulerStatus(0)
 		m.setActiveJobsGauge(0)
 
 		if err == nil {
-			m.logger.Info("Cron scheduler stopped")
+			m.logger.Info("Cron scheduler stopped gracefully")
 		}
 		close(m.shutdown)
 	})
@@ -114,15 +149,21 @@ func (m *Manager) Stop() error {
 }
 
 func (m *Manager) IsRunning() bool {
-	return m.isRunning()
+	state := m.getState()
+	return state == StateRunning
 }
 
-func (m *Manager) GetJobs() map[string]*types.JobEntry {
-	return m.getJobs()
+func (m *Manager) getState() State {
+	return m.state.Load().(State)
 }
 
-func (m *Manager) GetJob(name string) (*types.JobEntry, error) {
-	return m.getJob(name)
+func (m *Manager) setState(newState State) bool {
+	currentState := m.getState()
+	return m.state.CompareAndSwap(currentState, newState)
+}
+
+func (m *Manager) transitionState(from, to State) bool {
+	return m.state.CompareAndSwap(from, to)
 }
 
 func (m *Manager) wrapJob(jobName string, job func()) func() {
@@ -148,14 +189,14 @@ func (m *Manager) wrapJob(jobName string, job func()) func() {
 
 		m.safeUpdateJobStatsStart(jobName, startTime)
 
-		jobCtx, cancel := context.WithTimeout(m.ctx, 30*time.Minute)
+		jobCtx, cancel := context.WithTimeout(m.ctx, m.jobTimeout)
 		defer cancel()
 
 		if !m.registerActiveJob(jobName, cancel) {
 			m.logger.Info("Job cancelled due to manager shutdown", zap.String("job_name", jobName))
 			return
 		}
-		defer m.unregisterActiveJob(jobName)
+		defer m.cancelActiveJob(jobName)
 
 		m.incActiveJobsGauge()
 		defer m.decActiveJobsGauge()
@@ -190,7 +231,7 @@ func (m *Manager) wrapJob(jobName string, job func()) func() {
 		case <-done:
 		case <-jobCtx.Done():
 			if types.IsError(jobCtx.Err(), context.DeadlineExceeded) {
-				err = types.Errorf(types.ErrCronJobTimeout, "timeout after %v", 30*time.Minute)
+				err = types.Errorf(types.ErrCronJobTimeout, "timeout after %v", m.jobTimeout)
 			} else {
 				err = types.WrapError(jobCtx.Err(), "job canceled")
 			}
@@ -279,145 +320,56 @@ func (m *Manager) addJob(jobName, spec string, job func()) error {
 	return nil
 }
 
-func (m *Manager) removeJob(name string) error {
-	if name == "" {
-		return types.ErrCronJobNameIsEmpty
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	entry, exists := m.jobs[name]
-	if !exists {
-		return types.ErrCronJobNotFound
-	}
-
-	m.cancelActiveJob(name)
-
-	m.cron.Remove(entry.ID)
-	delete(m.jobs, name)
-
-	m.logger.Info("Cron job removed", zap.String("job_name", name))
-	return nil
-}
-
 func (m *Manager) start() error {
-	if !atomic.CompareAndSwapInt32(&m.running, 0, 1) {
-		return types.ErrCronIsRunning
-	}
-
 	m.cron.Start()
-
 	return nil
 }
 
 func (m *Manager) stop() error {
-	if !atomic.CompareAndSwapInt32(&m.running, 1, 0) {
-		return types.ErrCronSchedulerStopped
-	}
-
-	m.activeJobsMu.Lock()
-	activeJobs := make(map[string]context.CancelFunc, len(m.activeJobs))
-	for jobName, cancel := range m.activeJobs {
-		activeJobs[jobName] = cancel
-	}
-
-	m.activeJobs = make(map[string]context.CancelFunc)
-	m.activeJobsMu.Unlock()
-
-	for jobName, cancel := range activeJobs {
-		cancel()
-		m.logger.Debug("Cancelled job during shutdown", zap.String("job_name", jobName))
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), m.shutdownTimeout)
 	defer cancel()
 
-	stopCtx := m.cron.Stop()
+	g, gCtx := errgroup.WithContext(ctx)
 
-	select {
-	case <-stopCtx.Done():
-		return nil
-	case <-ctx.Done():
-		return types.ErrCronJobTimeout
-	}
-}
-
-func (m *Manager) isRunning() bool {
-	return atomic.LoadInt32(&m.running) == 1
-}
-
-func (m *Manager) getJobs() map[string]*types.JobEntry {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	jobs := make(map[string]*types.JobEntry, len(m.jobs))
-	for name, entry := range m.jobs {
-		entryCopy := m.copyJobEntry(entry)
-
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					m.logger.Debug("Failed to get cron entry in GetJobs",
-						zap.String("job_name", name),
-						zap.Any("panic", r))
-				}
-			}()
-
-			if cronEntry := m.cron.Entry(entry.ID); cronEntry.ID != 0 {
-				entryCopy.NextRun = cronEntry.Next
-			}
-		}()
-
-		jobs[name] = entryCopy
-	}
-
-	return jobs
-}
-
-func (m *Manager) getJob(name string) (*types.JobEntry, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	entry, exists := m.jobs[name]
-	if !exists {
-		return nil, types.ErrCronJobNotFound
-	}
-
-	entryCopy := m.copyJobEntry(entry)
-
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				m.logger.Debug("Failed to get cron entry in GetJob",
-					zap.String("job_name", name),
-					zap.Any("panic", r))
-			}
-		}()
-
-		if cronEntry := m.cron.Entry(entry.ID); cronEntry.ID != 0 {
-			entryCopy.NextRun = cronEntry.Next
+	g.Go(func() error {
+		m.activeJobsMu.Lock()
+		activeJobs := make(map[string]context.CancelFunc, len(m.activeJobs))
+		for jobName, cancel := range m.activeJobs {
+			activeJobs[jobName] = cancel
 		}
-	}()
 
-	return entryCopy, nil
-}
+		m.activeJobs = make(map[string]context.CancelFunc)
+		m.activeJobsMu.Unlock()
 
-func (m *Manager) copyJobEntry(entry *types.JobEntry) *types.JobEntry {
-	return &types.JobEntry{
-		ID:            entry.ID,
-		Name:          entry.Name,
-		Spec:          entry.Spec,
-		Job:           entry.Job,
-		AddedAt:       entry.AddedAt,
-		LastRun:       entry.LastRun,
-		NextRun:       entry.NextRun,
-		LastDuration:  entry.LastDuration,
-		TotalDuration: entry.TotalDuration,
-		AvgDuration:   entry.AvgDuration,
-		RunCount:      entry.RunCount,
-		Error:         entry.Error,
+		for jobName, cancel := range activeJobs {
+			cancel()
+			m.logger.Debug("Cancelled job during shutdown", zap.String("job_name", jobName))
+		}
+		return nil
+	})
+
+	g.Go(func() error {
+		stopCtx := m.cron.Stop()
+
+		select {
+		case <-stopCtx.Done():
+			return nil
+		case <-gCtx.Done():
+			return types.ErrCronJobTimeout
+		}
+	})
+
+	if err := g.Wait(); err != nil {
+		select {
+		case <-ctx.Done():
+			m.logger.Warn("Cron manager stop timeout, some components may not have stopped gracefully")
+		default:
+			m.logger.Error("Error during cron manager shutdown", zap.Error(err))
+		}
+		return err
 	}
+
+	return nil
 }
 
 func (m *Manager) registerActiveJob(jobName string, cancel context.CancelFunc) bool {
@@ -436,12 +388,6 @@ func (m *Manager) registerActiveJob(jobName string, cancel context.CancelFunc) b
 
 	m.activeJobs[jobName] = cancel
 	return true
-}
-
-func (m *Manager) unregisterActiveJob(jobName string) {
-	m.activeJobsMu.Lock()
-	defer m.activeJobsMu.Unlock()
-	delete(m.activeJobs, jobName)
 }
 
 func (m *Manager) cancelActiveJob(jobName string) {

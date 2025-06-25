@@ -6,7 +6,6 @@ import (
 
 type MetricsManager interface {
 	LifecycleManager
-	RegisterRoutes(router HTTPRouter)
 	Counter(name string, labels map[string]string) Counter
 	Gauge(name string, labels map[string]string) Gauge
 	Histogram(name string, buckets []float64, labels map[string]string) Histogram

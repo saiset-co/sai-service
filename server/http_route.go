@@ -10,7 +10,7 @@ import (
 const maxMiddlewareSliceSize = 100
 
 type RouteBuilder struct {
-	router     types.HTTPRouter
+	router     *LazyHTTPRouter
 	method     string
 	path       string
 	handler    types.FastHTTPHandler
@@ -18,7 +18,7 @@ type RouteBuilder struct {
 	routeGroup types.GroupBuilder
 }
 
-func (rb *RouteBuilder) WithCache(key string, ttl int, dependencies ...string) types.RouteBuilder {
+func (rb *RouteBuilder) WithCache(key string, ttl time.Duration, dependencies ...string) types.RouteBuilder {
 	rb.config.Cache = &types.CacheHandlerConfig{
 		Enabled: true,
 		Key:     key,

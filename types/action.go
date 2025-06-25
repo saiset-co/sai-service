@@ -5,20 +5,18 @@ import (
 )
 
 type ActionBroker interface {
-	LifecycleManager
 	Publish(action string, payload interface{}) error
 	Subscribe(action string, handler ActionHandler) error
 	Unsubscribe(action string) error
-	RegisterRoutes(router HTTPRouter)
 }
 
-type EventDispatcher interface {
+type Dispatcher interface {
 	ActionBroker
-	SetBroker(broker ActionBroker) error
 }
 
 type ActionHandler func(payload *ActionMessage) error
 type ActionBrokerCreator func(config interface{}) (ActionBroker, error)
+
 type ActionMessage struct {
 	Action    string            `json:"action"`
 	Payload   interface{}       `json:"payload"`

@@ -5,6 +5,10 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
+type LoggerManager interface {
+	Logger
+}
+
 type Logger interface {
 	Error(msg string, fields ...zap.Field)
 	Warn(msg string, fields ...zap.Field)

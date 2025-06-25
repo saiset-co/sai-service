@@ -1,92 +1,96 @@
 package middleware
 
 import (
-	"strings"
-	"time"
+	"bytes"
 
-	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
 
+	"github.com/saiset-co/sai-service/auth_providers"
 	"github.com/saiset-co/sai-service/types"
 	"github.com/saiset-co/sai-service/utils"
+)
+
+var (
+	challengeError = []byte("basic_auth_challenge_sent")
+	successMsg     = "Authentication successful"
+	challengeMsg   = "Basic auth challenge sent to browser"
+	failedMsg      = "Authentication failed"
 )
 
 type AuthMiddleware struct {
 	config     types.ConfigManager
 	logger     types.Logger
 	metrics    types.MetricsManager
+	provider   types.AuthProvider
 	authConfig *AuthConfig
+	name       string
+	weight     int
 }
 
 type AuthConfig struct {
-	Token string `json:"token"`
+	Provider string `json:"provider"`
 }
 
-func NewAuthMiddleware(config types.ConfigManager, logger types.Logger, metrics types.MetricsManager) *AuthMiddleware {
-	var authConfig = &AuthConfig{}
+func NewAuthMiddleware(provider types.AuthProviderManager, config types.ConfigManager, logger types.Logger, metrics types.MetricsManager) (*AuthMiddleware, error) {
+	var authConfig = &AuthConfig{
+		Provider: "token",
+	}
 
 	if config.GetConfig().Middlewares.Auth.Params != nil {
 		err := utils.UnmarshalConfig(config.GetConfig().Middlewares.Auth.Params, authConfig)
 		if err != nil {
 			logger.Error("Failed to unmarshal Auth middleware config", zap.Error(err))
+			return nil, err
 		}
 	}
 
-	return &AuthMiddleware{
+	authProvider, err := provider.(*auth_providers.AuthProviderManager).GetProvider(authConfig.Provider)
+	if err != nil {
+		logger.Error("Failed to get auth provider", zap.Error(err))
+		return nil, err
+	}
+
+	am := &AuthMiddleware{
+		name:       "auth",
 		config:     config,
 		logger:     logger,
 		metrics:    metrics,
+		provider:   authProvider,
 		authConfig: authConfig,
+		weight:     config.GetConfig().Middlewares.Auth.Weight,
 	}
+
+	return am, nil
 }
 
-func (a *AuthMiddleware) Name() string { return "auth" }
-func (a *AuthMiddleware) Weight() int  { return 50 }
+func (a *AuthMiddleware) Name() string          { return a.name }
+func (a *AuthMiddleware) Weight() int           { return a.weight }
+func (a *AuthMiddleware) Provider() interface{} { return a.provider }
 
-func (a *AuthMiddleware) Handle(ctx *fasthttp.RequestCtx, next func(*fasthttp.RequestCtx), _ *types.RouteConfig) {
-	start := time.Now()
-	token := a.extractToken(ctx)
-	authenticated := a.validateToken(token)
-	duration := time.Since(start)
+func (a *AuthMiddleware) Handle(ctx *types.RequestCtx, next func(*types.RequestCtx), _ *types.RouteConfig) {
+	err := a.provider.ApplyToIncomingRequest(ctx)
 
-	if authenticated {
-		a.logger.Debug("Authentication successful",
-			zap.String("path", string(ctx.Path())),
-			zap.Duration("duration", duration))
-
+	if err == nil {
+		a.logger.Debug(successMsg,
+			zap.ByteString("path", ctx.Path()),
+			zap.String("provider_type", a.provider.Type()))
 		next(ctx)
 		return
 	}
 
-	a.logger.Warn("Authentication failed",
-		zap.String("path", string(ctx.Path())),
-		zap.String("remote_addr", ctx.RemoteIP().String()),
-		zap.Duration("duration", duration))
+	if a.isBasicAuthChallenge(err) {
+		a.logger.Debug(challengeMsg,
+			zap.ByteString("path", ctx.Path()))
+		return
+	}
 
-	utils.CreateUnauthorizedResponse(ctx)
+	a.logger.Warn(failedMsg,
+		zap.ByteString("path", ctx.Path()),
+		zap.String("provider_type", a.provider.Type()),
+		zap.Error(err))
+	types.CreateUnauthorizedResponse(ctx)
 }
 
-func (a *AuthMiddleware) extractToken(ctx *fasthttp.RequestCtx) string {
-	authHeader := string(ctx.Request.Header.Peek("Authorization"))
-	if authHeader == "" {
-		return string(ctx.Request.Header.Peek("X-API-Key"))
-	}
-
-	if strings.HasPrefix(authHeader, "Bearer ") {
-		return strings.TrimPrefix(authHeader, "Bearer ")
-	}
-
-	if strings.HasPrefix(authHeader, "Token ") {
-		return strings.TrimPrefix(authHeader, "Token ")
-	}
-
-	return authHeader
-}
-
-func (a *AuthMiddleware) validateToken(token string) bool {
-	if a.authConfig.Token == "" || token == "" {
-		return false
-	}
-
-	return token == a.authConfig.Token
+func (a *AuthMiddleware) isBasicAuthChallenge(err error) bool {
+	return bytes.Contains([]byte(err.Error()), challengeError)
 }

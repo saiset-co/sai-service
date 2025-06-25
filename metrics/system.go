@@ -7,66 +7,157 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
+
 	"github.com/saiset-co/sai-service/types"
 )
 
+type SystemState int32
+
+const (
+	SystemStateStopped SystemState = iota
+	SystemStateStarting
+	SystemStateRunning
+	SystemStateStopping
+)
+
 type SystemMetricsCollector struct {
-	ctx            context.Context
-	logger         types.Logger
-	metrics        types.MetricsManager
-	stopChan       chan struct{}
-	running        int32
-	startTime      time.Time
-	lastMemStats   runtime.MemStats
-	lastMemUpdate  int64
-	memStatsMu     sync.RWMutex
-	lastCPUTime    int64
-	lastSampleTime int64
-	cpuPercent     float64
-	lastGoroutines int
-	lastGCTime     int64
-	lastGCCount    uint32
+	ctx             context.Context
+	cancel          context.CancelFunc
+	logger          types.Logger
+	metrics         types.MetricsManager
+	state           atomic.Value
+	shutdownTimeout time.Duration
+	startTime       time.Time
+	lastMemStats    runtime.MemStats
+	lastMemUpdate   int64
+	memStatsMu      sync.RWMutex
+	lastCPUTime     int64
+	lastSampleTime  int64
+	cpuPercent      float64
+	lastGoroutines  int
+	lastGCTime      int64
+	lastGCCount     uint32
+	stopChan        chan struct{}
 }
 
 func NewSystemMetricsCollector(ctx context.Context, logger types.Logger, metricsManager types.MetricsManager) *SystemMetricsCollector {
-	return &SystemMetricsCollector{
-		ctx:      ctx,
-		logger:   logger,
-		metrics:  metricsManager,
-		stopChan: make(chan struct{}),
-		running:  0,
+	systemCtx, cancel := context.WithCancel(ctx)
+
+	collector := &SystemMetricsCollector{
+		ctx:             systemCtx,
+		cancel:          cancel,
+		logger:          logger,
+		metrics:         metricsManager,
+		shutdownTimeout: 10 * time.Second,
+		stopChan:        make(chan struct{}),
 	}
+
+	collector.state.Store(SystemStateStopped)
+
+	return collector
 }
 
 func (smc *SystemMetricsCollector) Start() error {
-	if !atomic.CompareAndSwapInt32(&smc.running, 0, 1) {
+	if !smc.transitionState(SystemStateStopped, SystemStateStarting) {
 		smc.logger.Warn("System metrics is already running")
 		return types.ErrServerAlreadyRunning
 	}
 
+	defer func() {
+		if smc.getState() == SystemStateStarting {
+			smc.setState(SystemStateRunning)
+		}
+	}()
+
 	smc.startTime = time.Now()
 
-	go smc.collectLoop()
+	ctx, cancel := context.WithTimeout(smc.ctx, 30*time.Second)
+	defer cancel()
+
+	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		select {
+		case <-gCtx.Done():
+			return gCtx.Err()
+		default:
+			go smc.collectLoop()
+			return nil
+		}
+	})
+
+	if err := g.Wait(); err != nil {
+		select {
+		case <-ctx.Done():
+			smc.setState(SystemStateStopped)
+			return types.NewErrorf("system metrics start timeout")
+		default:
+			smc.setState(SystemStateStopped)
+			return types.WrapError(err, "failed to start system metrics")
+		}
+	}
 
 	smc.logger.Info("System metrics collection started")
-
 	return nil
 }
 
 func (smc *SystemMetricsCollector) Stop() error {
-	if !atomic.CompareAndSwapInt32(&smc.running, 1, 0) {
+	if !smc.transitionState(SystemStateRunning, SystemStateStopping) {
 		smc.logger.Warn("System metrics is not running")
 		return types.ErrServerNotRunning
 	}
 
-	close(smc.stopChan)
+	defer func() {
+		smc.setState(SystemStateStopped)
+		smc.cancel()
+	}()
 
-	smc.logger.Info("System metrics collection stopped")
+	ctx, cancel := context.WithTimeout(context.Background(), smc.shutdownTimeout)
+	defer cancel()
+
+	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		select {
+		case <-gCtx.Done():
+			return gCtx.Err()
+		default:
+			close(smc.stopChan)
+			return nil
+		}
+	})
+
+	if err := g.Wait(); err != nil {
+		select {
+		case <-ctx.Done():
+			smc.logger.Warn("System metrics stop timeout, some components may not have stopped gracefully")
+		default:
+			smc.logger.Error("Error during system metrics shutdown", zap.Error(err))
+		}
+	} else {
+		smc.logger.Info("System metrics collection stopped gracefully")
+	}
+
 	return nil
 }
 
 func (smc *SystemMetricsCollector) IsRunning() bool {
-	return atomic.LoadInt32(&smc.running) == 1
+	return smc.getState() == SystemStateRunning
+}
+
+func (smc *SystemMetricsCollector) getState() SystemState {
+	return smc.state.Load().(SystemState)
+}
+
+func (smc *SystemMetricsCollector) setState(newState SystemState) bool {
+	currentState := smc.getState()
+	return smc.state.CompareAndSwap(currentState, newState)
+}
+
+func (smc *SystemMetricsCollector) transitionState(from, to SystemState) bool {
+	return smc.state.CompareAndSwap(from, to)
 }
 
 func (smc *SystemMetricsCollector) collectLoop() {
@@ -81,9 +172,15 @@ func (smc *SystemMetricsCollector) collectLoop() {
 	for {
 		select {
 		case <-heavyTicker.C:
+			if !smc.IsRunning() {
+				return
+			}
 			smc.collectHeavyMetrics()
 
 		case <-lightTicker.C:
+			if !smc.IsRunning() {
+				return
+			}
 			smc.collectLightMetrics()
 
 		case <-smc.stopChan:
@@ -95,6 +192,10 @@ func (smc *SystemMetricsCollector) collectLoop() {
 }
 
 func (smc *SystemMetricsCollector) collectHeavyMetrics() {
+	if smc.metrics == nil {
+		return
+	}
+
 	now := time.Now().UnixNano()
 
 	smc.memStatsMu.RLock()
@@ -122,6 +223,10 @@ func (smc *SystemMetricsCollector) collectHeavyMetrics() {
 }
 
 func (smc *SystemMetricsCollector) collectLightMetrics() {
+	if smc.metrics == nil {
+		return
+	}
+
 	currentGoroutines := runtime.NumGoroutine()
 	if currentGoroutines != smc.lastGoroutines {
 		smc.metrics.Gauge("system_goroutines_count", nil).Set(float64(currentGoroutines))
@@ -229,25 +334,4 @@ func (smc *SystemMetricsCollector) measureCPUUsageEfficient() float64 {
 	atomic.StoreInt64(&smc.lastSampleTime, now)
 
 	return smc.cpuPercent
-}
-
-func (smc *SystemMetricsCollector) measureCPUUsageProduction() float64 {
-	goroutines := float64(runtime.NumGoroutine())
-	maxProcs := float64(runtime.GOMAXPROCS(0))
-
-	baseLoad := (goroutines / (maxProcs * 10)) * 100
-	if baseLoad > 100 {
-		baseLoad = 100
-	}
-
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	gcImpact := m.GCCPUFraction * 100
-
-	totalCPU := baseLoad + gcImpact
-	if totalCPU > 100 {
-		totalCPU = 100
-	}
-
-	return totalCPU
 }

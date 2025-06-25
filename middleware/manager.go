@@ -7,152 +7,221 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/valyala/fasthttp"
+	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/saiset-co/sai-service/types"
-	"github.com/saiset-co/sai-service/utils"
 )
 
 const (
-	CacheSize      = 512
 	MaxMiddlewares = 64
+)
+
+type State int32
+
+const (
+	StateStopped State = iota
+	StateStarting
+	StateRunning
+	StateStopping
 )
 
 type Manager struct {
 	ctx                context.Context
+	cancel             context.CancelFunc
 	config             types.ConfigManager
 	logger             types.Logger
 	metrics            types.MetricsManager
 	cache              types.CacheManager
 	health             types.HealthManager
+	authProvider       types.AuthProviderManager
+	compiledChain      func(*types.RequestCtx, func(*types.RequestCtx), *types.RouteConfig)
 	orderedMiddlewares []types.MiddlewareEntry
-	defaultEnabledMask uint64
-	nameToIndex        map[string]int
-	mu                 sync.RWMutex
-	maskCache          [CacheSize]*CacheEntry
-	cacheIndex         map[string]int
-	cacheLRU           []int
-	cacheSize          int32
-	cacheMu            sync.RWMutex
-	compiledChains     map[uint64]*CompiledChain
-	chainsMu           sync.RWMutex
-	initialized        int32
 	middlewareMap      map[string]*types.MiddlewareEntry
-	keyBuilderPool     sync.Pool
+	mu                 sync.RWMutex
+	state              int32
+	shutdownTimeout    time.Duration
 }
 
-type CacheEntry struct {
-	key  string
-	mask uint64
-	used int64
-}
+func NewManager(ctx context.Context, config types.ConfigManager, logger types.Logger, metrics types.MetricsManager, cache types.CacheManager, health types.HealthManager, authProvider types.AuthProviderManager) (*Manager, error) {
+	managerCtx, cancel := context.WithCancel(ctx)
 
-type CompiledChain struct {
-	mask        uint64
-	middlewares []types.Middleware
-	handler     func(*fasthttp.RequestCtx, func(*fasthttp.RequestCtx), *types.RouteConfig)
-}
-
-func NewManager(ctx context.Context, config types.ConfigManager, logger types.Logger, metrics types.MetricsManager, cache types.CacheManager, health types.HealthManager) (*Manager, error) {
 	manager := &Manager{
-		ctx:            ctx,
-		config:         config,
-		logger:         logger,
-		metrics:        metrics,
-		cache:          cache,
-		health:         health,
-		nameToIndex:    make(map[string]int),
-		cacheIndex:     make(map[string]int),
-		cacheLRU:       make([]int, 0, CacheSize),
-		compiledChains: make(map[uint64]*CompiledChain),
-		middlewareMap:  make(map[string]*types.MiddlewareEntry),
-		keyBuilderPool: sync.Pool{
-			New: func() interface{} {
-				return make([]byte, 0, 128)
-			},
-		},
-	}
-
-	for i := 0; i < CacheSize; i++ {
-		manager.maskCache[i] = &CacheEntry{}
+		ctx:             managerCtx,
+		cancel:          cancel,
+		config:          config,
+		logger:          logger,
+		metrics:         metrics,
+		cache:           cache,
+		health:          health,
+		authProvider:    authProvider,
+		middlewareMap:   make(map[string]*types.MiddlewareEntry),
+		shutdownTimeout: 10 * time.Second,
 	}
 
 	return manager, nil
 }
 
-func (m *Manager) RegisterMiddlewares() error {
+func (m *Manager) Start() error {
+	if !m.transitionState(StateStopped, StateStarting) {
+		return types.ErrServerAlreadyRunning
+	}
+
+	defer func() {
+		if m.getState() == StateStarting {
+			m.setState(StateRunning)
+		}
+	}()
+
+	if err := m.registerMiddlewares(); err != nil {
+		m.setState(StateStopped)
+		return types.WrapError(err, "failed to register middlewares")
+	}
+
+	m.logger.Info("Middleware manager started")
+	return nil
+}
+
+func (m *Manager) Stop() error {
+	if !m.transitionState(StateRunning, StateStopping) {
+		return types.ErrServerNotRunning
+	}
+
+	defer func() {
+		m.setState(StateStopped)
+		m.cancel()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), m.shutdownTimeout)
+	defer cancel()
+
+	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		m.clearResources()
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		select {
+		case <-gCtx.Done():
+			m.logger.Warn("Middleware manager stop timeout, some components may not have stopped gracefully")
+		default:
+			m.logger.Error("Error during middleware manager shutdown", zap.Error(err))
+		}
+	} else {
+		m.logger.Info("Middleware manager stopped gracefully")
+	}
+
+	return nil
+}
+
+func (m *Manager) IsRunning() bool {
+	return m.getState() == StateRunning
+}
+
+func (m *Manager) getState() State {
+	return State(atomic.LoadInt32(&m.state))
+}
+
+func (m *Manager) setState(newState State) bool {
+	atomic.StoreInt32(&m.state, int32(newState))
+	return true
+}
+
+func (m *Manager) transitionState(from, to State) bool {
+	return atomic.CompareAndSwapInt32(&m.state, int32(from), int32(to))
+}
+
+func (m *Manager) registerMiddlewares() error {
 	config := m.config.GetConfig()
 
-	if config.Middlewares.Recovery.Enabled {
-		recoveryMw := NewRecoveryMiddleware(m.config, m.logger, m.metrics)
-		if err := m.Register(recoveryMw); err != nil {
-			return err
-		}
-		m.logger.Info(" Recovery middleware registered")
+	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
+	defer cancel()
+
+	g, gCtx := errgroup.WithContext(ctx)
+
+	middlewares := []struct {
+		name       string
+		enabled    bool
+		createFunc func() (types.Middleware, error)
+	}{
+		{"recovery", config.Middlewares.Recovery.Enabled, func() (types.Middleware, error) {
+			return NewRecoveryMiddleware(m.config, m.logger, m.metrics), nil
+		}},
+		{"logging", config.Middlewares.Logging.Enabled, func() (types.Middleware, error) {
+			return NewLoggingMiddleware(m.config, m.logger, m.metrics), nil
+		}},
+		{"rate-limit", config.Middlewares.RateLimit.Enabled, func() (types.Middleware, error) {
+			return NewRateLimitMiddleware(m.ctx, m.config, m.logger, m.metrics), nil
+		}},
+		{"compression", config.Middlewares.Compression.Enabled, func() (types.Middleware, error) {
+			return NewCompressionMiddleware(m.config, m.logger, m.metrics), nil
+		}},
+		{"body-limit", config.Middlewares.BodyLimit.Enabled, func() (types.Middleware, error) {
+			return NewBodyLimitMiddleware(m.config, m.logger, m.metrics), nil
+		}},
+		{"cache", config.Middlewares.Cache.Enabled && m.cache != nil, func() (types.Middleware, error) {
+			return NewCacheMiddleware(m.config, m.logger, m.metrics, m.cache), nil
+		}},
+		{"auth", config.Middlewares.Auth.Enabled, func() (types.Middleware, error) {
+			return NewAuthMiddleware(m.authProvider, m.config, m.logger, m.metrics)
+		}},
+		{"cors", config.Middlewares.CORS.Enabled, func() (types.Middleware, error) {
+			return NewCORSMiddleware(m.config, m.logger, m.metrics), nil
+		}},
 	}
 
-	if config.Middlewares.Logging.Enabled {
-		loggingMw := NewLoggingMiddleware(m.config, m.logger, m.metrics)
-		if err := m.Register(loggingMw); err != nil {
-			return err
+	middlewareResults := make(chan struct {
+		middleware types.Middleware
+		name       string
+		err        error
+	}, len(middlewares))
+
+	for _, mw := range middlewares {
+		if !mw.enabled {
+			continue
 		}
-		m.logger.Info(" Logging middleware registered")
+
+		mw := mw
+		g.Go(func() error {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+				middleware, err := mw.createFunc()
+				middlewareResults <- struct {
+					middleware types.Middleware
+					name       string
+					err        error
+				}{middleware, mw.name, err}
+				return err
+			}
+		})
 	}
 
-	if config.Middlewares.Metadata.Enabled {
-		metadataMw := NewMetadataMiddleware(m.config, m.logger, m.metrics)
-		if err := m.Register(metadataMw); err != nil {
-			return err
+	go func() {
+		_ = g.Wait()
+		close(middlewareResults)
+	}()
+
+	var registrationErrors []error
+	for result := range middlewareResults {
+		if result.err != nil {
+			registrationErrors = append(registrationErrors, result.err)
+			continue
 		}
-		m.logger.Info(" Metadata middleware registered")
+
+		if err := m.Register(result.middleware); err != nil {
+			registrationErrors = append(registrationErrors, err)
+			continue
+		}
+
+		m.logger.Info("Middleware registered", zap.String("name", result.name))
 	}
 
-	if config.Middlewares.RateLimit.Enabled {
-		rateLimitMw := NewRateLimitMiddleware(m.ctx, m.config, m.logger, m.metrics)
-		if err := m.Register(rateLimitMw); err != nil {
-			return err
-		}
-		m.logger.Info(" RateLimit middleware registered")
-	}
-
-	if config.Middlewares.Compression.Enabled {
-		compressionMw := NewCompressionMiddleware(m.config, m.logger, m.metrics)
-		if err := m.Register(compressionMw); err != nil {
-			return err
-		}
-		m.logger.Info(" Compression middleware registered")
-	}
-
-	if config.Middlewares.BodyLimit.Enabled {
-		bodyLimitMw := NewBodyLimitMiddleware(m.config, m.logger, m.metrics)
-		if err := m.Register(bodyLimitMw); err != nil {
-			return err
-		}
-		m.logger.Info(" BodyLimit middleware registered")
-	}
-
-	if config.Middlewares.Cache.Enabled {
-		cacheMw := NewCacheMiddleware(m.config, m.logger, m.metrics, m.cache)
-		if err := m.Register(cacheMw); err != nil {
-			return err
-		}
-		m.logger.Info(" Cache middleware registered")
-	}
-
-	if config.Middlewares.Auth.Enabled {
-		authMw := NewAuthMiddleware(m.config, m.logger, m.metrics)
-		if err := m.Register(authMw); err != nil {
-			return err
-		}
-		m.logger.Info(" Auth middleware registered")
-	}
-
-	if config.Middlewares.CORS.Enabled {
-		corsMw := NewCORSMiddleware(m.config, m.logger, m.metrics)
-		if err := m.Register(corsMw); err != nil {
-			return err
-		}
-		m.logger.Info(" CORS middleware registered")
+	if len(registrationErrors) > 0 {
+		return types.NewErrorf("failed to register %d middlewares", len(registrationErrors))
 	}
 
 	return m.finalizeConfiguration()
@@ -161,10 +230,6 @@ func (m *Manager) RegisterMiddlewares() error {
 func (m *Manager) Register(middleware types.Middleware) error {
 	if middleware == nil {
 		return types.ErrMiddlewareInvalidType
-	}
-
-	if atomic.LoadInt32(&m.initialized) == 1 {
-		return types.NewErrorf("cannot register middleware after finalization")
 	}
 
 	m.mu.Lock()
@@ -190,10 +255,6 @@ func (m *Manager) finalizeConfiguration() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if atomic.LoadInt32(&m.initialized) == 1 {
-		return types.NewErrorf("configuration already finalized")
-	}
-
 	weights := make(map[int]string)
 	for name, entry := range m.middlewareMap {
 		if existingName, exists := weights[entry.Weight]; exists {
@@ -216,218 +277,37 @@ func (m *Manager) finalizeConfiguration() error {
 		return m.orderedMiddlewares[i].Weight < m.orderedMiddlewares[j].Weight
 	})
 
-	m.nameToIndex = make(map[string]int, len(m.orderedMiddlewares))
-	m.defaultEnabledMask = 0
+	m.compiledChain = m.compileChain(m.orderedMiddlewares)
 	m.middlewareMap = nil
-
-	atomic.StoreInt32(&m.initialized, 1)
 
 	return nil
 }
 
-func (m *Manager) Execute(ctx *fasthttp.RequestCtx, handler func(*fasthttp.RequestCtx), config *types.RouteConfig) {
-	if atomic.LoadInt32(&m.initialized) == 0 {
-		handler(ctx)
-		return
-	}
-
-	mask := m.computeRouteMaskFast(config)
-	if mask == 0 {
-		handler(ctx)
-		return
-	}
-
-	if compiled := m.getCompiledChain(mask); compiled != nil {
-		compiled.handler(ctx, handler, config)
+func (m *Manager) Execute(ctx *types.RequestCtx, handler func(*types.RequestCtx), config *types.RouteConfig) {
+	if m.compiledChain != nil {
+		m.compiledChain(ctx, handler, config)
 	} else {
-		m.executeAndCompile(ctx, handler, mask, config)
+		handler(ctx)
 	}
 }
 
-func (m *Manager) computeRouteMaskFast(config *types.RouteConfig) uint64 {
-	if config == nil {
-		return m.defaultEnabledMask
-	}
-
-	if len(config.Middlewares) == 0 && len(config.DisabledMiddlewares) == 0 {
-		return m.defaultEnabledMask
-	}
-
-	cacheKey := m.buildCacheKeyFast(config)
-
-	if mask, found := m.getCachedMaskFast(cacheKey); found {
-		return mask
-	}
-
-	mask := m.calculateMaskFast(config)
-	m.setCachedMaskFast(cacheKey, mask)
-
-	return mask
-}
-
-func (m *Manager) getCachedMaskFast(key string) (uint64, bool) {
-	m.cacheMu.RLock()
-	if idx, exists := m.cacheIndex[key]; exists {
-		entry := m.maskCache[idx]
-		if entry.key == key {
-			atomic.StoreInt64(&entry.used, time.Now().UnixNano())
-			mask := entry.mask
-			m.cacheMu.RUnlock()
-			return mask, true
-		}
-	}
-	m.cacheMu.RUnlock()
-	return 0, false
-}
-
-func (m *Manager) setCachedMaskFast(key string, mask uint64) {
-	m.cacheMu.Lock()
-	defer m.cacheMu.Unlock()
-
-	if idx, exists := m.cacheIndex[key]; exists {
-		entry := m.maskCache[idx]
-		entry.mask = mask
-		atomic.StoreInt64(&entry.used, time.Now().UnixNano())
-		return
-	}
-
-	idx := m.findCacheSlot()
-	entry := m.maskCache[idx]
-	if entry.key != "" {
-		delete(m.cacheIndex, entry.key)
-	}
-
-	entry.key = key
-	entry.mask = mask
-	atomic.StoreInt64(&entry.used, time.Now().UnixNano())
-	m.cacheIndex[key] = idx
-}
-
-func (m *Manager) findCacheSlot() int {
-	currentSize := atomic.LoadInt32(&m.cacheSize)
-
-	if int(currentSize) < CacheSize {
-		newSize := atomic.AddInt32(&m.cacheSize, 1)
-		return int(newSize) - 1
-	}
-
-	oldestIdx := 0
-	oldestTime := atomic.LoadInt64(&m.maskCache[0].used)
-
-	for i := 1; i < CacheSize; i++ {
-		_time := atomic.LoadInt64(&m.maskCache[i].used)
-		if _time < oldestTime {
-			oldestTime = _time
-			oldestIdx = i
-		}
-	}
-
-	return oldestIdx
-}
-
-func (m *Manager) buildCacheKeyFast(config *types.RouteConfig) string {
-	if config == nil || (len(config.Middlewares) == 0 && len(config.DisabledMiddlewares) == 0) {
-		return "default"
-	}
-
-	if len(config.Middlewares) == 0 && len(config.DisabledMiddlewares) == 1 {
-		switch config.DisabledMiddlewares[0] {
-		case "Auth":
-			return "d:Auth"
-		case "Cache":
-			return "d:Cache"
-		}
-	}
-
-	buf := m.keyBuilderPool.Get().([]byte)
-	defer m.keyBuilderPool.Put(buf[:0])
-
-	size := 10 + len(config.Middlewares)*10 + len(config.DisabledMiddlewares)*10
-	if cap(buf) < size {
-		buf = make([]byte, 0, size)
-	}
-	buf = buf[:0]
-
-	buf = append(buf, "e:"...)
-	for i, name := range config.Middlewares {
-		if i > 0 {
-			buf = append(buf, ',')
-		}
-		buf = append(buf, name...)
-	}
-
-	buf = append(buf, "|d:"...)
-	for _, name := range config.DisabledMiddlewares {
-		buf = append(buf, name...)
-		buf = append(buf, ',')
-	}
-
-	return utils.Intern(buf)
-}
-
-func (m *Manager) calculateMaskFast(config *types.RouteConfig) uint64 {
-	finalMask := m.defaultEnabledMask
-
-	for _, name := range config.Middlewares {
-		if index, exists := m.nameToIndex[name]; exists {
-			finalMask |= 1 << uint(index)
-		}
-	}
-
-	for _, name := range config.DisabledMiddlewares {
-		if index, exists := m.nameToIndex[name]; exists {
-			finalMask &= ^(1 << uint(index))
-		}
-	}
-
-	return finalMask
-}
-
-func (m *Manager) getCompiledChain(mask uint64) *CompiledChain {
-	m.chainsMu.RLock()
-	chain := m.compiledChains[mask]
-	m.chainsMu.RUnlock()
-	return chain
-}
-
-func (m *Manager) executeAndCompile(ctx *fasthttp.RequestCtx, handler func(*fasthttp.RequestCtx), mask uint64, config *types.RouteConfig) {
-	activeMiddlewares := make([]types.Middleware, 0, len(m.orderedMiddlewares))
-
-	for i, entry := range m.orderedMiddlewares {
-		if mask&(1<<uint(i)) != 0 {
-			if mw, ok := entry.Middleware.(types.Middleware); ok {
-				activeMiddlewares = append(activeMiddlewares, mw)
-			}
-		}
-	}
-
-	compiledHandler := m.compileChain(activeMiddlewares)
-
-	compiled := &CompiledChain{
-		mask:        mask,
-		middlewares: activeMiddlewares,
-		handler:     compiledHandler,
-	}
-
-	m.chainsMu.Lock()
-	m.compiledChains[mask] = compiled
-	m.chainsMu.Unlock()
-
-	compiledHandler(ctx, handler, config)
-}
-
-func (m *Manager) compileChain(middlewares []types.Middleware) func(*fasthttp.RequestCtx, func(*fasthttp.RequestCtx), *types.RouteConfig) {
-	if len(middlewares) == 0 {
-		return func(ctx *fasthttp.RequestCtx, handler func(*fasthttp.RequestCtx), config *types.RouteConfig) {
+func (m *Manager) compileChain(middlewareEntries []types.MiddlewareEntry) func(*types.RequestCtx, func(*types.RequestCtx), *types.RouteConfig) {
+	if len(middlewareEntries) == 0 {
+		return func(ctx *types.RequestCtx, handler func(*types.RequestCtx), config *types.RouteConfig) {
 			handler(ctx)
 		}
 	}
 
-	return func(ctx *fasthttp.RequestCtx, handler func(*fasthttp.RequestCtx), config *types.RouteConfig) {
+	middlewares := make([]types.Middleware, len(middlewareEntries))
+	for i, entry := range middlewareEntries {
+		middlewares[i] = entry.Middleware
+	}
+
+	return func(ctx *types.RequestCtx, handler func(*types.RequestCtx), config *types.RouteConfig) {
 		var index int
 
-		var next func(*fasthttp.RequestCtx)
-		next = func(ctx *fasthttp.RequestCtx) {
+		var next func(*types.RequestCtx)
+		next = func(ctx *types.RequestCtx) {
 			if index >= len(middlewares) {
 				handler(ctx)
 				return
@@ -442,19 +322,10 @@ func (m *Manager) compileChain(middlewares []types.Middleware) func(*fasthttp.Re
 	}
 }
 
-func (m *Manager) Clear() {
+func (m *Manager) clearResources() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	m.orderedMiddlewares = nil
-	m.nameToIndex = make(map[string]int)
-	m.defaultEnabledMask = 0
-
-	for i := 0; i < CacheSize; i++ {
-		m.maskCache[i] = &CacheEntry{}
-	}
-
-	atomic.StoreInt32(&m.initialized, 0)
-
-	m.logger.Info("Middleware manager stopped")
+	m.compiledChain = nil
 }

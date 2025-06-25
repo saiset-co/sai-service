@@ -2,306 +2,526 @@ package action
 
 import (
 	"context"
-	"fmt"
+	"github.com/saiset-co/sai-service/client"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/saiset-co/sai-service/types"
+	"github.com/saiset-co/sai-service/utils"
 )
 
-type EventDispatcher struct {
-	ctx        context.Context
-	logger     types.Logger
-	metrics    types.MetricsManager
-	health     types.HealthManager
-	broker     types.ActionBroker
-	webhookMgr *WebhookManager
-	mu         sync.RWMutex
-	running    int32
+type State int32
+
+const (
+	StateStopped State = iota
+	StateStarting
+	StateRunning
+	StateStopping
+)
+
+type Dispatcher struct {
+	ctx             context.Context
+	cancel          context.CancelFunc
+	config          types.ConfigManager
+	actionsConfig   *types.ActionsConfig
+	logger          types.Logger
+	router          types.HTTPRouter
+	metrics         types.MetricsManager
+	health          types.HealthManager
+	clientManager   types.ClientManager
+	broker          atomic.Pointer[types.ActionBroker]
+	webhookMgr      *WebhookManager
+	state           atomic.Value
+	webhookHandlers sync.Map
+	shutdownTimeout time.Duration
+	publishTimeout  time.Duration
+	handlerTimeout  time.Duration
 }
 
-func NewEventDispatcher(ctx context.Context, config types.ConfigManager, logger types.Logger, metrics types.MetricsManager, health types.HealthManager) (types.ActionBroker, error) {
-	actionsConfig := config.GetConfig().Actions
+var customActionCreators = sync.Map{}
 
-	if !actionsConfig.Enabled {
-		return nil, types.ErrActionIsDisabled
+func RegisterActionBroker(actionBrokerName string, creator types.ActionBrokerCreator) {
+	customActionCreators.Store(actionBrokerName, creator)
+}
+
+func NewDispatcher(
+	ctx context.Context,
+	config types.ConfigManager,
+	logger types.Logger,
+	router types.HTTPRouter,
+	metrics types.MetricsManager,
+	health types.HealthManager,
+	clientManager types.ClientManager,
+) (types.Dispatcher, error) {
+	actionsConfig := config.GetConfig().Actions
+	if actionsConfig == nil {
+		return nil, types.ErrActionConfigInvalid
 	}
 
-	webhookMgr, err := NewWebhookManager(ctx, logger, metrics)
+	dispatcherCtx, cancel := context.WithCancel(ctx)
+
+	webhookMgr, err := NewWebhookManager(dispatcherCtx, logger, metrics)
 	if err != nil {
+		cancel()
 		return nil, types.WrapError(err, "failed to create webhook manager")
 	}
 
-	dispatcher := &EventDispatcher{
-		ctx:        ctx,
-		logger:     logger,
-		metrics:    metrics,
-		health:     health,
-		webhookMgr: webhookMgr,
-		running:    0,
+	dispatcher := &Dispatcher{
+		ctx:             dispatcherCtx,
+		cancel:          cancel,
+		config:          config,
+		logger:          logger,
+		router:          router,
+		metrics:         metrics,
+		health:          health,
+		clientManager:   clientManager,
+		webhookMgr:      webhookMgr,
+		actionsConfig:   actionsConfig,
+		shutdownTimeout: 10 * time.Second,
+		publishTimeout:  30 * time.Second,
+		handlerTimeout:  30 * time.Second,
 	}
 
-	if actionsConfig.Type != "" {
-		var broker types.ActionBroker
-		var err error
+	dispatcher.state.Store(StateStopped)
 
-		switch actionsConfig.Type {
-		case "websocket":
-			broker, err = NewWebSocketBroker(ctx, logger, actionsConfig, health)
-		default:
-			if creator, exists := customActionCreators[actionsConfig.Type]; exists {
-				broker, err = creator(actionsConfig.Config)
-			} else {
-				return nil, types.Errorf(types.ErrActionTypeUnknown, "type: %s", actionsConfig.Type)
-			}
+	if actionsConfig.Broker != nil && actionsConfig.Broker.Enabled {
+		if err := dispatcher.initializeBroker(); err != nil {
+			cancel()
+			return nil, types.WrapError(err, "failed to initialize broker")
 		}
-
-		if err != nil {
-			return nil, types.WrapError(err, "failed to create action broker")
-		}
-
-		dispatcher.broker = broker
 	}
 
-	return newInstrumentedEventDispatcher(logger, metrics, dispatcher), nil
+	return dispatcher, nil
 }
 
-func (ed *EventDispatcher) Publish(action string, payload interface{}) error {
-	if !ed.IsRunning() {
-		return types.ErrActionNotInitialized
-	}
-
-	ed.logger.Debug("Publishing event", zap.String("action", action))
-
-	var wg sync.WaitGroup
-	var errors []error
-	var errorsMu sync.Mutex
-
-	ed.mu.RLock()
-	broker := ed.broker
-	ed.mu.RUnlock()
-
-	if broker != nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := broker.Publish(action, payload); err != nil {
-				errorsMu.Lock()
-				errors = append(errors, types.WrapError(err, "broker failed"))
-				errorsMu.Unlock()
-				ed.logger.Error("Broker publish failed",
-					zap.String("action", action),
-					zap.Error(err))
-			}
-		}()
-	}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := ed.webhookMgr.NotifyWebhooks(action, payload); err != nil {
-			errorsMu.Lock()
-			errors = append(errors, types.WrapError(err, "webhooks failed"))
-			errorsMu.Unlock()
-			ed.logger.Error("Webhook notification failed",
-				zap.String("action", action),
-				zap.Error(err))
-		}
-	}()
-
-	wg.Wait()
-
-	if len(errors) > 0 {
-		ed.logger.Warn("Some publishers failed",
-			zap.String("action", action),
-			zap.Int("failed_count", len(errors)))
-	}
-
-	ed.logger.Debug("Event published successfully", zap.String("action", action))
-	return nil
-}
-
-func (ed *EventDispatcher) Subscribe(action string, handler types.ActionHandler) error {
-	if !ed.IsRunning() {
-		return types.ErrActionNotInitialized
-	}
-
-	ed.mu.RLock()
-	broker := ed.broker
-	ed.mu.RUnlock()
-
-	if broker == nil {
-		return types.NewErrorf("no broker available for subscriptions")
-	}
-
-	return broker.Subscribe(action, handler)
-}
-
-func (ed *EventDispatcher) Unsubscribe(action string) error {
-	if !ed.IsRunning() {
-		return types.ErrActionNotInitialized
-	}
-
-	ed.mu.RLock()
-	broker := ed.broker
-	ed.mu.RUnlock()
-
-	if broker == nil {
-		return types.NewErrorf("no broker available for unsubscriptions")
-	}
-
-	return broker.Unsubscribe(action)
-}
-
-func (ed *EventDispatcher) SetBroker(broker types.ActionBroker) error {
-	if ed.IsRunning() {
-		return types.NewErrorf("cannot set broker while dispatcher is running")
-	}
-
-	ed.mu.Lock()
-	defer ed.mu.Unlock()
-
-	ed.broker = broker
-	ed.logger.Info("Action broker set", zap.String("type", fmt.Sprintf("%T", broker)))
-
-	return nil
-}
-
-func (ed *EventDispatcher) Start() error {
-	if !atomic.CompareAndSwapInt32(&ed.running, 0, 1) {
+func (d *Dispatcher) Start() error {
+	if !d.transitionState(StateStopped, StateStarting) {
 		return types.ErrServerAlreadyRunning
 	}
 
-	if err := ed.webhookMgr.Start(); err != nil {
-		atomic.StoreInt32(&ed.running, 0)
-		return types.WrapError(err, "failed to start webhook manager")
-	}
+	defer func() {
+		if d.getState() == StateStarting {
+			d.setState(StateRunning)
+		}
+	}()
 
-	ed.mu.RLock()
-	broker := ed.broker
-	ed.mu.RUnlock()
-
-	if broker != nil {
-		if err := broker.Start(); err != nil {
-			ed.logger.Error("Failed to start broker", zap.Error(err))
-		} else {
-			ed.logger.Info("Action broker started")
+	if d.config.GetConfig().Actions.Webhooks.Enabled {
+		if err := d.webhookMgr.Start(); err != nil {
+			d.setState(StateStopped)
+			return types.WrapError(err, "failed to start webhook manager")
 		}
 	}
 
-	ed.logger.Info("Event dispatcher started")
+	if broker := d.broker.Load(); broker != nil {
+		if err := (*broker).(types.LifecycleManager).Start(); err != nil {
+			d.logger.Error("Failed to start broker", zap.Error(err))
+		} else {
+			d.logger.Info("Action broker started")
+		}
+	}
+
+	d.registerRoutes()
+
+	if err := d.initializeWebhooks(); err != nil {
+		d.logger.Error("Failed to initialize webhooks", zap.Error(err))
+	}
+
+	d.logger.Info("Event dispatcher started")
 	return nil
 }
 
-func (ed *EventDispatcher) Stop() error {
-	if !atomic.CompareAndSwapInt32(&ed.running, 1, 0) {
+func (d *Dispatcher) Stop() error {
+	if !d.transitionState(StateRunning, StateStopping) {
 		return types.ErrServerNotRunning
 	}
 
-	if err := ed.webhookMgr.Stop(); err != nil {
-		ed.logger.Error("Failed to stop webhook manager", zap.Error(err))
-	}
+	defer func() {
+		d.setState(StateStopped)
+		d.cancel()
+	}()
 
-	ed.mu.RLock()
-	broker := ed.broker
-	ed.mu.RUnlock()
+	ctx, cancel := context.WithTimeout(context.Background(), d.shutdownTimeout)
+	defer cancel()
 
-	if broker != nil {
-		if err := broker.Stop(); err != nil {
-			ed.logger.Error("Failed to stop broker", zap.Error(err))
+	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		if err := d.webhookMgr.Stop(); err != nil {
+			d.logger.Error("Failed to stop webhook manager", zap.Error(err))
+			return err
 		}
+		return nil
+	})
+
+	if broker := d.broker.Load(); broker != nil {
+		g.Go(func() error {
+			if err := (*broker).(types.LifecycleManager).Stop(); err != nil {
+				d.logger.Error("Failed to stop broker", zap.Error(err))
+				return err
+			}
+			return nil
+		})
 	}
 
-	ed.logger.Info("Event dispatcher stopped")
+	if err := g.Wait(); err != nil {
+		select {
+		case <-gCtx.Done():
+			d.logger.Warn("Dispatcher stop timeout, some components may not have stopped gracefully")
+		default:
+			d.logger.Error("Error during dispatcher shutdown", zap.Error(err))
+		}
+	} else {
+		d.logger.Info("Event dispatcher stopped gracefully")
+	}
+
+	d.webhookHandlers = sync.Map{}
+	d.broker.Store(nil)
+
 	return nil
 }
 
-func (ed *EventDispatcher) IsRunning() bool {
-	return atomic.LoadInt32(&ed.running) == 1
+func (d *Dispatcher) IsRunning() bool {
+	return d.getState() == StateRunning
 }
 
-func (ed *EventDispatcher) RegisterRoutes(router types.HTTPRouter) {
-	ed.webhookMgr.RegisterRoutes(router)
-}
-
-type instrumentedEventDispatcher struct {
-	impl    *EventDispatcher
-	logger  types.Logger
-	metrics types.MetricsManager
-}
-
-func newInstrumentedEventDispatcher(logger types.Logger, metrics types.MetricsManager, impl *EventDispatcher) types.ActionBroker {
-	return &instrumentedEventDispatcher{
-		impl:    impl,
-		logger:  logger,
-		metrics: metrics,
+func (d *Dispatcher) Publish(action string, payload interface{}) error {
+	if !d.IsRunning() {
+		return types.ErrActionNotInitialized
 	}
+
+	start := time.Now()
+	defer func() {
+		d.recordMetric("publish", "attempt", action, time.Since(start))
+	}()
+
+	d.logger.Debug("Publishing event", zap.String("action", action))
+
+	publishCtx, cancel := context.WithTimeout(d.ctx, d.publishTimeout)
+	defer cancel()
+
+	g, gCtx := errgroup.WithContext(publishCtx)
+
+	var publishedChannels int32
+
+	if broker := d.broker.Load(); broker != nil {
+		atomic.AddInt32(&publishedChannels, 1)
+		g.Go(func() error {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+				if err := (*broker).Publish(action, payload); err != nil {
+					d.logger.Error("Broker publish failed", zap.String("action", action), zap.Error(err))
+					return types.WrapError(err, "broker publish failed")
+				}
+				return nil
+			}
+		})
+	}
+
+	if d.actionsConfig.Webhooks != nil && d.actionsConfig.Webhooks.Enabled {
+		atomic.AddInt32(&publishedChannels, 1)
+		g.Go(func() error {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+				if err := d.webhookMgr.notifyWebhooks(action, payload); err != nil {
+					d.logger.Error("Webhook notification failed", zap.String("action", action), zap.Error(err))
+					return types.WrapError(err, "webhook notification failed")
+				}
+				return nil
+			}
+		})
+	}
+
+	if atomic.LoadInt32(&publishedChannels) == 0 {
+		d.recordMetric("publish", "no_channels", action, time.Since(start))
+		return types.NewErrorf("no publication channels available for action: %s", action)
+	}
+
+	if err := g.Wait(); err != nil {
+		select {
+		case <-publishCtx.Done():
+			d.recordMetric("publish", "timeout", action, time.Since(start))
+			return types.NewErrorf("publish timeout for action: %s", action)
+		default:
+			d.logger.Warn("Some publishers failed",
+				zap.String("action", action),
+				zap.Error(err))
+			d.recordMetric("publish", "partial_success", action, time.Since(start))
+		}
+	}
+
+	d.recordMetric("publish", "success", action, time.Since(start))
+	d.logger.Debug("Event published successfully", zap.String("action", action))
+	return nil
 }
 
-func (ied *instrumentedEventDispatcher) Publish(action string, payload interface{}) error {
+func (d *Dispatcher) Subscribe(action string, handler types.ActionHandler) error {
+	if d.IsRunning() {
+		return types.ErrActionIsRunning
+	}
+
 	start := time.Now()
-	err := ied.impl.Publish(action, payload)
-	duration := time.Since(start)
+	wrappedHandler := d.wrapHandler(action, handler)
+
+	var err error
+	if broker := d.broker.Load(); broker != nil {
+		err = (*broker).Subscribe(action, wrappedHandler)
+	} else if d.actionsConfig.Webhooks != nil && d.actionsConfig.Webhooks.Enabled {
+		d.webhookHandlers.Store(action, wrappedHandler)
+		d.logger.Debug("Webhook handler registered for action", zap.String("action", action))
+	} else {
+		err = types.NewErrorf("no subscription mechanism available for action: %s", action)
+	}
 
 	result := "success"
 	if err != nil {
 		result = "error"
 	}
+	d.recordMetric("subscribe", result, action, time.Since(start))
 
-	ied.recordMetric("publish", result, action, duration)
 	return err
 }
 
-func (ied *instrumentedEventDispatcher) Subscribe(action string, handler types.ActionHandler) error {
-	start := time.Now()
+func (d *Dispatcher) Unsubscribe(action string) error {
+	if !d.IsRunning() {
+		return types.ErrActionNotInitialized
+	}
 
-	wrappedHandler := ied.wrapHandler(action, handler)
-	err := ied.impl.Subscribe(action, wrappedHandler)
-	duration := time.Since(start)
+	start := time.Now()
+	var err error
+
+	if broker := d.broker.Load(); broker != nil {
+		err = (*broker).Unsubscribe(action)
+	} else if d.actionsConfig.Webhooks != nil && d.actionsConfig.Webhooks.Enabled {
+		d.webhookHandlers.Delete(action)
+		d.logger.Debug("Webhook handler unregistered for action", zap.String("action", action))
+	} else {
+		err = types.NewErrorf("no broker available for unsubscriptions")
+	}
 
 	result := "success"
 	if err != nil {
 		result = "error"
 	}
+	d.recordMetric("unsubscribe", result, action, time.Since(start))
 
-	ied.recordMetric("subscribe", result, action, duration)
 	return err
 }
 
-func (ied *instrumentedEventDispatcher) Unsubscribe(action string) error {
+func (d *Dispatcher) getState() State {
+	return d.state.Load().(State)
+}
+
+func (d *Dispatcher) setState(newState State) bool {
+	currentState := d.getState()
+	return d.state.CompareAndSwap(currentState, newState)
+}
+
+func (d *Dispatcher) transitionState(from, to State) bool {
+	return d.state.CompareAndSwap(from, to)
+}
+
+func (d *Dispatcher) initializeBroker() error {
+	brokerConfig := d.actionsConfig.Broker
+	if brokerConfig == nil {
+		return nil
+	}
+
+	var broker types.ActionBroker
+	var err error
+
+	switch brokerConfig.Type {
+	case "websocket":
+		broker, err = NewWebSocketBroker(d.ctx, d.logger, brokerConfig, d.health)
+	default:
+		if creator, exists := customActionCreators.Load(brokerConfig.Type); exists {
+			broker, err = creator.(types.ActionBrokerCreator)(brokerConfig.Config)
+		} else {
+			return types.Errorf(types.ErrActionTypeUnknown, "type: %s", brokerConfig.Type)
+		}
+	}
+
+	if err != nil {
+		return types.WrapError(err, "failed to create action broker")
+	}
+
+	d.broker.Store(&broker)
+	d.logger.Info("Action broker initialized", zap.String("type", brokerConfig.Type))
+	return nil
+}
+
+func (d *Dispatcher) initializeWebhooks() error {
+	if d.clientManager == nil {
+		return nil
+	}
+
+	clientConfig := d.config.GetConfig().Client
+	if clientConfig == nil || !clientConfig.Enabled || clientConfig.Services == nil {
+		return nil
+	}
+
+	if d.actionsConfig.Webhooks != nil && d.actionsConfig.Webhooks.Enabled {
+		config := &types.RouteConfig{
+			Cache: &types.CacheHandlerConfig{
+				Enabled: false,
+			},
+			Timeout:             5 * time.Second,
+			DisabledMiddlewares: []string{"cache"},
+		}
+
+		d.router.Add("POST", "/webhook/create", d.handleWebhook, config)
+
+		for serviceName, serviceConfig := range clientConfig.Services {
+			for _, event := range serviceConfig.Events {
+				webhookURL := d.buildWebhookURL(event)
+
+				if _, _, err := d.clientManager.(*client.Manager).RegisterWebhook(serviceName, event, webhookURL); err != nil {
+					d.logger.Error("Failed to register webhook for service",
+						zap.String("service", serviceName),
+						zap.String("event", event),
+						zap.String("webhook_url", webhookURL),
+						zap.Error(err))
+				} else {
+					d.logger.Info("Webhook registered for external service",
+						zap.String("service", serviceName),
+						zap.String("event", event),
+						zap.String("webhook_url", webhookURL))
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (d *Dispatcher) buildWebhookURL(event string) string {
+	serverConfig := d.config.GetConfig().Server
+	scheme := "http"
+	if serverConfig.TLS.Enabled {
+		scheme = "https"
+	}
+
+	return scheme + "://" + serverConfig.HTTP.Host + ":" +
+		strconv.Itoa(serverConfig.HTTP.Port) + "/webhook/" + event
+}
+
+func (d *Dispatcher) handleWebhook(ctx *types.RequestCtx) {
+	actionID := d.getActionFromPath(ctx)
+	if actionID == "" {
+		d.logger.Warn("Webhook received without action ID")
+		d.writeErrorResponse(ctx, fasthttp.StatusBadRequest, "action ID is required")
+		return
+	}
+
+	handler, exists := d.webhookHandlers.Load(actionID)
+	if !exists {
+		d.logger.Debug("No handler found for webhook action", zap.String("action", actionID))
+		d.writeErrorResponse(ctx, fasthttp.StatusNotFound, "no handler for this action")
+		return
+	}
+
+	var webhookPayload map[string]interface{}
+	if err := utils.Unmarshal(ctx.PostBody(), &webhookPayload); err != nil {
+		d.logger.Error("Failed to parse webhook payload", zap.String("action", actionID), zap.Error(err))
+		d.writeErrorResponse(ctx, fasthttp.StatusBadRequest, "invalid JSON payload")
+		return
+	}
+
+	actionMessage := &types.ActionMessage{
+		Action:    actionID,
+		Payload:   webhookPayload,
+		Timestamp: time.Now(),
+		Source:    "webhook",
+	}
+
+	go d.processWebhookAsync(actionID, actionMessage, handler.(types.ActionHandler))
+
+	ctx.SetStatusCode(fasthttp.StatusOK)
+	ctx.SetContentType("application/json")
+	if _, err := ctx.WriteString(`{"status": "received"}`); err != nil {
+		d.logger.Error("Failed to write response", zap.Error(err))
+	}
+
+	d.logger.Debug("Webhook received and handler triggered", zap.String("action", actionID))
+}
+
+func (d *Dispatcher) processWebhookAsync(actionID string, message *types.ActionMessage, handler types.ActionHandler) {
 	start := time.Now()
-	err := ied.impl.Unsubscribe(action)
-	duration := time.Since(start)
+
+	ctx, cancel := context.WithTimeout(d.ctx, d.handlerTimeout)
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- types.NewErrorf("webhook handler panicked: %v", r)
+			}
+		}()
+
+		done <- handler(message)
+	}()
+
+	var err error
+	select {
+	case err = <-done:
+	case <-ctx.Done():
+		err = types.NewErrorf("webhook handler timeout for action: %s", actionID)
+		d.logger.Error("Webhook handler timeout",
+			zap.String("action", actionID),
+			zap.Duration("timeout", d.handlerTimeout))
+	case <-d.ctx.Done():
+		err = types.NewErrorf("dispatcher shutting down, aborting webhook handler for action: %s", actionID)
+	}
 
 	result := "success"
 	if err != nil {
 		result = "error"
+		d.logger.Error("Webhook handler failed", zap.String("action", actionID), zap.Error(err))
 	}
 
-	ied.recordMetric("unsubscribe", result, action, duration)
-	return err
+	d.recordMetric("webhook_handle", result, actionID, time.Since(start))
 }
 
-func (ied *instrumentedEventDispatcher) Start() error {
-	return ied.impl.Start()
+func (d *Dispatcher) writeErrorResponse(ctx *types.RequestCtx, statusCode int, message string) {
+	ctx.SetStatusCode(statusCode)
+	ctx.SetContentType("application/json")
+	response := `{"error": "` + message + `"}`
+	if _, err := ctx.WriteString(response); err != nil {
+		d.logger.Error("Failed to write error response", zap.Error(err))
+	}
 }
 
-func (ied *instrumentedEventDispatcher) Stop() error {
-	return ied.impl.Stop()
+func (d *Dispatcher) getActionFromPath(ctx *types.RequestCtx) string {
+	if id := ctx.UserValue("id"); id != nil {
+		return id.(string)
+	}
+
+	path := string(ctx.Path())
+	parts := strings.Split(path, "/")
+	if len(parts) >= 3 && parts[1] == "webhook" {
+		return parts[2]
+	}
+
+	return ""
 }
 
-func (ied *instrumentedEventDispatcher) IsRunning() bool {
-	return ied.impl.IsRunning()
+func (d *Dispatcher) registerRoutes() {
+	d.webhookMgr.registerRoutes(d.router)
 }
 
-func (ied *instrumentedEventDispatcher) RegisterRoutes(router types.HTTPRouter) {
-	ied.impl.RegisterRoutes(router)
-}
-
-func (ied *instrumentedEventDispatcher) wrapHandler(action string, handler types.ActionHandler) types.ActionHandler {
+func (d *Dispatcher) wrapHandler(action string, handler types.ActionHandler) types.ActionHandler {
 	return func(payload *types.ActionMessage) error {
 		start := time.Now()
 		err := handler(payload)
@@ -312,25 +532,25 @@ func (ied *instrumentedEventDispatcher) wrapHandler(action string, handler types
 			result = "error"
 		}
 
-		ied.recordMetric("handle", result, action, duration)
+		d.recordMetric("handle", result, action, duration)
 		return err
 	}
 }
 
-func (ied *instrumentedEventDispatcher) recordMetric(operation, result, action string, duration time.Duration) {
-	if ied.metrics == nil {
+func (d *Dispatcher) recordMetric(operation, result, action string, duration time.Duration) {
+	if d.metrics == nil {
 		return
 	}
 
-	counter := ied.metrics.Counter("action_operations_total", map[string]string{
+	counter := d.metrics.Counter("action_operations_total", map[string]string{
 		"operation": operation,
 		"result":    result,
 		"action":    action,
 	})
 	counter.Inc()
 
-	histogram := ied.metrics.Histogram("action_operation_duration_seconds",
-		[]float64{0.001, 0.01, 0.1, 1.0, 5.0},
+	histogram := d.metrics.Histogram("action_operation_duration_seconds",
+		[]float64{0.001, 0.01, 0.1, 1.0, 5.0, 10.0, 30.0},
 		map[string]string{"operation": operation, "action": action},
 	)
 	histogram.Observe(duration.Seconds())

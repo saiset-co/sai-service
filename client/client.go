@@ -7,20 +7,32 @@ import (
 
 	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/saiset-co/sai-service/types"
 	"github.com/saiset-co/sai-service/utils"
 )
 
+type State int32
+
+const (
+	StateRunning State = iota
+	StateStopping
+	StateStopped
+)
+
 type HTTPClient struct {
-	ctx            context.Context
-	logger         types.Logger
-	name           string
-	client         *fasthttp.Client
-	baseURL        string
-	config         *ServiceClientConfig
-	circuitBreaker *CircuitBreaker
-	closed         int32
+	ctx             context.Context
+	cancel          context.CancelFunc
+	logger          types.Logger
+	name            string
+	client          *fasthttp.Client
+	baseURL         string
+	config          *ServiceClientConfig
+	circuitBreaker  *CircuitBreaker
+	state           atomic.Value
+	shutdownTimeout time.Duration
+	requestTimeout  time.Duration
 }
 
 type ServiceClientConfig struct {
@@ -31,6 +43,8 @@ type ServiceClientConfig struct {
 }
 
 func NewHTTPClient(ctx context.Context, logger types.Logger, serviceName string, config *ServiceClientConfig) *HTTPClient {
+	clientCtx, cancel := context.WithCancel(ctx)
+
 	httpClient := &fasthttp.Client{
 		ReadTimeout:  config.Timeout,
 		WriteTimeout: config.Timeout,
@@ -38,38 +52,185 @@ func NewHTTPClient(ctx context.Context, logger types.Logger, serviceName string,
 
 	circuitBreaker := NewCircuitBreaker(config.CircuitBreaker, logger, serviceName)
 
-	return &HTTPClient{
-		ctx:            ctx,
-		logger:         logger,
-		name:           serviceName,
-		client:         httpClient,
-		baseURL:        config.BaseURL,
-		config:         config,
-		circuitBreaker: circuitBreaker,
+	client := &HTTPClient{
+		ctx:             clientCtx,
+		cancel:          cancel,
+		logger:          logger,
+		name:            serviceName,
+		client:          httpClient,
+		baseURL:         config.BaseURL,
+		config:          config,
+		circuitBreaker:  circuitBreaker,
+		shutdownTimeout: 10 * time.Second,
+		requestTimeout:  config.Timeout,
+	}
+
+	client.state.Store(StateRunning)
+
+	return client
+}
+
+func (c *HTTPClient) Call(method, path string, data interface{}, opts *types.CallOptions) ([]byte, int, error) {
+	if !c.IsRunning() {
+		return nil, 500, types.ErrActionNotInitialized
+	}
+
+	url := c.baseURL + path
+
+	callCtx, cancel := context.WithTimeout(c.ctx, c.requestTimeout)
+	defer cancel()
+
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+
+	req.SetRequestURI(url)
+	req.Header.SetMethod(method)
+
+	if data != nil {
+		jsonData, err := utils.Marshal(data)
+		if err != nil {
+			return nil, 500, types.WrapError(err, "failed to marshal request data")
+		}
+		req.SetBody(jsonData)
+		req.Header.SetContentType("application/json")
+	}
+
+	timeout := c.requestTimeout
+	retries := c.config.Retries
+
+	if opts != nil {
+		for key, value := range opts.Headers {
+			req.Header.Set(key, value)
+		}
+
+		if opts.Timeout > 0 {
+			timeout = opts.Timeout
+			callCtx, cancel = context.WithTimeout(c.ctx, timeout)
+			defer cancel()
+		}
+
+		if opts.Retry > 0 {
+			retries = opts.Retry
+		}
+	}
+
+	originalTimeout := c.client.ReadTimeout
+	c.client.ReadTimeout = timeout
+	defer func() { c.client.ReadTimeout = originalTimeout }()
+
+	var responseBody []byte
+	var statusCode int
+	var err error
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		responseBody, statusCode, err = c.executeWithRetries(req, resp, retries)
+	}()
+
+	select {
+	case <-done:
+	case <-callCtx.Done():
+		err = types.NewErrorf("call timeout for service: %s", c.name)
+		statusCode = 500
+		return nil, statusCode, err
+	case <-c.ctx.Done():
+		err = types.NewErrorf("client shutting down, aborting call to service: %s", c.name)
+		statusCode = 500
+		return nil, statusCode, err
+	}
+
+	return responseBody, statusCode, err
+}
+
+func (c *HTTPClient) Close() {
+	if !c.transitionClientState(StateRunning, StateStopping) {
+		return
+	}
+
+	defer func() {
+		c.setClientState(StateStopped)
+		c.cancel()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), c.shutdownTimeout)
+	defer cancel()
+
+	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		select {
+		case <-gCtx.Done():
+			return gCtx.Err()
+		default:
+			return nil
+		}
+	})
+
+	if err := g.Wait(); err != nil {
+		select {
+		case <-ctx.Done():
+			c.logger.Warn("HTTP client close timeout",
+				zap.String("service", c.name))
+		default:
+			c.logger.Error("Error during HTTP client shutdown",
+				zap.String("service", c.name),
+				zap.Error(err))
+		}
+	} else {
+		c.logger.Debug("HTTP client closed gracefully",
+			zap.String("service", c.name))
 	}
 }
 
-func (c *HTTPClient) executeWithRetries(req *fasthttp.Request, resp *fasthttp.Response, maxRetries int) error {
+func (c *HTTPClient) IsRunning() bool {
+	return c.getClientState() == StateRunning
+}
+
+func (c *HTTPClient) getState() (state int32, failures int32, lastFail int64) {
+	if c.circuitBreaker == nil {
+		return 0, 0, 0
+	}
+	return c.circuitBreaker.GetState()
+}
+
+func (c *HTTPClient) getClientState() State {
+	return c.state.Load().(State)
+}
+
+func (c *HTTPClient) setClientState(newState State) bool {
+	currentState := c.getClientState()
+	return c.state.CompareAndSwap(currentState, newState)
+}
+
+func (c *HTTPClient) transitionClientState(from, to State) bool {
+	return c.state.CompareAndSwap(from, to)
+}
+
+func (c *HTTPClient) executeWithRetries(req *fasthttp.Request, resp *fasthttp.Response, maxRetries int) ([]byte, int, error) {
 	var lastErr error
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if !c.circuitBreaker.CanExecute() {
-			return types.ErrCircuitBreakerOpen
+		if !c.IsRunning() {
+			return nil, 500, types.ErrActionNotInitialized
 		}
 
-		c.logger.Debug("HTTP request attempt",
-			zap.String("service", c.name),
-			zap.String("method", string(req.Header.Method())),
-			zap.String("url", string(req.URI().FullURI())),
-			zap.Int("attempt", attempt+1),
-			zap.String("cb_state", c.circuitBreaker.GetStateString()))
+		if !c.circuitBreaker.CanExecute() {
+			return nil, 500, types.ErrCircuitBreakerOpen
+		}
 
 		err := c.client.DoTimeout(req, resp, c.config.Timeout)
 		statusCode := resp.StatusCode()
 
 		if IsSuccessfulResponse(statusCode, err) {
 			c.circuitBreaker.RecordSuccess()
-			return nil
+
+			responseBody := make([]byte, len(resp.Body()))
+			copy(responseBody, resp.Body())
+
+			return responseBody, resp.StatusCode(), nil
 		}
 
 		if IsCircuitBreakerFailure(statusCode, err) {
@@ -91,97 +252,18 @@ func (c *HTTPClient) executeWithRetries(req *fasthttp.Request, resp *fasthttp.Re
 			}
 
 			backoff := time.Duration(attempt+1) * time.Second
-			c.logger.Debug("Retrying request",
-				zap.String("service", c.name),
-				zap.Duration("backoff", backoff),
-				zap.Error(lastErr))
 
-			time.Sleep(backoff)
+			select {
+			case <-time.After(backoff):
+				c.logger.Debug("Retrying request",
+					zap.String("service", c.name),
+					zap.Duration("backoff", backoff),
+					zap.Error(lastErr))
+			case <-c.ctx.Done():
+				return nil, 500, types.NewErrorf("client shutting down during retry for service: %s", c.name)
+			}
 		}
 	}
 
-	return types.Errorf(types.ErrClientRequestFailed, "all %d attempts failed for service %s: %v", maxRetries+1, c.name, lastErr)
-}
-
-func (c *HTTPClient) Call(method, path string, data interface{}, opts types.CallOptions) error {
-	url := c.baseURL + path
-
-	req := fasthttp.AcquireRequest()
-	resp := fasthttp.AcquireResponse()
-	defer fasthttp.ReleaseRequest(req)
-	defer fasthttp.ReleaseResponse(resp)
-
-	req.SetRequestURI(url)
-	req.Header.SetMethod(method)
-
-	if data != nil {
-		jsonData, err := utils.Marshal(data)
-		if err != nil {
-			return types.WrapError(err, "failed to marshal request data")
-		}
-		req.SetBody(jsonData)
-		req.Header.SetContentType("application/json")
-	}
-
-	for key, value := range opts.Headers {
-		req.Header.Set(key, value)
-	}
-
-	timeout := c.config.Timeout
-	if opts.Timeout > 0 {
-		timeout = opts.Timeout
-	}
-
-	retries := c.config.Retries
-	if opts.Retry > 0 {
-		retries = opts.Retry
-	}
-
-	originalTimeout := c.client.ReadTimeout
-	c.client.ReadTimeout = timeout
-	defer func() { c.client.ReadTimeout = originalTimeout }()
-
-	return c.executeWithRetries(req, resp, retries)
-}
-
-func (c *HTTPClient) GetState() (state int32, failures int32, lastFail int64) {
-	return c.circuitBreaker.GetState()
-}
-
-func (c *HTTPClient) Close() {
-	if !atomic.CompareAndSwapInt32(&c.closed, 0, 1) {
-		return
-	}
-}
-
-func (c *HTTPClient) Do(req *fasthttp.Request, resp *fasthttp.Response) error {
-	return c.client.Do(req, resp)
-}
-
-func (c *HTTPClient) DoTimeout(req *fasthttp.Request, resp *fasthttp.Response, timeout time.Duration) error {
-	return c.client.DoTimeout(req, resp, timeout)
-}
-
-func (c *HTTPClient) DoRedirects(req *fasthttp.Request, resp *fasthttp.Response, maxRedirectsCount int) error {
-	return c.client.DoRedirects(req, resp, maxRedirectsCount)
-}
-
-func (c *HTTPClient) DoDeadline(req *fasthttp.Request, resp *fasthttp.Response, deadline time.Time) error {
-	return c.client.DoDeadline(req, resp, deadline)
-}
-
-func (c *HTTPClient) Get(dst []byte, url string) (statusCode int, body []byte, err error) {
-	return c.client.Get(dst, url)
-}
-
-func (c *HTTPClient) GetTimeout(dst []byte, url string, timeout time.Duration) (statusCode int, body []byte, err error) {
-	return c.client.GetTimeout(dst, url, timeout)
-}
-
-func (c *HTTPClient) GetDeadline(dst []byte, url string, deadline time.Time) (statusCode int, body []byte, err error) {
-	return c.client.GetDeadline(dst, url, deadline)
-}
-
-func (c *HTTPClient) Post(dst []byte, url string, postArgs *fasthttp.Args) (statusCode int, body []byte, err error) {
-	return c.client.Post(dst, url, postArgs)
+	return nil, 500, types.Errorf(types.ErrClientRequestFailed, "all %d attempts failed for service %s: %v", maxRetries+1, c.name, lastErr)
 }
