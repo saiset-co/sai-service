@@ -48,13 +48,15 @@ func NewRecoveryMiddleware(config types.ConfigManager, logger types.Logger, metr
 
 		stackBufPool: sync.Pool{
 			New: func() interface{} {
-				return make([]byte, 4096)
+				buf := make([]byte, 4096)
+				return &buf
 			},
 		},
 
 		fieldsPool: sync.Pool{
 			New: func() interface{} {
-				return make([]zap.Field, 0, 8)
+				fields := make([]zap.Field, 0, 8)
+				return &fields
 			},
 		},
 
@@ -81,7 +83,7 @@ func (r *RecoveryMiddleware) Handle(ctx *types.RequestCtx, next func(*types.Requ
 			}
 
 			r.logPanic(rec, stack, ctx)
-			types.CreateErrorResponse(ctx)
+			//ctx.Error(types.NewError("An unexpected error occurred"), fasthttp.StatusInternalServerError)
 		}
 	}()
 
@@ -102,16 +104,17 @@ func (r *RecoveryMiddleware) logPanic(rec interface{}, stack string, ctx *types.
 		zap.ByteString("remote_addr", ctx.RemoteIP()),
 	)
 
-	if r.recoveryConfig.StackTrace && stack != "" {
-		*fields = append(*fields, zap.String("stack", stack))
-	}
-
 	if requestID := ctx.Request.Header.Peek("X-Request-ID"); len(requestID) > 0 {
 		*fields = append(*fields, zap.ByteString("request_id", requestID))
 	}
 
 	if userAgent := ctx.UserAgent(); len(userAgent) > 0 {
 		*fields = append(*fields, zap.ByteString("user_agent", userAgent))
+	}
+
+	if r.recoveryConfig.StackTrace && stack != "" {
+		r.logger.ErrorWithStack("Recovered from panic", stack, *fields...)
+		return
 	}
 
 	r.logger.Error("Recovered from panic", *fields...)

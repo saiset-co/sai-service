@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"bytes"
+	"go.uber.org/zap/zapcore"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ type LoggingMiddleware struct {
 	loggingConfig    *LoggingConfig
 	headerSlicePool  sync.Pool
 	fieldsPool       sync.Pool
+	stackBufPool     sync.Pool
 	sensitiveHeaders map[string]bool
 	logLevel         int
 	name             string
@@ -82,14 +84,22 @@ func NewLoggingMiddleware(config types.ConfigManager, logger types.Logger, metri
 			"set-cookie":    true,
 			"x-auth-token":  true,
 		},
+		stackBufPool: sync.Pool{
+			New: func() interface{} {
+				buf := make([]byte, 4096)
+				return &buf
+			},
+		},
 		headerSlicePool: sync.Pool{
 			New: func() interface{} {
-				return make([][]byte, 0, 16)
+				buf := make([][]byte, 0, 16)
+				return &buf
 			},
 		},
 		fieldsPool: sync.Pool{
 			New: func() interface{} {
-				return make([]zap.Field, 0, 10)
+				fields := make([]zapcore.Field, 0, 8)
+				return &fields
 			},
 		},
 	}
@@ -183,9 +193,23 @@ func (l *LoggingMiddleware) logResponse(ctx *types.RequestCtx, duration time.Dur
 
 	statusCode := ctx.Response.StatusCode()
 	if statusCode >= 500 {
+		if errI := ctx.UserValue("error"); errI != nil {
+			if err, ok := errI.(error); err != nil && ok {
+				l.logger.ErrorWithErrStack("Request completed", err, *fields...)
+				return
+			} else {
+
+			}
+		}
 		l.logger.Error("Request completed", *fields...)
 	} else if statusCode >= 400 {
-		l.logger.Warn("Request completed", *fields...)
+		if errI := ctx.UserValue("error"); errI != nil {
+			if err := errI.(error); err != nil {
+				l.logger.ErrorWithErrStack("Request completed", err, *fields...)
+				return
+			}
+		}
+		l.logger.Error("Request completed", *fields...)
 	} else {
 		l.logWithLevel("Request completed", *fields...)
 	}

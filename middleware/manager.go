@@ -2,7 +2,10 @@ package middleware
 
 import (
 	"context"
+	"fmt"
+	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -320,6 +323,119 @@ func (m *Manager) compileChain(middlewareEntries []types.MiddlewareEntry) func(*
 
 		next(ctx)
 	}
+}
+
+func (m *Manager) captureHandlerStackTrace() string {
+	pc := make([]uintptr, 40)
+	n := runtime.Callers(4, pc)
+
+	if n == 0 {
+		return "no stack trace available"
+	}
+
+	return m.formatStackTrace(pc[:n])
+}
+
+func (m *Manager) formatStackTrace(pc []uintptr) string {
+	frames := runtime.CallersFrames(pc)
+	var result []string
+	foundBusinessLogic := false
+
+	for {
+		frame, more := frames.Next()
+		isBusinessLogic := m.isBusinessLogicFrame(frame)
+
+		if isBusinessLogic {
+			foundBusinessLogic = true
+		}
+
+		if foundBusinessLogic && isBusinessLogic {
+			funcName := m.formatFunctionName(frame.Function)
+			result = append(result, fmt.Sprintf("%s\n\t%s:%d +0x%x",
+				funcName, frame.File, frame.Line, frame.PC-frame.Entry))
+		}
+
+		if m.isSystemFrame(frame) {
+			break
+		}
+
+		if !more {
+			break
+		}
+	}
+
+	if len(result) == 0 {
+		return "business logic stack not found"
+	}
+
+	return strings.Join(result, "\n")
+}
+
+func (m *Manager) isBusinessLogicFrame(frame runtime.Frame) bool {
+	if m.isSystemFrame(frame) {
+		return false
+	}
+
+	if strings.Contains(frame.File, "middleware") {
+		return false
+	}
+
+	if strings.Contains(frame.File, "server") &&
+		(strings.Contains(frame.File, "http.go") ||
+			strings.Contains(frame.File, "router.go")) {
+		return false
+	}
+
+	if strings.Contains(frame.File, "/vendor/") ||
+		strings.Contains(frame.File, "/pkg/mod/") {
+		return false
+	}
+
+	if !strings.Contains(frame.File, "/") ||
+		(!strings.Contains(frame.File, ".") && strings.Count(frame.File, "/") < 2) {
+		return false
+	}
+
+	return true
+}
+
+func (m *Manager) isSystemFrame(frame runtime.Frame) bool {
+	systemPrefixes := []string{
+		"runtime.",
+		"github.com/valyala/fasthttp",
+		"net/http",
+		"net.",
+		"syscall.",
+		"os.",
+		"io.",
+		"bufio.",
+		"sync.",
+		"reflect.",
+		"encoding/",
+		"crypto/",
+		"compress/",
+	}
+
+	for _, prefix := range systemPrefixes {
+		if strings.HasPrefix(frame.Function, prefix) ||
+			strings.Contains(frame.File, prefix) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (m *Manager) formatFunctionName(fullName string) string {
+	parts := strings.Split(fullName, "/")
+
+	if len(parts) >= 3 {
+		return strings.Join(parts[len(parts)-3:], "/")
+	} else if len(parts) >= 2 {
+		return strings.Join(parts[len(parts)-2:], "/")
+	}
+
+	return fullName
 }
 
 func (m *Manager) clearResources() {

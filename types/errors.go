@@ -1,131 +1,148 @@
 package types
 
 import (
-	"errors"
-	"fmt"
+	"github.com/pkg/errors"
 )
 
 var (
-	ErrConfigNotFound       = errors.New("config not found")
-	ErrLoggerConfigInvalid  = errors.New("config invalid")
-	ErrConfigInvalidPath    = errors.New("config invalid path")
-	ErrConfigParseFailed    = errors.New("config parse failed")
-	ErrConfigIsNil          = errors.New("config is nil")
-	ErrConfigLoadFailed     = errors.New("config load failed")
-	ErrConfigValidateFailed = errors.New("config validate failed")
+	ErrConfigNotFound       = NewError("config not found")
+	ErrLoggerConfigInvalid  = NewError("config invalid")
+	ErrConfigInvalidPath    = NewError("config invalid path")
+	ErrConfigParseFailed    = NewError("config parse failed")
+	ErrConfigIsNil          = NewError("config is nil")
+	ErrConfigLoadFailed     = NewError("config load failed")
+	ErrConfigValidateFailed = NewError("config validate failed")
 )
 
 var (
-	ErrServerNotRunning        = errors.New("server not running")
-	ErrServerAlreadyRunning    = errors.New("server already running")
-	ErrServerStartFailed       = errors.New("server start failed")
-	ErrServerStopFailed        = errors.New("server stop failed")
-	ErrRouteFinalizationFailed = errors.New("route finalization failed")
-	ErrHandlerIsNil            = errors.New("handler is nil")
+	ErrServerNotRunning        = NewError("server not running")
+	ErrServerAlreadyRunning    = NewError("server already running")
+	ErrServerStartFailed       = NewError("server start failed")
+	ErrServerStopFailed        = NewError("server stop failed")
+	ErrRouteFinalizationFailed = NewError("route finalization failed")
+	ErrHandlerIsNil            = NewError("handler is nil")
 )
 
 var (
-	ErrMiddlewareNotFound     = errors.New("middleware not found")
-	ErrMiddlewareInvalidType  = errors.New("middleware invalid type")
-	ErrMiddlewareOrderInvalid = errors.New("middleware order invalid")
-	ErrAuthTokenInvalid       = errors.New("auth token invalid")
-	ErrBodyTooLarge           = errors.New("body too large")
-	ErrRateLimitExceeded      = errors.New("rate limit exceeded")
+	ErrMiddlewareNotFound     = NewError("middleware not found")
+	ErrMiddlewareInvalidType  = NewError("middleware invalid type")
+	ErrMiddlewareOrderInvalid = NewError("middleware order invalid")
+	ErrAuthTokenInvalid       = NewError("auth token invalid")
+	ErrBodyTooLarge           = NewError("body too large")
+	ErrRateLimitExceeded      = NewError("rate limit exceeded")
 )
 
 var (
-	ErrCacheNotFound         = errors.New("cache not found")
-	ErrCacheKeyEmpty         = errors.New("cache key empty")
-	ErrCacheConnectionFailed = errors.New("cache connection failed")
-	ErrCacheTypeUnknown      = errors.New("cache type unknown")
-	ErrCacheOperationFailed  = errors.New("cache operation failed")
-	ErrCacheIsDisabled       = errors.New("cache manager is disabled")
+	ErrCacheNotFound         = NewError("cache not found")
+	ErrCacheKeyEmpty         = NewError("cache key empty")
+	ErrCacheConnectionFailed = NewError("cache connection failed")
+	ErrCacheTypeUnknown      = NewError("cache type unknown")
+	ErrCacheOperationFailed  = NewError("cache operation failed")
+	ErrCacheIsDisabled       = NewError("cache manager is disabled")
 )
 
 var (
-	ErrActionNotInitialized   = errors.New("action not initialized")
-	ErrActionPublishFailed    = errors.New("action publish failed")
-	ErrActionConnectionFailed = errors.New("action connection failed")
-	ErrActionConfigInvalid    = errors.New("action config invalid")
-	ErrActionTypeUnknown      = errors.New("action type unknown")
-	ErrActionIsDisabled       = errors.New("action broker is disabled")
-	ErrActionIsRunning        = errors.New("action is running")
+	ErrActionNotInitialized   = NewError("action not initialized")
+	ErrActionPublishFailed    = NewError("action publish failed")
+	ErrActionConnectionFailed = NewError("action connection failed")
+	ErrActionConfigInvalid    = NewError("action config invalid")
+	ErrActionTypeUnknown      = NewError("action type unknown")
+	ErrActionIsDisabled       = NewError("action broker is disabled")
+	ErrActionIsRunning        = NewError("action is running")
 )
 
 var (
-	ErrCronJobNotFound       = errors.New("cron job not found")
-	ErrCronIsRunning         = errors.New("cron is running")
-	ErrCronSchedulerStopped  = errors.New("cron scheduler stopped")
-	ErrCronJobExists         = errors.New("cron job exists")
-	ErrCronExpressionInvalid = errors.New("cron expression invalid")
-	ErrCronJobFailed         = errors.New("cron job failed")
-	ErrCronJobNameIsEmpty    = errors.New("cron job name is empty")
-	ErrCronJobIsNil          = errors.New("cron job is nil")
-	ErrCronJobTimeout        = errors.New("cron job timeout")
+	ErrCronJobNotFound       = NewError("cron job not found")
+	ErrCronIsRunning         = NewError("cron is running")
+	ErrCronSchedulerStopped  = NewError("cron scheduler stopped")
+	ErrCronJobExists         = NewError("cron job exists")
+	ErrCronExpressionInvalid = NewError("cron expression invalid")
+	ErrCronJobFailed         = NewError("cron job failed")
+	ErrCronJobNameIsEmpty    = NewError("cron job name is empty")
+	ErrCronJobIsNil          = NewError("cron job is nil")
+	ErrCronJobTimeout        = NewError("cron job timeout")
 )
 
 var (
-	ErrMetricsNotRunning    = errors.New("metrics manager not running")
-	ErrMetricsTypeUnknown   = errors.New("metrics type unknown")
-	ErrMetricsStartFailed   = errors.New("metrics start failed")
-	ErrMetricsConfigInvalid = errors.New("metrics config invalid")
-	ErrMetricsIsDisabled    = errors.New("metrics manager is disabled")
+	ErrMetricsNotRunning     = NewError("metrics manager not running")
+	ErrMetricsTypeUnknown    = NewError("metrics type unknown")
+	ErrMetricsStartFailed    = NewError("metrics start failed")
+	ErrMetricsConfigInvalid  = NewError("metrics config invalid")
+	ErrMetricsIsDisabled     = NewError("metrics manager is disabled")
+	ErrTemplateFailed        = NewError("metrics manager template build failed")
+	ErrMetricsGetFailed      = NewError("metrics manager get failed")
+	ErrMetricsStatsGetFailed = NewError("metrics manager stats get failed")
 )
 
 var (
-	ErrClientNotFound        = errors.New("client not found")
-	ErrClientCreateFailed    = errors.New("client create failed")
-	ErrClientRequestFailed   = errors.New("client request failed")
-	ErrClientResponseInvalid = errors.New("client response invalid")
-	ErrClientTimeout         = errors.New("client timeout")
-	ErrCircuitBreakerOpen    = errors.New("circuit breaker open")
+	ErrClientNotFound        = NewError("client not found")
+	ErrClientCreateFailed    = NewError("client create failed")
+	ErrClientRequestFailed   = NewError("client request failed")
+	ErrClientResponseInvalid = NewError("client response invalid")
+	ErrClientTimeout         = NewError("client timeout")
+	ErrCircuitBreakerOpen    = NewError("circuit breaker open")
 )
 
 var (
-	ErrHealthCheckFailed  = errors.New("health check failed")
-	ErrHealthCheckTimeout = errors.New("health check timeout")
+	ErrHealthIsNotRunning = NewError("health manager is not running")
+	ErrHealthCheckFailed  = NewError("health check failed")
+	ErrHealthCheckTimeout = NewError("health check timeout")
 )
 
 var (
-	ErrLogFileIsEmpty     = errors.New("log file is empty")
-	ErrLogFileWrongFormat = errors.New("log file wrong format")
-	ErrLoggerTypeUnknown  = errors.New("logger type unknown")
+	ErrDocsIsNotRunning   = NewError("documentation manager is not running")
+	ErrDocsGenerateFailed = NewError("documentation generation failed")
 )
 
 var (
-	ErrServiceIsRunning     = errors.New("service is running")
-	ErrServiceIsNotRunning  = errors.New("service is not running")
-	ErrComponentNotFound    = errors.New("component not found")
-	ErrComponentStartFailed = errors.New("component start failed")
-	ErrComponentStopFailed  = errors.New("component stop failed")
+	ErrLogFileIsEmpty     = NewError("log file is empty")
+	ErrLogFileWrongFormat = NewError("log file wrong format")
+	ErrLoggerTypeUnknown  = NewError("logger type unknown")
 )
 
 var (
-	ErrInvalidParameter = errors.New("invalid parameter")
-	ErrOperationFailed  = errors.New("operation failed")
-	ErrNotImplemented   = errors.New("not implemented")
-	ErrPermissionDenied = errors.New("permission denied")
-	ErrResourceNotFound = errors.New("resource not found")
-	ErrInternalError    = errors.New("internal error")
-	ErrContextCancelled = errors.New("context cancelled")
-	ErrContextTimeout   = errors.New("context timeout")
-	ErrInvalidState     = errors.New("invalid state")
-	ErrNotSupported     = errors.New("not supported")
+	ErrServiceIsRunning     = NewError("service is running")
+	ErrServiceIsNotRunning  = NewError("service is not running")
+	ErrComponentNotFound    = NewError("component not found")
+	ErrComponentStartFailed = NewError("component start failed")
+	ErrComponentStopFailed  = NewError("component stop failed")
+)
+
+var (
+	ErrInvalidParameter = NewError("invalid parameter")
+	ErrOperationFailed  = NewError("operation failed")
+	ErrNotImplemented   = NewError("not implemented")
+	ErrPermissionDenied = NewError("permission denied")
+	ErrResourceNotFound = NewError("resource not found")
+	ErrInternalError    = NewError("internal error")
+	ErrContextCancelled = NewError("context cancelled")
+	ErrContextTimeout   = NewError("context timeout")
+	ErrInvalidState     = NewError("invalid state")
+	ErrNotSupported     = NewError("not supported")
+	ErrMarshaling       = NewError("error during marshalling")
+	ErrUnMarshaling     = NewError("error during unmarshalling")
+	ErrWriteContext     = NewError("error during write context")
+	ErrPathNotFound     = NewError("path not found")
 )
 
 func Errorf(baseErr error, format string, args ...interface{}) error {
-	return fmt.Errorf("%w: %s", baseErr, fmt.Sprintf(format, args...))
+	return errors.Wrapf(baseErr, format, args...)
 }
 
 func WrapError(err error, message string) error {
-	if err == nil {
-		return nil
-	}
-	return fmt.Errorf("%s: %w", message, err)
+	return errors.Wrap(err, message)
+}
+
+func WrapErrorf(err error, format string, args ...interface{}) error {
+	return errors.Wrapf(err, format, args...)
+}
+
+func NewError(message string) error {
+	return errors.WithStack(errors.New(message))
 }
 
 func NewErrorf(format string, args ...interface{}) error {
-	return fmt.Errorf(format, args...)
+	return errors.WithStack(errors.Errorf(format, args...))
 }
 
 func IsError(err, target error) bool {

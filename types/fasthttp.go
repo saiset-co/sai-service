@@ -1,27 +1,42 @@
 package types
 
 import (
-	"net/http"
-	"net/url"
-
+	"github.com/pkg/errors"
 	"github.com/valyala/fasthttp"
+	"net/http"
 
 	"github.com/saiset-co/sai-service/utils"
 )
 
-var headerBytes = []byte("application/json")
+var jsonHeaderBytes = []byte("application/json")
+var textHeaderBytes = []byte("text/html; charset=UTF-8")
 
 type RequestCtx struct {
 	*fasthttp.RequestCtx
 }
 
-type Response struct {
-	Message string `json:"message"`
-	Status  string `json:"status"`
+type ErrorResponse struct {
+	Error   string `json:"error,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
-func (ctx *RequestCtx) WriteJSON(data any) (int, error) {
-	ctx.SetContentTypeBytes(headerBytes)
+func (ctx *RequestCtx) Error(err error, statusCode int) {
+	ctx.Response.Reset()
+
+	ctx.Response.Header.Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	ctx.Response.Header.Set("Pragma", "no-cache")
+	ctx.Response.Header.Set("Expires", "0")
+
+	ctx.SetUserValue("error", err)
+	ctx.SetStatusCode(statusCode)
+	ctx.SetContentTypeBytes(jsonHeaderBytes)
+
+	bytes, _ := utils.Marshal(ErrorResponse{Message: errors.Cause(err).Error(), Error: fasthttp.StatusMessage(statusCode)})
+	ctx.Write(bytes)
+}
+
+func (ctx *RequestCtx) SuccessJSON(data any) (int, error) {
+	ctx.SetContentTypeBytes(jsonHeaderBytes)
 	ctx.SetStatusCode(fasthttp.StatusOK)
 
 	bytes, err := utils.Marshal(data)
@@ -32,14 +47,31 @@ func (ctx *RequestCtx) WriteJSON(data any) (int, error) {
 	return ctx.Write(bytes)
 }
 
+func (ctx *RequestCtx) Success(data []byte, header []byte) (int, error) {
+	if len(header) == 0 {
+		header = textHeaderBytes
+	}
+
+	ctx.SetContentTypeBytes(header)
+	ctx.SetStatusCode(fasthttp.StatusOK)
+
+	return ctx.Write(data)
+}
+
 func (ctx *RequestCtx) ReadJSON(request any) error {
 	if err := utils.Unmarshal(ctx.PostBody(), &request); err != nil {
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		ctx.WriteJSON(Response{
-			Message: "Invalid JSON",
-			Status:  "error",
-		})
+		return err
+	}
 
+	return nil
+}
+
+func (ctx *RequestCtx) Marshal(data any) ([]byte, error) {
+	return utils.Marshal(data)
+}
+
+func (ctx *RequestCtx) Unmarshal(data []byte, request any) error {
+	if err := utils.Unmarshal(data, &request); err != nil {
 		return err
 	}
 
@@ -75,64 +107,4 @@ func (frw *FastResponseWriter) Write(data []byte) (int, error) {
 func (frw *FastResponseWriter) WriteHeader(statusCode int) {
 	frw.statusCode = statusCode
 	frw.ctx.SetStatusCode(statusCode)
-}
-
-type FastRequestContext struct {
-	ctx    *RequestCtx
-	header http.Header
-	url    *url.URL
-}
-
-func (frc *FastRequestContext) Method() string {
-	return string(frc.ctx.Method())
-}
-
-func (frc *FastRequestContext) URL() *url.URL {
-	if frc.url == nil {
-		frc.url = &url.URL{
-			Path:     string(frc.ctx.Path()),
-			RawQuery: string(frc.ctx.QueryArgs().QueryString()),
-		}
-	}
-	return frc.url
-}
-
-func (frc *FastRequestContext) Header() http.Header {
-	if frc.header == nil {
-		frc.header = make(http.Header)
-		frc.ctx.Request.Header.VisitAll(func(key, value []byte) {
-			frc.header.Set(string(key), string(value))
-		})
-	}
-	return frc.header
-}
-
-func CreateErrorResponse(ctx *RequestCtx) {
-	ctx.SetStatusCode(fasthttp.StatusInternalServerError)
-	ctx.SetContentType("application/json")
-
-	ctx.Response.Header.Set("Cache-Control", "no-cache, no-store, must-revalidate")
-	ctx.Response.Header.Set("Pragma", "no-cache")
-	ctx.Response.Header.Set("Expires", "0")
-
-	if requestID := string(ctx.Request.Header.Peek("X-Request-ID")); requestID != "" {
-		ctx.Response.Header.Set("X-Request-ID", requestID)
-	}
-
-	ctx.SetBodyString(`{"error":"Internal Server Error","message":"An unexpected error occurred"}`)
-}
-
-func CreateUnauthorizedResponse(ctx *RequestCtx) {
-	ctx.SetStatusCode(fasthttp.StatusUnauthorized)
-	ctx.SetContentType("application/json")
-
-	ctx.Response.Header.Set("Cache-Control", "no-cache, no-store, must-revalidate")
-	ctx.Response.Header.Set("Pragma", "no-cache")
-	ctx.Response.Header.Set("Expires", "0")
-
-	if requestID := string(ctx.Request.Header.Peek("X-Request-ID")); requestID != "" {
-		ctx.Response.Header.Set("X-Request-ID", requestID)
-	}
-
-	ctx.SetBodyString(`{"error":"Unauthorized","message":"Authentication required"}`)
 }

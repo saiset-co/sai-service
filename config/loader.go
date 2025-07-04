@@ -331,7 +331,7 @@ func (l *Loader) Defaults() *types.ServiceConfig {
 		Health: &types.HealthConfig{
 			Enabled: false,
 		},
-		Client: &types.ClientConfig{
+		Clients: &types.ClientsConfig{
 			Enabled: false,
 		},
 		Middlewares: &types.MiddlewaresConfig{

@@ -165,11 +165,6 @@ func (m *Manager) RegisterWebhook(serviceName, event, webhookURL string) ([]byte
 		return nil, 500, types.ErrActionNotInitialized
 	}
 
-	start := time.Now()
-	defer func() {
-		m.recordMetric("webhook_register", "attempt", serviceName, time.Since(start))
-	}()
-
 	webhookData := map[string]interface{}{
 		"event": event,
 		"url":   webhookURL,
@@ -181,26 +176,13 @@ func (m *Manager) RegisterWebhook(serviceName, event, webhookURL string) ([]byte
 		Retry:   3,
 	}
 
-	resp, statusCode, err := m.Call(serviceName, "POST", "/api/webhooks", webhookData, opts)
-
-	result := "success"
-	if err != nil {
-		result = "error"
-	}
-	m.recordMetric("webhook_register", result, serviceName, time.Since(start))
-
-	return resp, statusCode, err
+	return m.Call(serviceName, "POST", "/api/webhooks", webhookData, opts)
 }
 
 func (m *Manager) Call(serviceName, method, path string, data interface{}, opts *types.CallOptions) ([]byte, int, error) {
 	if !m.IsRunning() {
 		return nil, 500, types.ErrActionNotInitialized
 	}
-
-	start := time.Now()
-	defer func() {
-		m.recordMetric("call", "attempt", serviceName, time.Since(start))
-	}()
 
 	callCtx, cancel := context.WithTimeout(m.ctx, m.callTimeout)
 	defer cancel()
@@ -213,22 +195,21 @@ func (m *Manager) Call(serviceName, method, path string, data interface{}, opts 
 
 	client, err := m.getClient(serviceName)
 	if err != nil {
-		m.recordMetric("call", "client_error", serviceName, time.Since(start))
 		return nil, 500, err
 	}
 
 	serviceConfig, err := m.getServiceConfig(serviceName)
 	if err != nil {
-		m.recordMetric("call", "config_error", serviceName, time.Since(start))
 		return nil, 500, err
 	}
 
 	if serviceConfig.Auth != nil {
 		if err := m.addAuthenticationHeaders(opts, serviceConfig.Auth); err != nil {
-			m.recordMetric("call", "auth_error", serviceName, time.Since(start))
 			return nil, 500, types.WrapError(err, "failed to add authentication headers")
 		}
 	}
+
+	return client.Call(method, path, data, opts)
 
 	var resp []byte
 	var statusCode int
@@ -242,31 +223,14 @@ func (m *Manager) Call(serviceName, method, path string, data interface{}, opts 
 	select {
 	case <-done:
 	case <-callCtx.Done():
-		err = types.NewErrorf("call timeout for service: %s", serviceName)
-		statusCode = 500
-		m.recordMetric("call", "timeout", serviceName, time.Since(start))
-		return nil, statusCode, err
+		return nil, 500, types.WrapErrorf(err, "call timeout for service: %s", serviceName)
 	case <-m.ctx.Done():
-		err = types.NewErrorf("manager shutting down, aborting call to service: %s", serviceName)
-		statusCode = 500
-		m.recordMetric("call", "canceled", serviceName, time.Since(start))
-		return nil, statusCode, err
+		return nil, 500, types.WrapErrorf(err, "manager shutting down, aborting call to service: %s", serviceName)
 	}
 
-	duration := time.Since(start)
-	status := "success"
 	if err != nil {
-		status = "error"
+		err = types.WrapError(err, "failed to execute client")
 	}
-
-	m.recordMetrics(serviceName, method, status, 0, duration)
-	m.updateCircuitBreakerMetrics(serviceName, client)
-
-	result := "success"
-	if err != nil {
-		result = "error"
-	}
-	m.recordMetric("call", result, serviceName, time.Since(start))
 
 	return resp, statusCode, err
 }
@@ -309,7 +273,7 @@ func (m *Manager) addAuthenticationHeaders(opts *types.CallOptions, authConfig *
 }
 
 func (m *Manager) initializeClients() error {
-	clientConfig := m.config.GetConfig().Client
+	clientConfig := m.config.GetConfig().Clients
 	if clientConfig == nil || !clientConfig.Enabled {
 		m.logger.Info("Client configuration disabled or not found")
 		return nil
@@ -392,90 +356,4 @@ func (m *Manager) getClient(serviceName string) (*HTTPClient, error) {
 	}
 
 	return client, nil
-}
-
-func (m *Manager) recordMetrics(serviceName, method, status string, responseSize int64, duration time.Duration) {
-	if m.metrics == nil {
-		return
-	}
-
-	requestCounter := m.metrics.Counter("http_client_requests_total", map[string]string{
-		"service": serviceName,
-		"method":  method,
-		"status":  status,
-	})
-	requestCounter.Inc()
-
-	durationHist := m.metrics.Histogram("http_client_request_duration_seconds",
-		[]float64{0.01, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0},
-		map[string]string{"service": serviceName, "method": method},
-	)
-	durationHist.Observe(duration.Seconds())
-
-	if responseSize > 0 {
-		sizeHist := m.metrics.Histogram("http_client_response_size_bytes",
-			[]float64{100, 1000, 10000, 100000, 1000000},
-			map[string]string{"service": serviceName, "method": method},
-		)
-		sizeHist.Observe(float64(responseSize))
-	}
-
-	m.logger.Debug("HTTP client metrics recorded",
-		zap.String("service", serviceName),
-		zap.String("method", method),
-		zap.String("status", status),
-		zap.Duration("duration", duration),
-		zap.Int64("response_size", responseSize))
-}
-
-func (m *Manager) recordMetric(operation, result, service string, duration time.Duration) {
-	if m.metrics == nil {
-		return
-	}
-
-	counter := m.metrics.Counter("client_operations_total", map[string]string{
-		"operation": operation,
-		"result":    result,
-		"service":   service,
-	})
-	counter.Inc()
-
-	histogram := m.metrics.Histogram("client_operation_duration_seconds",
-		[]float64{0.001, 0.01, 0.1, 1.0, 5.0, 10.0, 30.0},
-		map[string]string{"operation": operation, "service": service},
-	)
-	histogram.Observe(duration.Seconds())
-}
-
-func (m *Manager) updateCircuitBreakerMetrics(serviceName string, client *HTTPClient) {
-	if m.metrics == nil {
-		return
-	}
-
-	state, _, _ := client.getState()
-
-	states := []string{"closed", "open", "half-open"}
-	for _, s := range states {
-		stateGauge := m.metrics.Gauge("http_client_circuit_breaker_status", map[string]string{
-			"service": serviceName,
-			"state":   s,
-		})
-		stateGauge.Set(0)
-	}
-
-	currentState := "closed"
-	switch state {
-	case 0:
-		currentState = "closed"
-	case 1:
-		currentState = "open"
-	case 2:
-		currentState = "half-open"
-	}
-
-	currentStateGauge := m.metrics.Gauge("http_client_circuit_breaker_status", map[string]string{
-		"service": serviceName,
-		"state":   currentState,
-	})
-	currentStateGauge.Set(1)
 }

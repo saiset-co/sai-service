@@ -565,7 +565,7 @@ func (m *MemoryMetrics) registerRoutes() {
 
 func (m *MemoryMetrics) handleMetricsUI(ctx *types.RequestCtx) {
 	if !m.IsRunning() {
-		ctx.Error("Metrics service unavailable", fasthttp.StatusServiceUnavailable)
+		ctx.Error(types.ErrMetricsNotRunning, fasthttp.StatusServiceUnavailable)
 		return
 	}
 
@@ -611,7 +611,7 @@ func (m *MemoryMetrics) handleMetricsUI(ctx *types.RequestCtx) {
 	var buf strings.Builder
 	if err := tmpl.Execute(&buf, data); err != nil {
 		m.logger.Error("Template execution failed", zap.Error(err))
-		ctx.Error("Template error", fasthttp.StatusInternalServerError)
+		ctx.Error(err, fasthttp.StatusInternalServerError)
 		return
 	}
 
@@ -625,13 +625,13 @@ func (m *MemoryMetrics) handleMetricsUI(ctx *types.RequestCtx) {
 
 func (m *MemoryMetrics) handleMetrics(ctx *types.RequestCtx) {
 	if !m.IsRunning() {
-		ctx.Error("metrics service not running", fasthttp.StatusServiceUnavailable)
+		ctx.Error(types.ErrMetricsNotRunning, fasthttp.StatusServiceUnavailable)
 		return
 	}
 
 	metricsData, err := m.GetMetrics()
 	if err != nil {
-		ctx.Error("failed to get metrics", fasthttp.StatusInternalServerError)
+		ctx.Error(err, fasthttp.StatusInternalServerError)
 		return
 	}
 
@@ -646,13 +646,13 @@ func (m *MemoryMetrics) handleMetrics(ctx *types.RequestCtx) {
 
 func (m *MemoryMetrics) handleStats(ctx *types.RequestCtx) {
 	if !m.IsRunning() {
-		ctx.Error("metrics service not running", fasthttp.StatusServiceUnavailable)
+		ctx.Error(types.ErrMetricsNotRunning, fasthttp.StatusServiceUnavailable)
 		return
 	}
 
 	statsData, err := m.GetStats()
 	if err != nil {
-		ctx.Error("failed to get stats", fasthttp.StatusInternalServerError)
+		ctx.Error(err, fasthttp.StatusInternalServerError)
 		return
 	}
 

@@ -77,9 +77,6 @@ func (c *HTTPClient) Call(method, path string, data interface{}, opts *types.Cal
 
 	url := c.baseURL + path
 
-	callCtx, cancel := context.WithTimeout(c.ctx, c.requestTimeout)
-	defer cancel()
-
 	req := fasthttp.AcquireRequest()
 	resp := fasthttp.AcquireResponse()
 	defer fasthttp.ReleaseRequest(req)
@@ -105,12 +102,6 @@ func (c *HTTPClient) Call(method, path string, data interface{}, opts *types.Cal
 			req.Header.Set(key, value)
 		}
 
-		if opts.Timeout > 0 {
-			timeout = opts.Timeout
-			callCtx, cancel = context.WithTimeout(c.ctx, timeout)
-			defer cancel()
-		}
-
 		if opts.Retry > 0 {
 			retries = opts.Retry
 		}
@@ -120,29 +111,7 @@ func (c *HTTPClient) Call(method, path string, data interface{}, opts *types.Cal
 	c.client.ReadTimeout = timeout
 	defer func() { c.client.ReadTimeout = originalTimeout }()
 
-	var responseBody []byte
-	var statusCode int
-	var err error
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		responseBody, statusCode, err = c.executeWithRetries(req, resp, retries)
-	}()
-
-	select {
-	case <-done:
-	case <-callCtx.Done():
-		err = types.NewErrorf("call timeout for service: %s", c.name)
-		statusCode = 500
-		return nil, statusCode, err
-	case <-c.ctx.Done():
-		err = types.NewErrorf("client shutting down, aborting call to service: %s", c.name)
-		statusCode = 500
-		return nil, statusCode, err
-	}
-
-	return responseBody, statusCode, err
+	return c.executeWithRetries(req, resp, retries)
 }
 
 func (c *HTTPClient) Close() {
@@ -218,7 +187,7 @@ func (c *HTTPClient) executeWithRetries(req *fasthttp.Request, resp *fasthttp.Re
 		}
 
 		if !c.circuitBreaker.CanExecute() {
-			return nil, 500, types.ErrCircuitBreakerOpen
+			return nil, 500, types.NewErrorf("Service %s is temporary blocked by the circuit breaker", c.name)
 		}
 
 		err := c.client.DoTimeout(req, resp, c.config.Timeout)
@@ -233,8 +202,26 @@ func (c *HTTPClient) executeWithRetries(req *fasthttp.Request, resp *fasthttp.Re
 			return responseBody, resp.StatusCode(), nil
 		}
 
+		if !IsRetryableError(statusCode, err) {
+			var responseBody types.ErrorResponse
+			utils.Unmarshal(resp.Body(), &responseBody)
+
+			if responseBody.Message != "" {
+				err = types.NewError(responseBody.Message)
+			}
+
+			return nil, resp.StatusCode(), err
+		}
+
 		if IsCircuitBreakerFailure(statusCode, err) {
 			c.circuitBreaker.RecordFailure()
+			var responseBody types.ErrorResponse
+			utils.Unmarshal(resp.Body(), &responseBody)
+
+			if responseBody.Message != "" {
+				err = types.NewError(responseBody.Message)
+			}
+
 		}
 
 		lastErr = err
@@ -245,9 +232,6 @@ func (c *HTTPClient) executeWithRetries(req *fasthttp.Request, resp *fasthttp.Re
 		if attempt < maxRetries {
 			if statusCode >= 400 && statusCode < 500 &&
 				statusCode != 429 && statusCode != 408 {
-				c.logger.Debug("Not retrying client error",
-					zap.String("service", c.name),
-					zap.Int("status_code", statusCode))
 				break
 			}
 
@@ -255,15 +239,11 @@ func (c *HTTPClient) executeWithRetries(req *fasthttp.Request, resp *fasthttp.Re
 
 			select {
 			case <-time.After(backoff):
-				c.logger.Debug("Retrying request",
-					zap.String("service", c.name),
-					zap.Duration("backoff", backoff),
-					zap.Error(lastErr))
 			case <-c.ctx.Done():
-				return nil, 500, types.NewErrorf("client shutting down during retry for service: %s", c.name)
+				return nil, 500, lastErr
 			}
 		}
 	}
 
-	return nil, 500, types.Errorf(types.ErrClientRequestFailed, "all %d attempts failed for service %s: %v", maxRetries+1, c.name, lastErr)
+	return nil, 500, lastErr
 }

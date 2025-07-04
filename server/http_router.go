@@ -150,6 +150,8 @@ func (r *LazyHTTPRouter) Add(method, path string, handler types.FastHTTPHandler,
 		return
 	}
 
+	path = normalizePath(path)
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -337,4 +339,21 @@ func (r *LazyHTTPRouter) HEAD(path string, handler types.FastHTTPHandler) types.
 
 func (r *LazyHTTPRouter) OPTIONS(path string, handler types.FastHTTPHandler) types.RouteBuilder {
 	return r.route("OPTIONS", path, handler, nil)
+}
+
+func normalizePathBytes(path []byte) []byte {
+	if len(path) == 1 && path[0] == '/' {
+		return path
+	}
+	if len(path) > 1 && path[len(path)-1] == '/' {
+		return path[:len(path)-1]
+	}
+	return path
+}
+
+func normalizePath(path string) string {
+	if path == "/" {
+		return path
+	}
+	return strings.TrimSuffix(path, "/")
 }
