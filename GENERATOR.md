@@ -353,13 +353,4 @@ actions: "websocket,webhook"
 
 MIT License - see LICENSE file for details.
 
-## 🆘 Support
-
-- 📧 Email: support@sai-service.com
-- 💬 Discord: [SAI Community](https://discord.gg/sai)
-- 📖 Documentation: [docs.sai-service.com](https://docs.sai-service.com)
-- 🐛 Issues: [GitHub Issues](https://github.com/sai-service/generator/issues)
-
----
-
 **Create powerful Go services in minutes, not days! 🚀**
