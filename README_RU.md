@@ -3176,13 +3176,4 @@ func setupCertificateAlerts() {
 
 MIT Лицензия - см. файл LICENSE для подробностей.
 
-## 🆘 Поддержка
-
-- 📧 Email: support@sai-service.com
-- 💬 Discord: [SAI Сообщество](https://discord.gg/sai)
-- 📖 Документация: [docs.sai-service.com](https://docs.sai-service.com)
-- 🐛 Проблемы: [GitHub Issues](https://github.com/saiset-co/sai-service/issues)
-
----
-
 **Создавайте мощные Go сервисы за минуты, а не дни!**
