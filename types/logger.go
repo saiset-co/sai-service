@@ -11,6 +11,8 @@ type LoggerManager interface {
 
 type Logger interface {
 	Error(msg string, fields ...zap.Field)
+	ErrorWithErrStack(msg string, err error, fields ...zap.Field)
+	ErrorWithStack(msg string, stack string, fields ...zap.Field)
 	Warn(msg string, fields ...zap.Field)
 	Info(msg string, fields ...zap.Field)
 	Debug(msg string, fields ...zap.Field)

@@ -403,7 +403,7 @@ func (wm *WebhookManager) writeJSONResponse(ctx *types.RequestCtx, statusCode in
 
 	if jsonData, err := utils.Marshal(data); err != nil {
 		wm.logger.Error("Failed to marshal JSON response", zap.Error(err))
-		ctx.Error(fasthttp.StatusMessage(statusCode), fasthttp.StatusInternalServerError)
+		ctx.Error(err, fasthttp.StatusInternalServerError)
 	} else {
 		if _, err := ctx.Write(jsonData); err != nil {
 			wm.logger.Error("Failed to write response", zap.Error(err))

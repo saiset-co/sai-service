@@ -119,53 +119,31 @@ func (m *Manager) IsRunning() bool {
 }
 
 func (m *Manager) Error(msg string, fields ...zap.Field) {
-	if m.logger != nil {
-		if zapLogger, ok := m.logger.(*zap.Logger); ok {
-			zapLogger.WithOptions(zap.AddCallerSkip(1)).Error(msg, fields...)
-		} else {
-			m.logger.Error(msg, fields...)
-		}
-	}
+	m.logger.Error(msg, fields...)
+}
+
+func (m *Manager) ErrorWithErrStack(msg string, err error, fields ...zap.Field) {
+	m.logger.ErrorWithErrStack(msg, err, fields...)
+}
+
+func (m *Manager) ErrorWithStack(msg string, stack string, fields ...zap.Field) {
+	m.logger.ErrorWithStack(msg, stack, fields...)
 }
 
 func (m *Manager) Warn(msg string, fields ...zap.Field) {
-	if m.logger != nil {
-		if zapLogger, ok := m.logger.(*zap.Logger); ok {
-			zapLogger.WithOptions(zap.AddCallerSkip(1)).Warn(msg, fields...)
-		} else {
-			m.logger.Warn(msg, fields...)
-		}
-	}
+	m.logger.Warn(msg, fields...)
 }
 
 func (m *Manager) Info(msg string, fields ...zap.Field) {
-	if m.logger != nil {
-		if zapLogger, ok := m.logger.(*zap.Logger); ok {
-			zapLogger.WithOptions(zap.AddCallerSkip(1)).Info(msg, fields...)
-		} else {
-			m.logger.Info(msg, fields...)
-		}
-	}
+	m.logger.Info(msg, fields...)
 }
 
 func (m *Manager) Debug(msg string, fields ...zap.Field) {
-	if m.logger != nil {
-		if zapLogger, ok := m.logger.(*zap.Logger); ok {
-			zapLogger.WithOptions(zap.AddCallerSkip(1)).Debug(msg, fields...)
-		} else {
-			m.logger.Debug(msg, fields...)
-		}
-	}
+	m.logger.Debug(msg, fields...)
 }
 
 func (m *Manager) Log(lvl zapcore.Level, msg string, fields ...zap.Field) {
-	if m.logger != nil {
-		if zapLogger, ok := m.logger.(*zap.Logger); ok {
-			zapLogger.WithOptions(zap.AddCallerSkip(1)).Log(lvl, msg, fields...)
-		} else {
-			m.logger.Log(lvl, msg, fields...)
-		}
-	}
+	m.logger.Log(lvl, msg, fields...)
 }
 
 func (m *Manager) getState() State {

@@ -34,8 +34,10 @@ type GroupBuilder interface {
 	Route(method, path string, handler FastHTTPHandler) RouteBuilder
 	GET(path string, handler FastHTTPHandler) RouteBuilder
 	POST(path string, handler FastHTTPHandler) RouteBuilder
+	PATCH(path string, handler FastHTTPHandler) RouteBuilder
 	PUT(path string, handler FastHTTPHandler) RouteBuilder
 	DELETE(path string, handler FastHTTPHandler) RouteBuilder
+	Group(prefix string) GroupBuilder
 }
 
 type RouteConfig struct {

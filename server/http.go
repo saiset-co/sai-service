@@ -295,6 +295,8 @@ func (h *FastHTTPServer) findStaticRoute(method, path []byte) (types.FastHTTPHan
 		return nil, nil
 	}
 
+	path = normalizePathBytes(path)
+
 	var buf [32]byte
 	n := copy(buf[:], method)
 	buf[n] = ':'
@@ -316,6 +318,7 @@ func (h *FastHTTPServer) findDynamicRoute(method, path []byte) (types.FastHTTPHa
 		return nil, nil, nil
 	}
 
+	path = normalizePathBytes(path)
 	pathStr := utils.BytesToString(path)
 	pathSegments := h.parsePathSegments(pathStr)
 
@@ -411,12 +414,12 @@ func (h *FastHTTPServer) matchRoute(pathSegments []string, route *CompiledRoute)
 
 func (h *FastHTTPServer) executeHandler(ctx *types.RequestCtx, handler types.FastHTTPHandler, config *types.RouteConfig) {
 	if handler == nil {
-		ctx.Error("Path not found", fasthttp.StatusNotFound)
+		ctx.Error(types.ErrPathNotFound, fasthttp.StatusNotFound)
 		return
 	}
 
 	if config == nil {
-		ctx.Error("Internal server error", fasthttp.StatusInternalServerError)
+		ctx.Error(types.ErrConfigNotFound, fasthttp.StatusInternalServerError)
 		return
 	}
 

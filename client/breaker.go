@@ -2,8 +2,12 @@ package client
 
 import (
 	"context"
+	"errors"
+	"net"
+	"net/url"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"go.uber.org/zap"
@@ -371,15 +375,125 @@ func IsCircuitBreakerFailure(statusCode int, err error) bool {
 		return true
 	}
 
-	switch {
-	case statusCode >= 500:
+	switch statusCode {
+	case 429:
 		return true
-	case statusCode == 429:
+	case 408:
 		return true
-	case statusCode == 408:
+	case 502:
 		return true
-	case statusCode >= 400:
+	case 503:
+		return true
+	case 504:
+		return true
+	default:
 		return false
+	}
+}
+
+func isNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Контекстные ошибки
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+
+	// Сетевые ошибки
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		// Timeout ошибки всегда retry
+		if netErr.Timeout() {
+			return true
+		}
+		// Временные сетевые ошибки
+		if netErr.Temporary() {
+			return true
+		}
+	}
+
+	// DNS ошибки
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		// DNS timeout или temporary - retry
+		return dnsErr.Timeout() || dnsErr.Temporary()
+	}
+
+	// Connection ошибки
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		// Connection refused, reset, etc.
+		if errors.Is(opErr.Err, syscall.ECONNREFUSED) ||
+			errors.Is(opErr.Err, syscall.ECONNRESET) ||
+			errors.Is(opErr.Err, syscall.ECONNABORTED) ||
+			errors.Is(opErr.Err, syscall.EHOSTUNREACH) ||
+			errors.Is(opErr.Err, syscall.ENETUNREACH) {
+			return true
+		}
+	}
+
+	// URL ошибки (обычно не retry)
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		// Рекурсивно проверяем вложенную ошибку
+		return isNetworkError(urlErr.Err)
+	}
+
+	// Syscall ошибки
+	var syscallErr syscall.Errno
+	if errors.As(err, &syscallErr) {
+		switch syscallErr {
+		case syscall.ECONNREFUSED, syscall.ECONNRESET, syscall.ECONNABORTED,
+			syscall.EHOSTUNREACH, syscall.ENETUNREACH, syscall.ETIMEDOUT:
+			return true
+		}
+	}
+
+	return false
+}
+
+// Дополнительная функция для более специфичной проверки
+func isTemporaryError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Временные интерфейсы (deprecated, но еще используются)
+	type temporary interface {
+		Temporary() bool
+	}
+
+	if temp, ok := err.(temporary); ok {
+		return temp.Temporary()
+	}
+
+	// Timeout всегда считаем временным
+	type timeout interface {
+		Timeout() bool
+	}
+
+	if to, ok := err.(timeout); ok {
+		return to.Timeout()
+	}
+
+	return false
+}
+
+// Обновленная версия IsRetryableError
+func IsRetryableError(statusCode int, err error) bool {
+	if err != nil {
+		return isNetworkError(err) || isTemporaryError(err)
+	}
+
+	switch statusCode {
+	case 429: // Rate limiting - retry с exponential backoff
+		return true
+	case 408: // Request Timeout
+		return true
+	case 502, 503, 504: // Временные проблемы с gateway/сервисом
+		return true
 	default:
 		return false
 	}

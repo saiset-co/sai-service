@@ -598,7 +598,7 @@ func (dm *DocumentationManager) generateSchemaFromType(t reflect.Type) *types.Ro
 		return &types.RouteSchema{
 			Type: "object",
 			Properties: map[string]*types.RouteSchema{
-				"additionalProperties": dm.generateSchemaFromType(t.Elem()),
+				"field": dm.generateSchemaFromType(t.Elem()),
 			},
 		}
 	case reflect.String:
@@ -985,7 +985,7 @@ func (dm *DocumentationManager) generateParamExample(paramName string) interface
 
 func (dm *DocumentationManager) handleDocs(ctx *types.RequestCtx) {
 	if !dm.IsRunning() {
-		ctx.Error("Documentation service unavailable", fasthttp.StatusServiceUnavailable)
+		ctx.Error(types.ErrDocsIsNotRunning, fasthttp.StatusServiceUnavailable)
 		return
 	}
 
@@ -1034,7 +1034,7 @@ func (dm *DocumentationManager) handleDocs(ctx *types.RequestCtx) {
 
 func (dm *DocumentationManager) handleOpenAPIJSON(ctx *types.RequestCtx) {
 	if !dm.IsRunning() {
-		ctx.Error("Documentation service unavailable", fasthttp.StatusServiceUnavailable)
+		ctx.Error(types.ErrDocsIsNotRunning, fasthttp.StatusServiceUnavailable)
 		return
 	}
 
@@ -1043,7 +1043,7 @@ func (dm *DocumentationManager) handleOpenAPIJSON(ctx *types.RequestCtx) {
 	if spec == nil {
 		if err := dm.generate(); err != nil {
 			dm.logger.Error("Failed to generate documentation", zap.Error(err))
-			ctx.Error("Internal server error", fasthttp.StatusInternalServerError)
+			ctx.Error(err, fasthttp.StatusInternalServerError)
 			return
 		}
 		spec = dm.getSpec()
@@ -1055,14 +1055,14 @@ func (dm *DocumentationManager) handleOpenAPIJSON(ctx *types.RequestCtx) {
 	specData, err := utils.Marshal(spec)
 	if err != nil {
 		dm.logger.Error("Failed to encode OpenAPI spec", zap.Error(err))
-		ctx.Error("Internal server error", fasthttp.StatusInternalServerError)
+		ctx.Error(err, fasthttp.StatusInternalServerError)
 		return
 	}
 
 	_, err = ctx.Write(specData)
 	if err != nil {
 		dm.logger.Error("Failed to write OpenAPI spec", zap.Error(err))
-		ctx.Error("Internal server error", fasthttp.StatusInternalServerError)
+		ctx.Error(err, fasthttp.StatusInternalServerError)
 		return
 	}
 }

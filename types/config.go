@@ -22,7 +22,7 @@ type ServiceConfig struct {
 	Middlewares   *MiddlewaresConfig   `yaml:"middlewares" json:"middlewares"`
 	Docs          *DocsConfig          `yaml:"docs" json:"docs"`
 	Metrics       *MetricsConfig       `yaml:"metrics" json:"metrics"`
-	Client        *ClientConfig        `yaml:"client" json:"client"`
+	Clients       *ClientsConfig       `yaml:"clients" json:"clients"`
 	Health        *HealthConfig        `yaml:"health" json:"health"`
 }
 
@@ -164,7 +164,7 @@ type HealthConfig struct {
 	Enabled bool `yaml:"enabled" json:"enabled"`
 }
 
-type ClientConfig struct {
+type ClientsConfig struct {
 	Enabled            bool                            `yaml:"enabled" json:"enabled"`
 	DefaultTimeout     time.Duration                   `yaml:"default_timeout" json:"default_timeout"`
 	MaxIdleConnections int                             `yaml:"max_idle_connections" json:"max_idle_connections"`

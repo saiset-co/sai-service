@@ -203,7 +203,7 @@ func (hm *Manager) registerRoutes() {
 
 func (hm *Manager) handleVersion(ctx *types.RequestCtx) {
 	if !hm.IsRunning() {
-		ctx.Error("Health manager is not running", fasthttp.StatusServiceUnavailable)
+		ctx.Error(types.ErrHealthIsNotRunning, fasthttp.StatusServiceUnavailable)
 		return
 	}
 
@@ -229,7 +229,7 @@ func (hm *Manager) handleVersion(ctx *types.RequestCtx) {
 
 func (hm *Manager) handleHealth(ctx *types.RequestCtx) {
 	if !hm.IsRunning() {
-		ctx.Error("Health manager is not running", fasthttp.StatusServiceUnavailable)
+		ctx.Error(types.ErrHealthIsNotRunning, fasthttp.StatusServiceUnavailable)
 		return
 	}
 
@@ -241,14 +241,14 @@ func (hm *Manager) handleHealth(ctx *types.RequestCtx) {
 	specData, err := utils.Marshal(report)
 	if err != nil {
 		hm.logger.Error("Failed to encode health report", zap.Error(err))
-		ctx.Error("Internal server error", fasthttp.StatusInternalServerError)
+		ctx.Error(err, fasthttp.StatusInternalServerError)
 		return
 	}
 
 	_, err = ctx.Write(specData)
 	if err != nil {
 		hm.logger.Error("Failed to write health report", zap.Error(err))
-		ctx.Error("Internal server error", fasthttp.StatusInternalServerError)
+		ctx.Error(err, fasthttp.StatusInternalServerError)
 		return
 	}
 }

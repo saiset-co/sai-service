@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"bytes"
+	"github.com/valyala/fasthttp"
 
 	"go.uber.org/zap"
 
@@ -88,7 +89,8 @@ func (a *AuthMiddleware) Handle(ctx *types.RequestCtx, next func(*types.RequestC
 		zap.ByteString("path", ctx.Path()),
 		zap.String("provider_type", a.provider.Type()),
 		zap.Error(err))
-	types.CreateUnauthorizedResponse(ctx)
+
+	ctx.Error(types.NewError("Authentication require"), fasthttp.StatusUnauthorized)
 }
 
 func (a *AuthMiddleware) isBasicAuthChallenge(err error) bool {

@@ -365,7 +365,7 @@ func (d *Dispatcher) initializeWebhooks() error {
 		return nil
 	}
 
-	clientConfig := d.config.GetConfig().Client
+	clientConfig := d.config.GetConfig().Clients
 	if clientConfig == nil || !clientConfig.Enabled || clientConfig.Services == nil {
 		return nil
 	}

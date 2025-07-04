@@ -329,7 +329,7 @@ func (s *Service) startComponents(ctx context.Context) error {
 		}
 	}
 
-	if _config.Client.Enabled {
+	if _config.Clients.Enabled {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -697,7 +697,7 @@ func registerProviders(container *sai.Container, ctx context.Context, configPath
 		container.SetMiddlewares(middlewareManager)
 	}
 
-	if _config.Client.Enabled {
+	if _config.Clients.Enabled {
 		clientManager, err = client.NewManager(ctx, configManager, loggerManager, metricsManager, healthManager, middlewareManager, authProvider)
 		if err != nil {
 			return types.WrapError(err, "failed to register client manager")

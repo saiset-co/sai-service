@@ -72,6 +72,10 @@ func (gb *GroupBuilder) PUT(path string, handler types.FastHTTPHandler) types.Ro
 	return gb.Route("PUT", path, handler)
 }
 
+func (gb *GroupBuilder) PATCH(path string, handler types.FastHTTPHandler) types.RouteBuilder {
+	return gb.Route("PATCH", path, handler)
+}
+
 func (gb *GroupBuilder) DELETE(path string, handler types.FastHTTPHandler) types.RouteBuilder {
 	return gb.Route("DELETE", path, handler)
 }

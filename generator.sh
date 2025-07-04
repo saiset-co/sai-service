@@ -1,11 +1,8 @@
 #!/bin/bash
 
-# SAI Service Generator
-# Generates a complete microservice project based on SAI Service library
-
 set -e
 
-# Colors for output
+# Цвета для вывода
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -14,1024 +11,1234 @@ PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
-# Default values
-DEFAULT_PORT="8080"
-DEFAULT_TEMPLATE="api"
-DEFAULT_CACHE_TYPE="memory"
-DEFAULT_METRICS_TYPE="memory"
-DEFAULT_BROKER_TYPE="websocket"
-
-# Available options
-TEMPLATES=("basic" "api" "microservice" "full")
-FEATURES=("cache" "metrics" "docs" "cron" "actions" "tls" "middleware" "health" "client")
-MIDDLEWARES=("cache" "auth" "bodylimit" "compression" "cors" "logging" "ratelimit" "recovery")
-CACHE_TYPES=("memory" "redis")
-METRICS_TYPES=("memory" "prometheus")
-BROKER_TYPES=("websocket")
-CICD_TYPES=("none" "github" "gitlab")
-
-# Project configuration
+# Глобальные переменные
 PROJECT_NAME=""
-MODULE_NAME=""
-PORT=""
+PKG_NAME=""
 TEMPLATE=""
-SELECTED_FEATURES=()
-SELECTED_MIDDLEWARES=()
+FEATURES=""
+AUTH_TYPES=""
 CACHE_TYPE=""
 METRICS_TYPE=""
-BROKER_TYPE=""
+ACTIONS=""
+MIDDLEWARES=""
 INCLUDE_TESTS="false"
-CICD_TYPE="none"
+CICD_TYPE=""
 
-# Helper functions
-print_header() {
-    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║                   SAI Service Generator                      ║${NC}"
-    echo -e "${CYAN}║              Fast Microservice Project Creation             ║${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
-    echo
+# Функции для вывода
+print_info() {
+    echo -e "${BLUE}ℹ ${1}${NC}"
 }
 
 print_success() {
-    echo -e "${GREEN}✓ $1${NC}"
-}
-
-print_error() {
-    echo -e "${RED}✗ $1${NC}"
-}
-
-print_info() {
-    echo -e "${BLUE}ℹ $1${NC}"
+    echo -e "${GREEN}✓ ${1}${NC}"
 }
 
 print_warning() {
-    echo -e "${YELLOW}⚠ $1${NC}"
+    echo -e "${YELLOW}⚠ ${1}${NC}"
 }
 
-prompt_input() {
-    local prompt="$1"
-    local default="$2"
-    local result=""
-
-    if [ -n "$default" ]; then
-        echo -ne "${YELLOW}$prompt [$default]: ${NC}" >&2
-    else
-        echo -ne "${YELLOW}$prompt: ${NC}" >&2
-    fi
-
-    read -r result
-    if [ -z "$result" ] && [ -n "$default" ]; then
-        result="$default"
-    fi
-    echo "$result"
+print_error() {
+    echo -e "${RED}✗ ${1}${NC}"
 }
 
-prompt_yes_no() {
-    local prompt="$1"
-    local default="$2"
-    local result=""
-
-    if [ "$default" = "y" ]; then
-        echo -ne "${YELLOW}$prompt [Y/n]: ${NC}" >&2
-    else
-        echo -ne "${YELLOW}$prompt [y/N]: ${NC}" >&2
-    fi
-
-    read -r result
-    if [ -z "$result" ]; then
-        result="$default"
-    fi
-
-    case "$result" in
-        [Yy]|[Yy][Ee][Ss]) echo "true" ;;
-        *) echo "false" ;;
-    esac
+print_header() {
+    echo -e "${PURPLE}${1}${NC}"
 }
 
-select_from_array() {
-    local prompt="$1"
-    local default="$2"
-    shift 2
-    local options=("$@")
+# Функция для отображения справки
+show_help() {
+    echo -e "${CYAN}SAI Service Generator${NC}"
+    echo ""
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  --name STRING          Project name"
+    echo "  --pkg STRING           Go package name (e.g., github.com/user/project)"
+    echo "  --features STRING      Comma-separated features: auth,cache,metrics,docs,cron,actions,tls,middlewares,health,client"
+    echo "  --auth STRING          Auth types: basic,token (comma-separated)"
+    echo "  --cache STRING         Cache type: memory,redis"
+    echo "  --metrics STRING       Metrics type: memory,prometheus"
+    echo "  --actions STRING       Actions: websocket,webhook (comma-separated)"
+    echo "  --middlewares STRING   Middlewares: auth,bodylimit,cache,compression,cors,logging,ratelimit,recovery (comma-separated)"
+    echo "  --test                 Include integration tests"
+    echo "  --cicd STRING          CI/CD type: none,github,gitlab"
+    echo "  --help                 Show this help message"
+    echo ""
+    echo "Templates:"
+    echo "  basic       - Minimal web server"
+    echo "  api         - REST API service with CRUD"
+    echo "  microservice- Microservice with actions"
+    echo "  full        - Full-featured service"
+    echo "  custom      - Custom configuration"
+    echo ""
+    echo "Examples:"
+    echo "  $0 --name \"Hello World\" --pkg \"github.com/user/hello\" --features \"auth,cache\" --middlewares \"auth,recovery,logging\""
+    echo "  $0  # Interactive mode"
+}
 
-    echo -e "${PURPLE}Available $prompt:${NC} ${options[*]}" >&2
-    local result
-
-    if [ -n "$default" ]; then
-        echo -ne "${YELLOW}Select $prompt [$default]: ${NC}" >&2
-    else
-        echo -ne "${YELLOW}Select $prompt: ${NC}" >&2
-    fi
-
-    read -r result
-
-    # Если пустой ввод, используем дефолтное значение
-    if [ -z "$result" ]; then
-        echo "$default"
-        return
-    fi
-
-    # Validate selection
-    for option in "${options[@]}"; do
-        if [ "$option" = "$result" ]; then
-            echo "$result"
-            return
-        fi
+# Функция для парсинга аргументов командной строки
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --name)
+                PROJECT_NAME="$2"
+                shift 2
+                ;;
+            --pkg)
+                PKG_NAME="$2"
+                shift 2
+                ;;
+            --features)
+                FEATURES="$2"
+                shift 2
+                ;;
+            --auth)
+                AUTH_TYPES="$2"
+                shift 2
+                ;;
+            --cache)
+                CACHE_TYPE="$2"
+                shift 2
+                ;;
+            --metrics)
+                METRICS_TYPE="$2"
+                shift 2
+                ;;
+            --actions)
+                ACTIONS="$2"
+                shift 2
+                ;;
+            --middlewares)
+                MIDDLEWARES="$2"
+                shift 2
+                ;;
+            --test)
+                INCLUDE_TESTS="true"
+                shift
+                ;;
+            --cicd)
+                CICD_TYPE="$2"
+                shift 2
+                ;;
+            --help)
+                show_help
+                exit 0
+                ;;
+            *)
+                print_error "Unknown option: $1"
+                show_help
+                exit 1
+                ;;
+        esac
     done
-
-    echo -e "${YELLOW}⚠ Invalid selection '$result', using default '$default'${NC}" >&2
-    echo "$default"
 }
 
-select_multiple_from_array() {
-    local prompt="$1"
-    shift
-    local options=("$@")
-
-    echo -e "${PURPLE}Available $prompt:${NC} ${options[*]}" >&2
-    echo -ne "${YELLOW}Enable $prompt (comma-separated): ${NC}" >&2
-
-    local result
-    read -r result
-
-    if [ -z "$result" ]; then
-        echo ""
-        return
-    fi
-
-    # Split by comma and validate
-    IFS=',' read -ra SELECTED <<< "$result"
-    local valid_selections=()
-
-    for selection in "${SELECTED[@]}"; do
-        selection=$(echo "$selection" | xargs) # trim whitespace
-        for option in "${options[@]}"; do
-            if [ "$option" = "$selection" ]; then
-                valid_selections+=("$selection")
-                break
-            fi
-        done
-    done
-
-    echo "${valid_selections[@]}"
-}
-
-# Validation functions
-validate_project_name() {
-    local name="$1"
-    # Проверяем, что имя не пустое и содержит только допустимые символы
-    if [[ -z "$name" ]]; then
-        print_error "Project name cannot be empty"
-        return 1
-    fi
-
-    # Проверяем, что имя начинается с буквы
-    if [[ ! "$name" =~ ^[a-zA-Z] ]]; then
-        print_error "Project name must start with a letter"
-        return 1
-    fi
-
-    # Проверяем, что имя содержит только буквы, цифры, дефисы и подчеркивания
-    if [[ ! "$name" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]]; then
-        print_error "Project name can only contain letters, numbers, hyphens, and underscores"
-        return 1
-    fi
-
-    return 0
-}
-
-validate_module_name() {
-    local name="$1"
-    if [[ -z "$name" ]]; then
-        print_error "Module name cannot be empty"
-        return 1
-    fi
-
-    # Более мягкая проверка для Go модулей
-    if [[ ! "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_./-]*[a-zA-Z0-9]$ ]] && [[ ! "$name" =~ ^[a-zA-Z0-9]$ ]]; then
-        print_error "Module name must be a valid Go module path (e.g., github.com/user/project or simple-name)"
-        return 1
-    fi
-
-    return 0
-}
-
-validate_port() {
-    local port="$1"
-    if [[ ! "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-        print_error "Port must be a number between 1 and 65535"
-        return 1
-    fi
-    return 0
-}
-
-# Configuration collection
-collect_configuration() {
-    echo -e "${BLUE}Let's configure your new service:${NC}\n"
+# Функция для интерактивного ввода
+interactive_mode() {
+    print_header "=== SAI Service Generator - Interactive Mode ==="
+    echo ""
 
     # Project name
-    while true; do
-        PROJECT_NAME=$(prompt_input "Enter project name" "")
-        if [ -n "$PROJECT_NAME" ] && validate_project_name "$PROJECT_NAME"; then
-            break
-        fi
-        if [ -z "$PROJECT_NAME" ]; then
-            print_error "Project name is required"
-        fi
+    read -p "Project name: " PROJECT_NAME
+    while [[ -z "$PROJECT_NAME" ]]; do
+        print_warning "Project name is required"
+        read -p "Project name: " PROJECT_NAME
     done
 
-    # Module name
-    while true; do
-        MODULE_NAME=$(prompt_input "Enter Go module name" "$PROJECT_NAME")
-        if validate_module_name "$MODULE_NAME"; then
-            break
-        fi
-    done
-
-    # Port
-    while true; do
-        PORT=$(prompt_input "Enter port number" "$DEFAULT_PORT")
-        if validate_port "$PORT"; then
-            break
-        fi
-    done
-
-    # Template
-    TEMPLATE=$(select_from_array "template" "$DEFAULT_TEMPLATE" "${TEMPLATES[@]}")
-
-    # Features
-    local features_str
-    features_str=$(select_multiple_from_array "features" "${FEATURES[@]}")
-    if [ -n "$features_str" ]; then
-        IFS=' ' read -ra SELECTED_FEATURES <<< "$features_str"
+    # Package name
+    local default_pkg=$(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/ /-/g')
+    read -p "Go pkg name [$default_pkg]: " PKG_NAME
+    if [[ -z "$PKG_NAME" ]]; then
+        PKG_NAME="$default_pkg"
     fi
 
-    # Cache type if cache is enabled
-    if [[ " ${SELECTED_FEATURES[*]} " == *" cache "* ]]; then
-        CACHE_TYPE=$(select_from_array "cache type" "$DEFAULT_CACHE_TYPE" "${CACHE_TYPES[@]}")
+    # Template selection
+    echo ""
+    print_info "Available templates: custom basic api microservice full"
+    read -p "Select template [custom]: " TEMPLATE
+    if [[ -z "$TEMPLATE" ]]; then
+        TEMPLATE="custom"
     fi
 
-    # Metrics type if metrics is enabled
-    if [[ " ${SELECTED_FEATURES[*]} " == *" metrics "* ]]; then
-        METRICS_TYPE=$(select_from_array "metrics type" "$DEFAULT_METRICS_TYPE" "${METRICS_TYPES[@]}")
-    fi
-
-    # Broker type if actions is enabled
-    if [[ " ${SELECTED_FEATURES[*]} " == *" actions "* ]]; then
-        BROKER_TYPE=$(select_from_array "broker type" "$DEFAULT_BROKER_TYPE" "${BROKER_TYPES[@]}")
-    fi
-
-    # Middlewares if middleware is enabled
-    if [[ " ${SELECTED_FEATURES[*]} " == *" middleware "* ]]; then
-        local middlewares_str
-        middlewares_str=$(select_multiple_from_array "middlewares" "${MIDDLEWARES[@]}")
-        if [ -n "$middlewares_str" ]; then
-            IFS=' ' read -ra SELECTED_MIDDLEWARES <<< "$middlewares_str"
-        fi
+    # Если выбран не custom, применяем предустановки
+    if [[ "$TEMPLATE" != "custom" ]]; then
+        apply_template_preset "$TEMPLATE"
+    else
+        configure_custom_template
     fi
 
     # Tests
-    INCLUDE_TESTS=$(prompt_yes_no "Include integration tests?" "n")
+    echo ""
+    read -p "Include integration tests? [y/N]: " test_choice
+    if [[ "$test_choice" =~ ^[Yy]$ ]]; then
+        INCLUDE_TESTS="true"
+    fi
 
     # CI/CD
-    CICD_TYPE=$(select_from_array "CI/CD" "none" "${CICD_TYPES[@]}")
+    echo ""
+    print_info "Available CI/CD: none github gitlab"
+    read -p "Generate CI/CD files [none]: " CICD_TYPE
+    if [[ -z "$CICD_TYPE" ]]; then
+        CICD_TYPE="none"
+    fi
 }
 
-# Configuration summary
-show_configuration() {
-    echo
-    echo -e "${CYAN}Configuration Summary:${NC}"
-    echo -e "${GREEN}   • Project:${NC} $PROJECT_NAME"
-    echo -e "${GREEN}   • Module:${NC} $MODULE_NAME"
-    echo -e "${GREEN}   • Port:${NC} $PORT"
-    echo -e "${GREEN}   • Template:${NC} $TEMPLATE"
+# Функция для применения предустановок шаблонов
+apply_template_preset() {
+    local template=$1
 
-    if [ ${#SELECTED_FEATURES[@]} -gt 0 ]; then
-        echo -e "${GREEN}   • Features:${NC} ${SELECTED_FEATURES[*]}"
-    fi
-
-    if [[ " ${SELECTED_FEATURES[*]} " == *" cache "* ]]; then
-        echo -e "${GREEN}   • Cache Type:${NC} $CACHE_TYPE"
-    fi
-
-    if [[ " ${SELECTED_FEATURES[*]} " == *" metrics "* ]]; then
-        echo -e "${GREEN}   • Metrics Type:${NC} $METRICS_TYPE"
-    fi
-
-    if [[ " ${SELECTED_FEATURES[*]} " == *" actions "* ]]; then
-        echo -e "${GREEN}   • Broker Type:${NC} $BROKER_TYPE"
-    fi
-
-    if [ ${#SELECTED_MIDDLEWARES[@]} -gt 0 ]; then
-        echo -e "${GREEN}   • Middlewares:${NC} ${SELECTED_MIDDLEWARES[*]}"
-    fi
-
-    echo -e "${GREEN}   • Tests:${NC} $INCLUDE_TESTS"
-    echo -e "${GREEN}   • CI/CD:${NC} $CICD_TYPE"
-    echo
+    case $template in
+        basic)
+            FEATURES="health,cache"
+            MIDDLEWARES="recovery,logging"
+            AUTH_TYPES=""
+            CACHE_TYPE="memory"
+            METRICS_TYPE=""
+            ACTIONS=""
+            ;;
+        api)
+            FEATURES="health,middlewares,docs,cache"
+            MIDDLEWARES="auth,cache,recovery,logging,cors,bodylimit"
+            AUTH_TYPES="token"
+            CACHE_TYPE="redis"
+            METRICS_TYPE=""
+            ACTIONS=""
+            ;;
+        microservice)
+            FEATURES="health,middlewares,docs,cache,client,actions"
+            MIDDLEWARES="auth,cache,recovery,logging,cors,bodylimit"
+            AUTH_TYPES="token"
+            CACHE_TYPE="redis"
+            METRICS_TYPE=""
+            ACTIONS="webhook"
+            ;;
+        full)
+            FEATURES="auth,cache,metrics,docs,cron,actions,tls,middlewares,health,client"
+            MIDDLEWARES="auth,bodylimit,cache,compression,cors,logging,ratelimit,recovery"
+            AUTH_TYPES="basic,token"
+            CACHE_TYPE="redis"
+            METRICS_TYPE="prometheus"
+            ACTIONS="websocket,webhook"
+            ;;
+    esac
 }
 
-# File generation functions
-generate_main_go() {
-    cat > "$PROJECT_NAME/cmd/main.go" << EOF
+# Функция для настройки custom шаблона
+configure_custom_template() {
+    echo ""
+    print_info "Available features: auth cache metrics docs cron actions tls middlewares health client"
+    read -p "Enable features (comma-separated): " FEATURES
+
+    # Настройка actions
+    if [[ "$FEATURES" == *"actions"* ]]; then
+        echo ""
+        read -p "Enable websocket actions? [y/N]: " websocket_choice
+        read -p "Enable webhooks actions? [y/N]: " webhook_choice
+
+        ACTIONS=""
+        if [[ "$websocket_choice" =~ ^[Yy]$ ]]; then
+            ACTIONS="websocket"
+        fi
+        if [[ "$webhook_choice" =~ ^[Yy]$ ]]; then
+            if [[ -n "$ACTIONS" ]]; then
+                ACTIONS="$ACTIONS,webhook"
+            else
+                ACTIONS="webhook"
+            fi
+        fi
+    fi
+
+    # Настройка auth
+    if [[ "$FEATURES" == *"auth"* ]]; then
+        echo ""
+        read -p "Enable basic auth support? [y/N]: " basic_choice
+        read -p "Enable token auth support? [y/N]: " token_choice
+
+        AUTH_TYPES=""
+        if [[ "$basic_choice" =~ ^[Yy]$ ]]; then
+            AUTH_TYPES="basic"
+        fi
+        if [[ "$token_choice" =~ ^[Yy]$ ]]; then
+            if [[ -n "$AUTH_TYPES" ]]; then
+                AUTH_TYPES="$AUTH_TYPES,token"
+            else
+                AUTH_TYPES="token"
+            fi
+        fi
+    fi
+
+    # Настройка cache
+    if [[ "$FEATURES" == *"cache"* ]]; then
+        echo ""
+        print_info "Available cache: memory redis"
+        read -p "Select cache type: " CACHE_TYPE
+    fi
+
+    # Настройка metrics
+    if [[ "$FEATURES" == *"metrics"* ]]; then
+        echo ""
+        print_info "Available metrics: memory prometheus"
+        read -p "Select metrics type: " METRICS_TYPE
+    fi
+
+    # Настройка middlewares
+    if [[ "$FEATURES" == *"middlewares"* ]]; then
+        echo ""
+        local available_mw="recovery,logging,ratelimit,bodylimit,cors"
+
+        # Добавляем доступные middleware в зависимости от выбранных фич
+        if [[ "$FEATURES" == *"cache"* ]]; then
+            available_mw="$available_mw,cache"
+        fi
+        if [[ "$FEATURES" == *"auth"* ]]; then
+            available_mw="$available_mw,auth"
+        fi
+
+        available_mw="$available_mw,compression"
+
+        print_info "Available middlewares: $available_mw"
+        read -p "Enable middlewares (comma-separated): " MIDDLEWARES
+    fi
+}
+
+# Функция для валидации конфигурации
+validate_configuration() {
+    echo ""
+    print_header "=== Configuration ==="
+    echo "   • Project: $PROJECT_NAME"
+    echo "   • Module: $PKG_NAME"
+    if [[ -n "$TEMPLATE" && "$TEMPLATE" != "custom" ]]; then
+        echo "   • Template: $TEMPLATE"
+    fi
+    if [[ -n "$FEATURES" ]]; then
+        echo "   • Features: $FEATURES"
+    fi
+    if [[ -n "$AUTH_TYPES" ]]; then
+        echo "   • Auth: $AUTH_TYPES"
+    fi
+    if [[ -n "$CACHE_TYPE" ]]; then
+        echo "   • Cache: $CACHE_TYPE"
+    fi
+    if [[ -n "$METRICS_TYPE" ]]; then
+        echo "   • Metrics: $METRICS_TYPE"
+    fi
+    if [[ -n "$ACTIONS" ]]; then
+        echo "   • Actions: $ACTIONS"
+    fi
+    if [[ -n "$MIDDLEWARES" ]]; then
+        echo "   • Middlewares: $MIDDLEWARES"
+    fi
+    echo "   • Tests: $INCLUDE_TESTS"
+    echo "   • CI/CD: $CICD_TYPE"
+    echo ""
+
+    read -p "Proceed with generation? [Y/n]: " confirm
+    if [[ "$confirm" =~ ^[Nn]$ ]]; then
+        if [[ -n "$TEMPLATE" && "$TEMPLATE" != "custom" ]]; then
+            print_info "Returning to template selection..."
+            interactive_mode
+            return
+        else
+            print_info "Returning to feature configuration..."
+            configure_custom_template
+            validate_configuration
+            return
+        fi
+    fi
+}
+
+# Функция создания директории проекта
+create_project_structure() {
+    local project_dir=$(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/ /-/g')
+
+    print_info "Creating project structure in: $project_dir"
+
+    mkdir -p "$project_dir"/{cmd,internal,scripts,types}
+
+    cd "$project_dir"
+}
+
+# Функция создания go.mod
+create_go_mod() {
+    print_info "Creating go.mod..."
+
+    cat > go.mod << EOF
+module ${PKG_NAME}
+
+go 1.21
+EOF
+}
+
+# Функция создания main.go
+create_main_go() {
+    print_info "Creating cmd/main.go..."
+
+    cat > cmd/main.go << EOF
 package main
 
 import (
 	"context"
 	"log"
 
+	"github.com/saiset-co/sai-service/sai"
 	"github.com/saiset-co/sai-service/service"
-	"$MODULE_NAME/internal"
+	"${PKG_NAME}/internal"
 )
 
 func main() {
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// Initialize service
-	srv, err := service.NewService(ctx, "config.yml")
+	srv, err := service.NewService(ctx, "./config.yaml")
 	if err != nil {
 		log.Fatalf("Failed to create service: %v", err)
 	}
 
-	// Register business logic
-	if err := internal.RegisterBusinessLogic(); err != nil {
-		log.Fatalf("Failed to register business logic: %v", err)
+	// Инициализация бизнес-логики
+	businessService := internal.NewBusinessService(ctx)
+	if err := businessService.Initialize(); err != nil {
+		log.Fatalf("Failed to initialize business service: %v", err)
 	}
 
-	// Start service
-	if err := srv.Start(); err != nil {
-		log.Fatalf("Failed to start service: %v", err)
+	if err = srv.Start(); err != nil {
+		sai.Logger().Error("Failed to start service")
+		cancel()
+		return
 	}
 
-	// Wait for shutdown (handled by library)
-	<-srv.Done()
-	log.Println("Service stopped gracefully")
+	cancel()
 }
 EOF
 }
 
-generate_service_go() {
-    local middleware_routes=""
+# Функция создания handlers.go
+create_handlers() {
+    print_info "Creating internal/handlers.go..."
 
-    if [[ " ${SELECTED_FEATURES[*]} " == *" middleware "* ]]; then
-        if [[ " ${SELECTED_MIDDLEWARES[*]} " == *" auth "* ]]; then
-            middleware_routes=".
-		WithMiddlewares(\"auth\")"
-        fi
-        if [[ " ${SELECTED_MIDDLEWARES[*]} " == *" cache "* ]]; then
-            middleware_routes="${middleware_routes}.
-		WithCache(\"user_list\", 5*time.Minute)"
-        fi
+    if [[ "$TEMPLATE" == "api" ]]; then
+        create_api_handlers
+    else
+        create_basic_handlers
+    fi
+}
+
+# Функция создания basic handlers
+create_basic_handlers() {
+    local handlers_content='package internal
+
+import ('
+
+    # Добавляем импорт time если включен cache
+    if [[ "$FEATURES" == *"cache"* ]]; then
+        handlers_content+='
+	"time"'
     fi
 
-    cat > "$PROJECT_NAME/internal/service.go" << EOF
+    handlers_content+='
+
+	"go.uber.org/zap"
+
+	"github.com/saiset-co/sai-service/sai"
+	"github.com/saiset-co/sai-service/types"
+)
+
+// RegisterRoutes регистрирует все роуты приложения
+func RegisterRoutes() {
+	// Группа API v1
+	api := sai.Router().Group("/api/v1")'
+
+    # Добавляем cache если включен
+    if [[ "$FEATURES" == *"cache"* ]]; then
+        handlers_content+='.
+		WithCache("api_cache", time.Hour)'
+    fi
+
+    handlers_content+='
+
+	// Базовый роут
+	api.GET("/hello", handleHello)
+}
+
+// handleHello базовый тестовый handler
+func handleHello(ctx *types.RequestCtx) {
+	response := map[string]interface{}{
+		"message": "Hello from '"${PROJECT_NAME}"'!",
+		"status":  "ok",
+	}
+
+	_, err := ctx.SuccessJSON(response)
+	if err != nil {
+		sai.Logger().Error("Failed to write response", zap.Error(err))
+	}
+}'
+
+    echo "$handlers_content" > internal/handlers.go
+}
+
+# Функция создания API handlers с CRUD
+create_api_handlers() {
+    local handlers_content='package internal
+
+import (
+	"fmt"'
+
+    # Добавляем импорт time если включен cache
+    if [[ "$FEATURES" == *"cache"* ]]; then
+        handlers_content+='
+	"time"'
+    fi
+
+    handlers_content+='
+
+	"go.uber.org/zap"
+
+	"github.com/saiset-co/sai-service/sai"
+	"github.com/saiset-co/sai-service/types"
+	projectTypes "'${PKG_NAME}'/types"
+)
+
+// RegisterRoutes регистрирует все роуты приложения
+func RegisterRoutes() {
+	// Группа API v1
+	api := sai.Router().Group("/api/v1")'
+
+    # Добавляем cache если включен
+    if [[ "$FEATURES" == *"cache"* ]]; then
+        handlers_content+='.
+		WithCache("api_cache", time.Hour)'
+    fi
+
+    handlers_content+='
+
+	// CRUD группа
+	crud := api.Group("/documents")
+
+	// CRUD endpoints'
+
+    # Добавляем docs если включен
+    if [[ "$FEATURES" == *"docs"* ]]; then
+        handlers_content+='
+	crud.POST("/", handleCreate).
+		WithDoc("Create", "Create multiple documents in a collection", "documents", &projectTypes.CreateRequest{}, &projectTypes.CreateResponse{})
+	crud.GET("/", handleRead).
+		WithDoc("Read", "Get documents with filtering and pagination. Add ?count=1 to include total count", "documents", &projectTypes.ReadRequest{}, &projectTypes.ReadResponse{})
+	crud.PUT("/", handleUpdate).
+		WithDoc("Update", "Update multiple documents by filter", "documents", &projectTypes.UpdateRequest{}, &projectTypes.UpdateResponse{})
+	crud.DELETE("/", handleDelete).
+		WithDoc("Delete", "Delete multiple documents by filter", "documents", &projectTypes.DeleteRequest{}, &projectTypes.DeleteResponse{})'
+    else
+        handlers_content+='
+	crud.POST("/", handleCreate)
+	crud.GET("/", handleRead)
+	crud.PUT("/", handleUpdate)
+	crud.DELETE("/", handleDelete)'
+    fi
+
+    handlers_content+='
+
+	// Базовый роут
+	api.GET("/hello", handleHello)
+}
+
+// handleCreate создает новые документы
+func handleCreate(ctx *types.RequestCtx) {
+	var req projectTypes.CreateRequest
+	if err := ctx.Read(&req); err != nil {
+		ctx.Error(err, 400)
+		return
+	}
+
+	// Здесь должна быть бизнес-логика создания
+	response := &projectTypes.CreateResponse{
+		Success: true,
+		Created: len(req.Documents),
+		IDs:     generateIDs(len(req.Documents)),
+	}
+
+	_, err := ctx.SuccessJSON(response)
+	if err != nil {
+		sai.Logger().Error("Failed to write response", zap.Error(err))
+	}
+}
+
+// handleRead читает документы с фильтрацией и пагинацией
+func handleRead(ctx *types.RequestCtx) {
+	var req projectTypes.ReadRequest
+	// Здесь должно быть чтение параметров из query string
+
+	// Пример данных
+	documents := []map[string]interface{}{
+		{"id": "1", "name": "Document 1", "content": "Sample content 1"},
+		{"id": "2", "name": "Document 2", "content": "Sample content 2"},
+	}
+
+	response := &projectTypes.ReadResponse{
+		Success:   true,
+		Documents: documents,
+		Total:     len(documents),
+		Page:      req.Page,
+		Limit:     req.Limit,
+	}
+
+	_, err := ctx.SuccessJSON(response)
+	if err != nil {
+		sai.Logger().Error("Failed to write response", zap.Error(err))
+	}
+}
+
+// handleUpdate обновляет документы по фильтру
+func handleUpdate(ctx *types.RequestCtx) {
+	var req projectTypes.UpdateRequest
+	if err := ctx.Read(&req); err != nil {
+		ctx.Error(err, 400)
+		return
+	}
+
+	// Здесь должна быть бизнес-логику обновления
+	response := &projectTypes.UpdateResponse{
+		Success: true,
+		Updated: 1, // Пример
+	}
+
+	_, err := ctx.SuccessJSON(response)
+	if err != nil {
+		sai.Logger().Error("Failed to write response", zap.Error(err))
+	}
+}
+
+// handleDelete удаляет документы по фильтру
+func handleDelete(ctx *types.RequestCtx) {
+	var req projectTypes.DeleteRequest
+	if err := ctx.Read(&req); err != nil {
+		ctx.Error(err, 400)
+		return
+	}
+
+	// Здесь должна быть бизнес-логика удаления
+	response := &projectTypes.DeleteResponse{
+		Success: true,
+		Deleted: 1, // Пример
+	}
+
+	_, err := ctx.SuccessJSON(response)
+	if err != nil {
+		sai.Logger().Error("Failed to write response", zap.Error(err))
+	}
+}
+
+// handleHello базовый тестовый handler
+func handleHello(ctx *types.RequestCtx) {
+	response := map[string]interface{}{
+		"message": "Hello from '"${PROJECT_NAME}"'!",
+		"status":  "ok",
+	}
+
+	_, err := ctx.SuccessJSON(response)
+	if err != nil {
+		sai.Logger().Error("Failed to write response", zap.Error(err))
+	}
+}
+
+// generateIDs генерирует примеры ID для созданных документов
+func generateIDs(count int) []string {
+	ids := make([]string, count)
+	for i := 0; i < count; i++ {
+		ids[i] = fmt.Sprintf("doc_%d_%d", time.Now().Unix(), i)
+	}
+	return ids
+}'
+
+    echo "$handlers_content" > internal/handlers.go
+}
+
+# Функция создания service.go
+create_service() {
+    print_info "Creating internal/service.go..."
+
+    cat > internal/service.go << 'EOF'
 package internal
 
 import (
+	"context"
+
 	"github.com/saiset-co/sai-service/sai"
-	"$MODULE_NAME/internal/handlers"
 )
 
-func RegisterBusinessLogic() error {
-	router := sai.Router()
+// BusinessService представляет основную бизнес-логику сервиса
+type BusinessService struct {
+	ctx context.Context
+}
 
-	// Health check endpoint
-	router.GET("/health", handlers.HealthHandler).
-		WithDoc("Health Check", "Check service health", "system", nil, nil)
+// NewBusinessService создает новый экземпляр бизнес-сервиса
+func NewBusinessService(ctx context.Context) *BusinessService {
+	return &BusinessService{
+		ctx: ctx,
+	}
+}
 
-	// API routes
-	api := router.Group("/api/v1")
+// Initialize инициализирует бизнес-логику
+func (s *BusinessService) Initialize() error {
+	// Регистрируем роуты
+	RegisterRoutes()
 
-	// Users endpoints
-	api.GET("/users", handlers.GetUsers)${middleware_routes}.
-		WithDoc("List Users", "Get list of all users", "users", nil, handlers.UserListResponse{})
-
-	api.GET("/users/{id}", handlers.GetUser).
-		WithDoc("Get User", "Get user by ID", "users", nil, handlers.UserResponse{})
-
-	api.POST("/users", handlers.CreateUser).
-		WithDoc("Create User", "Create a new user", "users", handlers.CreateUserRequest{}, handlers.UserResponse{})
-
-	api.PUT("/users/{id}", handlers.UpdateUser).
-		WithDoc("Update User", "Update existing user", "users", handlers.UpdateUserRequest{}, handlers.UserResponse{})
-
-	api.DELETE("/users/{id}", handlers.DeleteUser).
-		WithDoc("Delete User", "Delete user by ID", "users", nil, nil)
+	// Здесь можно добавить дополнительную инициализацию
+	sai.Logger().Info("Business service initialized")
 
 	return nil
 }
 EOF
 }
 
-generate_handlers_go() {
-    cat > "$PROJECT_NAME/internal/handlers/handlers.go" << EOF
-package handlers
+# Функция создания types.go
+create_types() {
+    print_info "Creating types/types.go..."
 
-import (
-	"encoding/json"
-	"strconv"
-	"sync"
-	"time"
-
-	"github.com/valyala/fasthttp"
-	"github.com/saiset-co/sai-service/types"
-	"$MODULE_NAME/internal/models"
-)
-
-// In-memory storage for demo purposes
-var (
-	users = make(map[int]*models.User)
-	nextID = 1
-	usersMu sync.RWMutex
-)
-
-// Request/Response models
-type CreateUserRequest struct {
-	Name  string \`json:"name" validate:"required,min=2,max=50"\`
-	Email string \`json:"email" validate:"required,email"\`
-	Age   int    \`json:"age" validate:"min=1,max=120"\`
+    if [[ "$TEMPLATE" == "api" ]]; then
+        create_api_types
+    fi
 }
 
-type UpdateUserRequest struct {
-	Name  *string \`json:"name,omitempty" validate:"omitempty,min=2,max=50"\`
-	Email *string \`json:"email,omitempty" validate:"omitempty,email"\`
-	Age   *int    \`json:"age,omitempty" validate:"omitempty,min=1,max=120"\`
+# Функция создания API types с CRUD структурами
+create_api_types() {
+    cat > types/types.go << 'EOF'
+package types
+
+// Общие структуры и интерфейсы проекта
+
+// CRUD типы для API
+
+// CreateRequest запрос на создание документов
+type CreateRequest struct {
+	Documents []map[string]interface{} `json:"documents" validate:"required,min=1"`
 }
 
-type UserResponse struct {
-	Success bool         \`json:"success"\`
-	Data    *models.User \`json:"data,omitempty"\`
-	Error   string       \`json:"error,omitempty"\`
+// CreateResponse ответ на создание документов
+type CreateResponse struct {
+	Success bool     `json:"success"`
+	Created int      `json:"created"`
+	IDs     []string `json:"ids"`
 }
 
-type UserListResponse struct {
-	Success bool           \`json:"success"\`
-	Data    []*models.User \`json:"data,omitempty"\`
-	Total   int            \`json:"total"\`
-	Error   string         \`json:"error,omitempty"\`
+// ReadRequest запрос на чтение документов
+type ReadRequest struct {
+	Filter map[string]interface{} `json:"filter,omitempty"`
+	Page   int                    `json:"page,omitempty"`
+	Limit  int                    `json:"limit,omitempty"`
+	Count  bool                   `json:"count,omitempty"`
 }
 
-// Initialize with sample data
-func init() {
-	users[1] = &models.User{
-		ID:        1,
-		Name:      "John Doe",
-		Email:     "john@example.com",
-		Age:       30,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}
-	users[2] = &models.User{
-		ID:        2,
-		Name:      "Jane Smith",
-		Email:     "jane@example.com",
-		Age:       25,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}
-	nextID = 3
+// ReadResponse ответ на чтение документов
+type ReadResponse struct {
+	Success   bool                     `json:"success"`
+	Documents []map[string]interface{} `json:"documents"`
+	Total     int                      `json:"total,omitempty"`
+	Page      int                      `json:"page,omitempty"`
+	Limit     int                      `json:"limit,omitempty"`
 }
 
-func HealthHandler(ctx *types.RequestCtx) {
-	response := map[string]interface{}{
-		"status":    "healthy",
-		"timestamp": time.Now(),
-		"service":   "$PROJECT_NAME",
-	}
-
-	ctx.SetContentType("application/json")
-	ctx.SetStatusCode(fasthttp.StatusOK)
-	json.NewEncoder(ctx).Encode(response)
+// UpdateRequest запрос на обновление документов
+type UpdateRequest struct {
+	Filter map[string]interface{} `json:"filter" validate:"required"`
+	Update map[string]interface{} `json:"update" validate:"required"`
 }
 
-func GetUsers(ctx *types.RequestCtx) {
-	usersMu.RLock()
-	defer usersMu.RUnlock()
-
-	userList := make([]*models.User, 0, len(users))
-	for _, user := range users {
-		userList = append(userList, user)
-	}
-
-	response := UserListResponse{
-		Success: true,
-		Data:    userList,
-		Total:   len(userList),
-	}
-
-	ctx.WriteJSON(response)
+// UpdateResponse ответ на обновление документов
+type UpdateResponse struct {
+	Success bool `json:"success"`
+	Updated int  `json:"updated"`
 }
 
-func GetUser(ctx *types.RequestCtx) {
-	idParam := ctx.UserValue("id")
-	if idParam == nil {
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		ctx.WriteJSON(UserResponse{
-			Success: false,
-			Error:   "User ID is required",
-		})
-		return
-	}
-
-	idStr, ok := idParam.(string)
-	if !ok {
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		ctx.WriteJSON(UserResponse{
-			Success: false,
-			Error:   "Invalid user ID format",
-		})
-		return
-	}
-
-	id, err := strconv.Atoi(idStr)
-	if err != nil {
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		ctx.WriteJSON(UserResponse{
-			Success: false,
-			Error:   "Invalid user ID",
-		})
-		return
-	}
-
-	usersMu.RLock()
-	user, exists := users[id]
-	usersMu.RUnlock()
-
-	if !exists {
-		ctx.SetStatusCode(fasthttp.StatusNotFound)
-		ctx.WriteJSON(UserResponse{
-			Success: false,
-			Error:   "User not found",
-		})
-		return
-	}
-
-	ctx.WriteJSON(UserResponse{
-		Success: true,
-		Data:    user,
-	})
+// DeleteRequest запрос на удаление документов
+type DeleteRequest struct {
+	Filter map[string]interface{} `json:"filter" validate:"required"`
 }
 
-func CreateUser(ctx *types.RequestCtx) {
-	var req CreateUserRequest
-	if err := ctx.ReadJSON(&req); err != nil {
-		return // ReadJSON already sets error response
-	}
-
-	// Validate required fields
-	if req.Name == "" {
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		ctx.WriteJSON(UserResponse{
-			Success: false,
-			Error:   "Name is required",
-		})
-		return
-	}
-
-	if req.Email == "" {
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		ctx.WriteJSON(UserResponse{
-			Success: false,
-			Error:   "Email is required",
-		})
-		return
-	}
-
-	if req.Age <= 0 {
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		ctx.WriteJSON(UserResponse{
-			Success: false,
-			Error:   "Age must be positive",
-		})
-		return
-	}
-
-	usersMu.Lock()
-	defer usersMu.Unlock()
-
-	user := &models.User{
-		ID:        nextID,
-		Name:      req.Name,
-		Email:     req.Email,
-		Age:       req.Age,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}
-
-	users[nextID] = user
-	nextID++
-
-	ctx.SetStatusCode(fasthttp.StatusCreated)
-	ctx.WriteJSON(UserResponse{
-		Success: true,
-		Data:    user,
-	})
-}
-
-func UpdateUser(ctx *types.RequestCtx) {
-	idParam := ctx.UserValue("id")
-	if idParam == nil {
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		ctx.WriteJSON(UserResponse{
-			Success: false,
-			Error:   "User ID is required",
-		})
-		return
-	}
-
-	idStr, ok := idParam.(string)
-	if !ok {
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		ctx.WriteJSON(UserResponse{
-			Success: false,
-			Error:   "Invalid user ID format",
-		})
-		return
-	}
-
-	id, err := strconv.Atoi(idStr)
-	if err != nil {
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		ctx.WriteJSON(UserResponse{
-			Success: false,
-			Error:   "Invalid user ID",
-		})
-		return
-	}
-
-	var req UpdateUserRequest
-	if err := ctx.ReadJSON(&req); err != nil {
-		return // ReadJSON already sets error response
-	}
-
-	usersMu.Lock()
-	defer usersMu.Unlock()
-
-	user, exists := users[id]
-	if !exists {
-		ctx.SetStatusCode(fasthttp.StatusNotFound)
-		ctx.WriteJSON(UserResponse{
-			Success: false,
-			Error:   "User not found",
-		})
-		return
-	}
-
-	// Update fields if provided
-	if req.Name != nil {
-		user.Name = *req.Name
-	}
-	if req.Email != nil {
-		user.Email = *req.Email
-	}
-	if req.Age != nil {
-		user.Age = *req.Age
-	}
-	user.UpdatedAt = time.Now()
-
-	ctx.WriteJSON(UserResponse{
-		Success: true,
-		Data:    user,
-	})
-}
-
-func DeleteUser(ctx *types.RequestCtx) {
-	idParam := ctx.UserValue("id")
-	if idParam == nil {
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		ctx.WriteJSON(UserResponse{
-			Success: false,
-			Error:   "User ID is required",
-		})
-		return
-	}
-
-	idStr, ok := idParam.(string)
-	if !ok {
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		ctx.WriteJSON(UserResponse{
-			Success: false,
-			Error:   "Invalid user ID format",
-		})
-		return
-	}
-
-	id, err := strconv.Atoi(idStr)
-	if err != nil {
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		ctx.WriteJSON(UserResponse{
-			Success: false,
-			Error:   "Invalid user ID",
-		})
-		return
-	}
-
-	usersMu.Lock()
-	defer usersMu.Unlock()
-
-	_, exists := users[id]
-	if !exists {
-		ctx.SetStatusCode(fasthttp.StatusNotFound)
-		ctx.WriteJSON(UserResponse{
-			Success: false,
-			Error:   "User not found",
-		})
-		return
-	}
-
-	delete(users, id)
-
-	ctx.SetStatusCode(fasthttp.StatusNoContent)
+// DeleteResponse ответ на удаление документов
+type DeleteResponse struct {
+	Success bool `json:"success"`
+	Deleted int  `json:"deleted"`
 }
 EOF
 }
 
-generate_models_go() {
-    cat > "$PROJECT_NAME/internal/models/model.go" << EOF
-package models
+# Функция создания конфигурации
+create_config() {
+    print_info "Creating config.template.yml..."
 
-import (
-	"time"
-)
-
-// User represents a user entity
-type User struct {
-	ID        int       \`json:"id" db:"id"\`
-	Name      string    \`json:"name" db:"name" validate:"required,min=2,max=50"\`
-	Email     string    \`json:"email" db:"email" validate:"required,email"\`
-	Age       int       \`json:"age" db:"age" validate:"min=1,max=120"\`
-	CreatedAt time.Time \`json:"created_at" db:"created_at"\`
-	UpdatedAt time.Time \`json:"updated_at" db:"updated_at"\`
-}
-
-// Validate performs validation on the User model
-func (u *User) Validate() error {
-	// Custom validation logic can be added here
-	return nil
-}
-
-// TableName returns the database table name for the User model
-func (u *User) TableName() string {
-	return "users"
-}
-EOF
-}
-
-generate_config_yml() {
-    local cache_config=""
-    local metrics_config=""
-    local actions_config=""
-    local middleware_config=""
-
-    # Cache configuration
-    if [[ " ${SELECTED_FEATURES[*]} " == *" cache "* ]]; then
-        if [ "$CACHE_TYPE" = "redis" ]; then
-            cache_config="cache:
-  enabled: true
-  type: redis
-  default_ttl: 1h
-  config:
-    host: localhost
-    port: 6379
-    password: \"\"
-    db: 0
-    pool_size: 10"
-        else
-            cache_config="cache:
-  enabled: true
-  type: memory
-  default_ttl: 1h"
-        fi
-    else
-        cache_config="cache:
-  enabled: false"
-    fi
-
-    # Metrics configuration
-    if [[ " ${SELECTED_FEATURES[*]} " == *" metrics "* ]]; then
-        if [ "$METRICS_TYPE" = "prometheus" ]; then
-            metrics_config="metrics:
-  enabled: true
-  type: prometheus
-  http:
-    enabled: true
-    path: /metrics
-    port: 9090
-  collectors:
-    system: true
-    runtime: true
-    http: true"
-        else
-            metrics_config="metrics:
-  enabled: true
-  type: memory
-  collectors:
-    system: true
-    runtime: true
-    http: true"
-        fi
-    else
-        metrics_config="metrics:
-  enabled: false"
-    fi
-
-    # Actions configuration
-    if [[ " ${SELECTED_FEATURES[*]} " == *" actions "* ]]; then
-        actions_config="actions:
-  enabled: true
-  broker:
-    enabled: true
-    type: $BROKER_TYPE
-  webhooks:
-    enabled: true"
-    else
-        actions_config="actions:
-  enabled: false"
-    fi
-
-    # Middleware configuration
-    if [[ " ${SELECTED_FEATURES[*]} " == *" middleware "* ]]; then
-        middleware_config="middlewares:
-  enabled: true"
-
-        for middleware in "${SELECTED_MIDDLEWARES[@]}"; do
-            case "$middleware" in
-                "auth")
-                    middleware_config="${middleware_config}
-  auth:
-    enabled: true
-    weight: 60
-    params:
-      token: \"your-secret-token\""
-                    ;;
-                "cache")
-                    middleware_config="${middleware_config}
-  cache:
-    enabled: true
-    weight: 80
-    params:
-      default_ttl: 5m"
-                    ;;
-                "recovery")
-                    middleware_config="${middleware_config}
-  recovery:
-    enabled: true
-    weight: 10
-    params:
-      stack_trace: true"
-                    ;;
-                "logging")
-                    middleware_config="${middleware_config}
-  logging:
-    enabled: true
-    weight: 20
-    params:
-      log_level: info
-      log_headers: false
-      log_body: false"
-                    ;;
-                "ratelimit")
-                    middleware_config="${middleware_config}
-  rate_limit:
-    enabled: true
-    weight: 30
-    params:
-      requests_per_minute: 100"
-                    ;;
-                "bodylimit")
-                    middleware_config="${middleware_config}
-  body_limit:
-    enabled: true
-    weight: 40
-    params:
-      max_body_size: 10485760"
-                    ;;
-                "cors")
-                    middleware_config="${middleware_config}
-  cors:
-    enabled: true
-    weight: 50
-    params:
-      allowed_origins: [\"*\"]
-      allowed_methods: [\"GET\", \"POST\", \"PUT\", \"DELETE\", \"OPTIONS\"]
-      allowed_headers: [\"Content-Type\", \"Authorization\", \"X-API-Key\"]
-      max_age: 86400"
-                    ;;
-                "compression")
-                    middleware_config="${middleware_config}
-  compression:
-    enabled: true
-    weight: 70
-    params:
-      algorithm: gzip
-      level: 6
-      threshold: 1024"
-                    ;;
-            esac
-        done
-    else
-        middleware_config="middlewares:
-  enabled: false"
-    fi
-
-    # Generate the config file
-    cat > "$PROJECT_NAME/config.yml" << EOF
-name: $PROJECT_NAME
-version: 1.0.0
+    local config_content='name: "${SERVICE_NAME}"
+version: "${SERVICE_VERSION}"
 
 server:
   http:
-    host: 0.0.0.0
-    port: $PORT
-    read_timeout: 30
-    write_timeout: 30
-    idle_timeout: 120
+    host: "${SERVER_HOST}"
+    port: ${SERVER_PORT}
+    read_timeout: ${SERVER_READ_TIMEOUT}
+    write_timeout: ${SERVER_WRITE_TIMEOUT}
+    idle_timeout: ${SERVER_IDLE_TIMEOUT}'
+
+    # TLS конфигурация
+    if [[ "$FEATURES" == *"tls"* ]]; then
+        config_content+='
   tls:
-    enabled: false
+    enabled: ${TLS_ENABLED}
+    auto_cert: ${TLS_AUTO_CERT}
+    domains: [${TLS_DOMAINS}]
+    email: "${TLS_EMAIL}"
+    cache_dir: "${TLS_CACHE_DIR}"'
+    fi
+
+    # Logger всегда включен
+    config_content+='
 
 logger:
-  level: info
-  type: default
-  config:
-    format: console
-    output: stdout
+  level: "${LOGGER_LEVEL}"
+  type: "${LOGGER_TYPE}"'
 
-$cache_config
+    # Auth providers
+    if [[ -n "$AUTH_TYPES" ]]; then
+        config_content+='
 
-$actions_config
-
-cron:
-  enabled: $([ "${SELECTED_FEATURES[*]}" == *"cron"* ] && echo "true" || echo "false")
-  timezone: UTC
-
-auth_providers:
+auth_providers:'
+        if [[ "$AUTH_TYPES" == *"token"* ]]; then
+            config_content+='
   token:
     params:
-      token: "your-secret-token"
+      token: "${AUTH_TOKEN}"'
+        fi
+        if [[ "$AUTH_TYPES" == *"basic"* ]]; then
+            config_content+='
   basic:
     params:
-      username: "admin"
-      password: "admin"
+      username: "${AUTH_USERNAME}"
+      password: "${AUTH_PASSWORD}"'
+        fi
+    fi
 
-$middleware_config
+    # Cache конфигурация
+    if [[ "$FEATURES" == *"cache"* ]]; then
+        config_content+='
+
+cache:
+  enabled: ${CACHE_ENABLED}
+  type: "${CACHE_TYPE}"
+  default_ttl: "${CACHE_DEFAULT_TTL}"'
+
+        if [[ "$CACHE_TYPE" == "redis" ]]; then
+            config_content+='
+  config:
+    host: "${REDIS_HOST}"
+    port: "${REDIS_PORT}"
+    password: "${REDIS_PASSWORD}"
+    db: ${REDIS_DB}'
+        fi
+    fi
+
+    # Metrics конфигурация
+    if [[ "$FEATURES" == *"metrics"* ]]; then
+        config_content+='
+
+metrics:
+  enabled: ${METRICS_ENABLED}
+  type: "${METRICS_TYPE}"
+  http:
+    enabled: ${METRICS_HTTP_ENABLED}
+    path: "${METRICS_HTTP_PATH}"
+    port: ${METRICS_HTTP_PORT}'
+
+        if [[ "$METRICS_TYPE" == "prometheus" ]]; then
+            config_content+='
+  collectors:
+    system: ${METRICS_COLLECTORS_SYSTEM}
+    runtime: ${METRICS_COLLECTORS_RUNTIME}
+    http: ${METRICS_COLLECTORS_HTTP}'
+        fi
+    fi
+
+    # Actions конфигурация
+    if [[ "$FEATURES" == *"actions"* ]]; then
+        config_content+='
+
+actions:
+  enabled: ${ACTIONS_ENABLED}'
+
+        if [[ "$ACTIONS" == *"websocket"* ]]; then
+            config_content+='
+  broker:
+    enabled: ${ACTIONS_BROKER_ENABLED}
+    type: "${ACTIONS_BROKER_TYPE}"
+    config:
+      path: "${ACTIONS_BROKER_PATH}"'
+        fi
+
+        if [[ "$ACTIONS" == *"webhook"* ]]; then
+            config_content+='
+  webhooks:
+    enabled: ${ACTIONS_WEBHOOKS_ENABLED}'
+        fi
+    fi
+
+    # Cron конфигурация
+    if [[ "$FEATURES" == *"cron"* ]]; then
+        config_content+='
+
+cron:
+  enabled: ${CRON_ENABLED}
+  timezone: "${CRON_TIMEZONE}"'
+    fi
+
+    # Middlewares конфигурация
+    if [[ "$FEATURES" == *"middlewares"* && -n "$MIDDLEWARES" ]]; then
+        config_content+='
+
+middlewares:
+  enabled: ${MIDDLEWARES_ENABLED}'
+
+        IFS=',' read -ra MW_ARRAY <<< "$MIDDLEWARES"
+        for mw in "${MW_ARRAY[@]}"; do
+            mw=$(echo "$mw" | xargs) # trim whitespace
+            case $mw in
+                recovery)
+                    config_content+='
+  recovery:
+    enabled: ${MIDDLEWARE_RECOVERY_ENABLED}
+    weight: ${MIDDLEWARE_RECOVERY_WEIGHT}
+    params:
+      stack_trace: ${MIDDLEWARE_RECOVERY_STACK_TRACE}'
+                    ;;
+                logging)
+                    config_content+='
+  logging:
+    enabled: ${MIDDLEWARE_LOGGING_ENABLED}
+    weight: ${MIDDLEWARE_LOGGING_WEIGHT}
+    params:
+      log_level: "${MIDDLEWARE_LOGGING_LEVEL}"
+      log_headers: ${MIDDLEWARE_LOGGING_HEADERS}
+      log_body: ${MIDDLEWARE_LOGGING_BODY}'
+                    ;;
+                ratelimit)
+                    config_content+='
+  rate_limit:
+    enabled: ${MIDDLEWARE_RATELIMIT_ENABLED}
+    weight: ${MIDDLEWARE_RATELIMIT_WEIGHT}
+    params:
+      requests_per_minute: ${MIDDLEWARE_RATELIMIT_RPM}'
+                    ;;
+                bodylimit|bodyimit)
+                    config_content+='
+  body_limit:
+    enabled: ${MIDDLEWARE_BODYLIMIT_ENABLED}
+    weight: ${MIDDLEWARE_BODYLIMIT_WEIGHT}
+    params:
+      max_body_size: ${MIDDLEWARE_BODYLIMIT_SIZE}'
+                    ;;
+                cors)
+                    config_content+='
+  cors:
+    enabled: ${MIDDLEWARE_CORS_ENABLED}
+    weight: ${MIDDLEWARE_CORS_WEIGHT}
+    params:
+      allowed_origins: ["${MIDDLEWARE_CORS_ORIGINS}"]
+      allowed_methods: ["${MIDDLEWARE_CORS_METHODS}"]
+      allowed_headers: ["${MIDDLEWARE_CORS_HEADERS}"]
+      max_age: ${MIDDLEWARE_CORS_MAX_AGE}'
+                    ;;
+                auth)
+                    config_content+='
+  auth:
+    enabled: ${MIDDLEWARE_AUTH_ENABLED}
+    weight: ${MIDDLEWARE_AUTH_WEIGHT}
+    params:
+      token: "${AUTH_TOKEN}"'
+                    ;;
+                compression|compresion)
+                    config_content+='
+  compression:
+    enabled: ${MIDDLEWARE_COMPRESSION_ENABLED}
+    weight: ${MIDDLEWARE_COMPRESSION_WEIGHT}
+    params:
+      algorithm: "${MIDDLEWARE_COMPRESSION_ALGORITHM}"
+      level: ${MIDDLEWARE_COMPRESSION_LEVEL}
+      threshold: ${MIDDLEWARE_COMPRESSION_THRESHOLD}'
+                    ;;
+                cache)
+                    config_content+='
+  cache:
+    enabled: ${MIDDLEWARE_CACHE_ENABLED}
+    weight: ${MIDDLEWARE_CACHE_WEIGHT}
+    params:
+      default_ttl: "${MIDDLEWARE_CACHE_TTL}"'
+                    ;;
+            esac
+        done
+    fi
+
+    # Docs конфигурация
+    if [[ "$FEATURES" == *"docs"* ]]; then
+        config_content+='
 
 docs:
-  enabled: $([ "${SELECTED_FEATURES[*]}" == *"docs"* ] && echo "true" || echo "false")
-  path: /docs
+  enabled: ${DOCS_ENABLED}
+  path: "${DOCS_PATH}"'
+    fi
 
-$metrics_config
+    # Health конфигурация
+    if [[ "$FEATURES" == *"health"* ]]; then
+        config_content+='
 
 health:
-  enabled: $([ "${SELECTED_FEATURES[*]}" == *"health"* ] && echo "true" || echo "false")
+  enabled: ${HEALTH_ENABLED}'
+    fi
 
-client:
-  enabled: $([ "${SELECTED_FEATURES[*]}" == *"client"* ] && echo "true" || echo "false")
-  default_timeout: 30s
-  max_idle_connections: 100
-  idle_conn_timeout: 90s
-  default_retries: 3
+    # Clients конфигурация
+    if [[ "$FEATURES" == *"client"* ]]; then
+        config_content+='
+
+clients:
+  enabled: ${CLIENTS_ENABLED}
+  default_timeout: "${CLIENTS_DEFAULT_TIMEOUT}"
+  max_idle_connections: ${CLIENTS_MAX_IDLE_CONNECTIONS}
+  idle_conn_timeout: "${CLIENTS_IDLE_CONN_TIMEOUT}"
+  default_retries: ${CLIENTS_DEFAULT_RETRIES}
   circuit_breaker:
-    enabled: true
-    failure_threshold: 5
-    recovery_timeout: 60s
-    half_open_requests: 3
-EOF
+    enabled: ${CLIENTS_CIRCUIT_BREAKER_ENABLED}
+    failure_threshold: ${CLIENTS_CIRCUIT_BREAKER_FAILURE_THRESHOLD}
+    recovery_timeout: "${CLIENTS_CIRCUIT_BREAKER_RECOVERY_TIMEOUT}"
+    half_open_requests: ${CLIENTS_CIRCUIT_BREAKER_HALF_OPEN_REQUESTS}
+  services: {}'
+    fi
+
+    echo "$config_content" > config.template.yml
 }
 
-generate_go_mod() {
-    cat > "$PROJECT_NAME/go.mod" << EOF
-module $MODULE_NAME
+# Функция создания .env.example
+create_env_example() {
+    print_info "Creating .env.example..."
 
-go 1.21
+    local env_content="SERVICE_NAME=${PROJECT_NAME}
+SERVICE_VERSION=1.0.0
 
-require (
-	github.com/saiset-co/sai-service v1.1.0
-	github.com/valyala/fasthttp v1.51.0
-)
+# Server configuration
+SERVER_HOST=0.0.0.0
+SERVER_PORT=8080
+SERVER_READ_TIMEOUT=30
+SERVER_WRITE_TIMEOUT=30
+SERVER_IDLE_TIMEOUT=120
 
-require (
-	github.com/andybalholm/brotli v1.0.5 // indirect
-	github.com/bytedance/sonic v1.10.2 // indirect
-	github.com/go-playground/validator/v10 v10.16.0 // indirect
-	github.com/klauspost/compress v1.17.0 // indirect
-	github.com/robfig/cron/v3 v3.0.1 // indirect
-	github.com/valyala/bytebufferpool v1.0.0 // indirect
-	go.uber.org/zap v1.26.0 // indirect
-	golang.org/x/sync v0.5.0 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
-)
-EOF
+# Logger configuration
+LOGGER_LEVEL=info
+LOGGER_TYPE=default"
+
+    # TLS configuration
+    if [[ "$FEATURES" == *"tls"* ]]; then
+        env_content+="
+
+# TLS configuration
+TLS_ENABLED=false
+TLS_AUTO_CERT=false
+TLS_EMAIL=
+TLS_CACHE_DIR=./certs
+TLS_DOMAINS=\"example.com\",\"www.example.com\""
+    fi
+
+    # Auth configuration
+    if [[ -n "$AUTH_TYPES" ]]; then
+        env_content+="
+
+# Auth configuration"
+        if [[ "$AUTH_TYPES" == *"token"* ]]; then
+            env_content+="
+AUTH_TOKEN=your-secret-token-here"
+        fi
+        if [[ "$AUTH_TYPES" == *"basic"* ]]; then
+            env_content+="
+AUTH_USERNAME=admin
+AUTH_PASSWORD=secure-password"
+        fi
+    fi
+
+    # Cache configuration
+    if [[ "$FEATURES" == *"cache"* ]]; then
+        env_content+="
+
+# Cache configuration
+CACHE_ENABLED=true
+CACHE_TYPE=$CACHE_TYPE
+CACHE_DEFAULT_TTL=1h"
+
+        if [[ "$CACHE_TYPE" == "redis" ]]; then
+            env_content+="
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_PASSWORD=
+REDIS_DB=0"
+        fi
+    fi
+
+    # Metrics configuration
+    if [[ "$FEATURES" == *"metrics"* ]]; then
+        env_content+="
+
+# Metrics configuration
+METRICS_ENABLED=true
+METRICS_TYPE=$METRICS_TYPE
+METRICS_HTTP_ENABLED=true
+METRICS_HTTP_PATH=/metrics
+METRICS_HTTP_PORT=9090"
+
+        if [[ "$METRICS_TYPE" == "prometheus" ]]; then
+            env_content+="
+METRICS_COLLECTORS_SYSTEM=true
+METRICS_COLLECTORS_RUNTIME=true
+METRICS_COLLECTORS_HTTP=true"
+        fi
+    fi
+
+    # Actions configuration
+    if [[ "$FEATURES" == *"actions"* ]]; then
+        env_content+="
+
+# Actions configuration
+ACTIONS_ENABLED=true"
+
+        if [[ "$ACTIONS" == *"websocket"* ]]; then
+            env_content+="
+ACTIONS_BROKER_ENABLED=true
+ACTIONS_BROKER_TYPE=websocket
+ACTIONS_BROKER_PATH=/ws"
+        fi
+
+        if [[ "$ACTIONS" == *"webhook"* ]]; then
+            env_content+="
+ACTIONS_WEBHOOKS_ENABLED=true"
+        fi
+    fi
+
+    # Cron configuration
+    if [[ "$FEATURES" == *"cron"* ]]; then
+        env_content+="
+
+# Cron configuration
+CRON_ENABLED=true
+CRON_TIMEZONE=UTC"
+    fi
+
+    # Middlewares configuration
+    if [[ "$FEATURES" == *"middlewares"* && -n "$MIDDLEWARES" ]]; then
+        env_content+="
+
+# Middlewares configuration
+MIDDLEWARES_ENABLED=true"
+
+        IFS=',' read -ra MW_ARRAY <<< "$MIDDLEWARES"
+        for mw in "${MW_ARRAY[@]}"; do
+            mw=$(echo "$mw" | xargs)
+            case $mw in
+                recovery)
+                    env_content+="
+MIDDLEWARE_RECOVERY_ENABLED=true
+MIDDLEWARE_RECOVERY_WEIGHT=10
+MIDDLEWARE_RECOVERY_STACK_TRACE=true"
+                    ;;
+                logging)
+                    env_content+="
+MIDDLEWARE_LOGGING_ENABLED=true
+MIDDLEWARE_LOGGING_WEIGHT=20
+MIDDLEWARE_LOGGING_LEVEL=info
+MIDDLEWARE_LOGGING_HEADERS=false
+MIDDLEWARE_LOGGING_BODY=false"
+                    ;;
+                ratelimit)
+                    env_content+="
+MIDDLEWARE_RATELIMIT_ENABLED=true
+MIDDLEWARE_RATELIMIT_WEIGHT=30
+MIDDLEWARE_RATELIMIT_RPM=100"
+                    ;;
+                bodylimit|bodyimit)
+                    env_content+="
+MIDDLEWARE_BODYLIMIT_ENABLED=true
+MIDDLEWARE_BODYLIMIT_WEIGHT=40
+MIDDLEWARE_BODYLIMIT_SIZE=10485760"
+                    ;;
+                cors)
+                    env_content+="
+MIDDLEWARE_CORS_ENABLED=true
+MIDDLEWARE_CORS_WEIGHT=50
+MIDDLEWARE_CORS_ORIGINS=*
+MIDDLEWARE_CORS_METHODS=GET,POST,PUT,DELETE,OPTIONS
+MIDDLEWARE_CORS_HEADERS=Content-Type,Authorization,X-API-Key
+MIDDLEWARE_CORS_MAX_AGE=86400"
+                    ;;
+                auth)
+                    env_content+="
+MIDDLEWARE_AUTH_ENABLED=true
+MIDDLEWARE_AUTH_WEIGHT=60"
+                    ;;
+                compression|compresion)
+                    env_content+="
+MIDDLEWARE_COMPRESSION_ENABLED=true
+MIDDLEWARE_COMPRESSION_WEIGHT=70
+MIDDLEWARE_COMPRESSION_ALGORITHM=gzip
+MIDDLEWARE_COMPRESSION_LEVEL=6
+MIDDLEWARE_COMPRESSION_THRESHOLD=1024"
+                    ;;
+                cache)
+                    env_content+="
+MIDDLEWARE_CACHE_ENABLED=true
+MIDDLEWARE_CACHE_WEIGHT=80
+MIDDLEWARE_CACHE_TTL=5m"
+                    ;;
+            esac
+        done
+    fi
+
+    # Docs configuration
+    if [[ "$FEATURES" == *"docs"* ]]; then
+        env_content+="
+
+# Docs configuration
+DOCS_ENABLED=true
+DOCS_PATH=/docs"
+    fi
+
+    # Health configuration
+    if [[ "$FEATURES" == *"health"* ]]; then
+        env_content+="
+
+# Health configuration
+HEALTH_ENABLED=true"
+    fi
+
+    # Clients configuration
+    if [[ "$FEATURES" == *"client"* ]]; then
+        env_content+="
+
+# Clients configuration
+CLIENTS_ENABLED=true
+CLIENTS_DEFAULT_TIMEOUT=30s
+CLIENTS_MAX_IDLE_CONNECTIONS=100
+CLIENTS_IDLE_CONN_TIMEOUT=90s
+CLIENTS_DEFAULT_RETRIES=3
+CLIENTS_CIRCUIT_BREAKER_ENABLED=true
+CLIENTS_CIRCUIT_BREAKER_FAILURE_THRESHOLD=5
+CLIENTS_CIRCUIT_BREAKER_RECOVERY_TIMEOUT=60s
+CLIENTS_CIRCUIT_BREAKER_HALF_OPEN_REQUESTS=3"
+    fi
+
+    printf "%s\n" "$env_content" > .env.example
 }
 
-generate_dockerfile() {
-    cat > "$PROJECT_NAME/Dockerfile" << EOF
+# Функция создания Dockerfile
+create_dockerfile() {
+    print_info "Creating Dockerfile..."
+
+    cat > Dockerfile << 'EOF'
 # Build stage
 FROM golang:1.21-alpine AS builder
 
 WORKDIR /app
 
 # Install dependencies
-RUN apk add --no-cache git ca-certificates
+RUN apk add --no-cache git ca-certificates tzdata
 
 # Copy go mod files
 COPY go.mod go.sum ./
@@ -1041,763 +1248,292 @@ RUN go mod download
 COPY . .
 
 # Build binary
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main ./cmd
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o main ./cmd
 
-# Final stage
+# Runtime stage
 FROM alpine:latest
 
 RUN apk --no-cache add ca-certificates tzdata
 WORKDIR /root/
 
-# Copy binary and config
+# Copy binary and configs
 COPY --from=builder /app/main .
-COPY --from=builder /app/config.yml .
+COPY --from=builder /app/config.template.yml .
+COPY --from=builder /app/scripts/docker-entrypoint.sh .
 
-# Create non-root user
-RUN adduser -D -s /bin/sh appuser
-USER appuser
+# Make script executable
+RUN chmod +x ./docker-entrypoint.sh
 
-EXPOSE $PORT
+EXPOSE 8080
 
+ENTRYPOINT ["./docker-entrypoint.sh"]
 CMD ["./main"]
 EOF
 }
 
-generate_docker_compose() {
-    local services="  $PROJECT_NAME:
+# Функция создания docker-compose.yml
+create_docker_compose() {
+    print_info "Creating docker-compose.yml..."
+
+    local compose_content='version: "3.8"
+
+services:
+  app:
     build: .
     ports:
-      - \"$PORT:$PORT\"
-    environment:
-      - ENV=development
-    volumes:
-      - ./config.yml:/root/config.yml"
+      - "8080:8080"
+    env_file:
+      - .env'
 
-    local additional_services=""
-    local depends_on=""
+    # Добавляем зависимости
+    local dependencies=()
+    if [[ "$CACHE_TYPE" == "redis" ]]; then
+        dependencies+=("redis")
+    fi
+    if [[ "$METRICS_TYPE" == "prometheus" ]]; then
+        dependencies+=("prometheus")
+    fi
 
-    # Add Redis if cache type is redis
-    if [ "$CACHE_TYPE" = "redis" ]; then
-        additional_services="${additional_services}
+    if [[ ${#dependencies[@]} -gt 0 ]]; then
+        compose_content+='
+    depends_on:'
+        for dep in "${dependencies[@]}"; do
+            compose_content+="
+      - $dep"
+        done
+    fi
+
+    # Добавляем Redis если нужен
+    if [[ "$CACHE_TYPE" == "redis" ]]; then
+        compose_content+='
+
   redis:
     image: redis:7-alpine
     ports:
-      - \"6379:6379\"
-    volumes:
-      - redis_data:/data
-    command: redis-server --appendonly yes"
-        depends_on="${depends_on}
-      - redis"
+      - "6379:6379"'
     fi
 
-    # Add Prometheus if metrics type is prometheus
-    if [ "$METRICS_TYPE" = "prometheus" ]; then
-        additional_services="${additional_services}
+    # Добавляем Prometheus если нужен
+    if [[ "$METRICS_TYPE" == "prometheus" ]]; then
+        compose_content+='
+
   prometheus:
     image: prom/prometheus:latest
     ports:
-      - \"9090:9090\"
+      - "9091:9090"
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus_data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/etc/prometheus/console_libraries'
-      - '--web.console.templates=/etc/prometheus/consoles'
-      - '--storage.tsdb.retention.time=200h'
-      - '--web.enable-lifecycle'"
-        depends_on="${depends_on}
-      - prometheus"
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml'
     fi
 
-    # Add depends_on if we have dependencies
-    if [ -n "$depends_on" ]; then
-        services="${services}
-    depends_on:${depends_on}"
-    fi
-
-    local volumes=""
-    if [ "$CACHE_TYPE" = "redis" ]; then
-        volumes="${volumes}
-  redis_data:"
-    fi
-    if [ "$METRICS_TYPE" = "prometheus" ]; then
-        volumes="${volumes}
-  prometheus_data:"
-    fi
-
-    cat > "$PROJECT_NAME/docker-compose.yml" << EOF
-version: '3.8'
-
-services:
-${services}${additional_services}
-$(if [ -n "$volumes" ]; then echo "
-volumes:${volumes}"; fi)
-EOF
+    echo "$compose_content" > docker-compose.yml
 }
 
-generate_prometheus_config() {
-    if [ "$METRICS_TYPE" = "prometheus" ]; then
-        cat > "$PROJECT_NAME/prometheus.yml" << EOF
-global:
-  scrape_interval: 15s
-  evaluation_interval: 15s
+# Функция создания Makefile
+create_makefile() {
+    print_info "Creating Makefile..."
 
-rule_files:
-  # - "first_rules.yml"
-  # - "second_rules.yml"
+    cat > Makefile << 'EOF'
+.PHONY: help config build run test clean fmt lint security docker-build docker-run docker-stop docker-logs docker-log
 
-scrape_configs:
-  - job_name: '$PROJECT_NAME'
-    static_configs:
-      - targets: ['$PROJECT_NAME:9090']
-    scrape_interval: 5s
-    metrics_path: /metrics
+# Default target
+.DEFAULT_GOAL := help
 
-  - job_name: 'prometheus'
-    static_configs:
-      - targets: ['localhost:9090']
-EOF
-    fi
-}
+# Variables
+BINARY_NAME=main
+BUILD_DIR=./bin
+CONFIG_FILE=config.yml
+CONFIG_TEMPLATE=config.template.yml
 
-generate_makefile() {
-    cat > "$PROJECT_NAME/Makefile" << EOF
-.PHONY: build run test clean docker-build docker-run docker-stop install-deps fmt lint
-
-# Go parameters
-GOCMD=go
-GOBUILD=\$(GOCMD) build
-GOCLEAN=\$(GOCMD) clean
-GOTEST=\$(GOCMD) test
-GOGET=\$(GOCMD) get
-GOMOD=\$(GOCMD) mod
-BINARY_NAME=$PROJECT_NAME
-BINARY_PATH=./cmd
-
-# Build the application
-build:
-	\$(GOBUILD) -o \$(BINARY_NAME) \$(BINARY_PATH)
-
-# Run the application
-run:
-	\$(GOBUILD) -o \$(BINARY_NAME) \$(BINARY_PATH) && ./\$(BINARY_NAME)
-
-# Run with live reload (requires air: go install github.com/cosmtrek/air@latest)
-dev:
-	air
-
-# Test the application
-test:
-	\$(GOTEST) -v ./...
-
-# Test with coverage
-test-coverage:
-	\$(GOTEST) -v -coverprofile=coverage.out ./...
-	\$(GOCMD) tool cover -html=coverage.out -o coverage.html
-
-# Clean build artifacts
-clean:
-	\$(GOCLEAN)
-	rm -f \$(BINARY_NAME)
-	rm -f coverage.out coverage.html
-
-# Install dependencies
-install-deps:
-	\$(GOMOD) download
-	\$(GOMOD) tidy
-
-# Format code
-fmt:
-	\$(GOCMD) fmt ./...
-
-# Lint code (requires golangci-lint)
-lint:
-	golangci-lint run
-
-# Security check (requires gosec)
-security:
-	gosec ./...
-
-# Build Docker image
-docker-build:
-	docker build -t \$(BINARY_NAME):latest .
-
-# Run with Docker Compose
-docker-run:
-	docker-compose up --build
-
-# Stop Docker Compose
-docker-stop:
-	docker-compose down
-
-# Run in background
-docker-run-bg:
-	docker-compose up -d --build
-
-# View logs
-docker-logs:
-	docker-compose logs -f
-
-# Database operations (if using database)
-db-migrate:
-	# Add your migration commands here
-	@echo "Add database migration commands"
-
-db-seed:
-	# Add your seeding commands here
-	@echo "Add database seeding commands"
-
-# Generate API documentation
-docs:
-	# Swagger/OpenAPI docs generation if needed
-	@echo "API docs available at http://localhost:\$(PORT)/docs"
-
-# Performance test (requires wrk or ab)
-perf-test:
-	wrk -t12 -c400 -d30s http://localhost:$PORT/health
-
-# Load test specific endpoint
-load-test:
-	wrk -t12 -c400 -d30s http://localhost:$PORT/api/v1/users
-
-# Help
-help:
+help: ## Show this help message
 	@echo "Available commands:"
-	@echo "  build          - Build the application"
-	@echo "  run            - Build and run the application"
-	@echo "  dev            - Run with live reload (requires air)"
-	@echo "  test           - Run tests"
-	@echo "  test-coverage  - Run tests with coverage"
-	@echo "  clean          - Clean build artifacts"
-	@echo "  install-deps   - Install/update dependencies"
-	@echo "  fmt            - Format code"
-	@echo "  lint           - Lint code"
-	@echo "  security       - Run security checks"
-	@echo "  docker-build   - Build Docker image"
-	@echo "  docker-run     - Run with Docker Compose"
-	@echo "  docker-stop    - Stop Docker Compose"
-	@echo "  docker-run-bg  - Run in background"
-	@echo "  docker-logs    - View logs"
-	@echo "  perf-test      - Run performance test"
-	@echo "  load-test      - Run load test"
-	@echo "  help           - Show this help"
+	@grep -E '^[a-zA-Z_-]+:.*?## .* $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $1, $2}'
+
+config: ## Build config.yml from template and .env
+	@echo "Building configuration..."
+	@if [ ! -f .env ]; then cp .env.example .env; fi
+	@export $(cat .env | xargs) && envsubst < $(CONFIG_TEMPLATE) > $(CONFIG_FILE)
+	@echo "Configuration built successfully"
+
+build: config ## Build the application
+	@echo "Building application..."
+	@if [ ! -f .env ]; then cp .env.example .env; fi
+	@go mod tidy
+	@mkdir -p $(BUILD_DIR)
+	@go build -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd
+	@echo "Build completed successfully"
+
+run: build ## Build and run the application
+	@echo "Starting application..."
+	@./$(BUILD_DIR)/$(BINARY_NAME)
+
+test: build ## Run tests
+	@echo "Running tests..."
+	@go test -v ./...
+
+clean: ## Clean build artifacts
+	@echo "Cleaning build artifacts..."
+	@rm -rf $(BUILD_DIR)
+	@rm -f $(CONFIG_FILE)
+	@echo "Clean completed"
+
+fmt: ## Format code
+	@echo "Formatting code..."
+	@go fmt ./...
+	@echo "Formatting completed"
+
+lint: ## Run linter
+	@echo "Running linter..."
+	@golangci-lint run
+	@echo "Linting completed"
+
+security: ## Run security checks
+	@echo "Running security checks..."
+	@gosec ./...
+	@echo "Security check completed"
+
+docker-build: ## Build Docker image
+	@echo "Building Docker image..."
+	@docker build -t $(echo "$(pwd)" | sed 's/.*\///'):latest .
+	@echo "Docker image built successfully"
+
+docker-run: ## Run with Docker Compose
+	@echo "Starting services with Docker Compose..."
+	@docker-compose up -d
+	@echo "Services started"
+
+docker-stop: ## Stop Docker Compose
+	@echo "Stopping services..."
+	@docker-compose down
+	@echo "Services stopped"
+
+docker-logs: ## Show Docker Compose logs
+	@docker-compose logs -f
+
+docker-log: ## Show main service logs
+	@docker-compose logs -f app
 EOF
 }
 
-generate_readme() {
-    local features_list=""
-    if [ ${#SELECTED_FEATURES[@]} -gt 0 ]; then
-        features_list="## Features
+# Функция создания docker-entrypoint.sh
+create_docker_entrypoint() {
+    print_info "Creating scripts/docker-entrypoint.sh..."
 
-"
-        for feature in "${SELECTED_FEATURES[@]}"; do
-            features_list="${features_list}- ${feature}
-"
-        done
-    fi
+    cat > scripts/docker-entrypoint.sh << 'EOF'
+#!/bin/sh
 
-    local middleware_list=""
-    if [ ${#SELECTED_MIDDLEWARES[@]} -gt 0 ]; then
-        middleware_list="
-### Enabled Middlewares
+set -e
 
-"
-        for middleware in "${SELECTED_MIDDLEWARES[@]}"; do
-            middleware_list="${middleware_list}- ${middleware}
-"
-        done
-    fi
+# Build config from template using environment variables
+echo "Building configuration from template..."
+envsubst < "./config.template.yml" > "./config.yml"
 
-    cat > "$PROJECT_NAME/README.md" << EOF
-# $PROJECT_NAME
+echo "Configuration built successfully"
+echo "Starting application..."
 
-A high-performance microservice built with [SAI Service](https://github.com/saiset-co/sai-service) framework.
-
-$features_list
-
-## Quick Start
-
-### Prerequisites
-
-- Go 1.21 or later
-- Docker and Docker Compose (optional)
-
-### Local Development
-
-1. Clone and navigate to the project:
-\`\`\`bash
-cd $PROJECT_NAME
-\`\`\`
-
-2. Install dependencies:
-\`\`\`bash
-make install-deps
-\`\`\`
-
-3. Run the service:
-\`\`\`bash
-make run
-\`\`\`
-
-The service will be available at \`http://localhost:$PORT\`
-
-### With Docker
-
-1. Build and run with Docker Compose:
-\`\`\`bash
-make docker-run
-\`\`\`
-
-2. Stop the service:
-\`\`\`bash
-make docker-stop
-\`\`\`
-
-## API Endpoints
-
-### Health Check
-- \`GET /health\` - Service health status
-
-### Users API
-- \`GET /api/v1/users\` - List all users
-- \`GET /api/v1/users/{id}\` - Get user by ID
-- \`POST /api/v1/users\` - Create new user
-- \`PUT /api/v1/users/{id}\` - Update user
-- \`DELETE /api/v1/users/{id}\` - Delete user
-
-$([ "$([[ " ${SELECTED_FEATURES[*]} " == *" docs "* ]] && echo "true" || echo "false")" = "true" ] && echo "### API Documentation
-Interactive API documentation is available at \`http://localhost:$PORT/docs\`")
-
-## Configuration
-
-The service is configured via \`config.yml\`. Key configuration sections:
-
-- **Server**: HTTP server settings
-- **Logger**: Logging configuration$([ "$([[ " ${SELECTED_FEATURES[*]} " == *" cache "* ]] && echo "true" || echo "false")" = "true" ] && echo "
-- **Cache**: Caching configuration ($CACHE_TYPE)")$([ "$([[ " ${SELECTED_FEATURES[*]} " == *" metrics "* ]] && echo "true" || echo "false")" = "true" ] && echo "
-- **Metrics**: Metrics collection ($METRICS_TYPE)")$([ "$([[ " ${SELECTED_FEATURES[*]} " == *" actions "* ]] && echo "true" || echo "false")" = "true" ] && echo "
-- **Actions**: Event handling and webhooks")$middleware_list
-
-## Development
-
-### Available Commands
-
-\`\`\`bash
-make help  # Show all available commands
-\`\`\`
-
-### Testing
-
-Run tests:
-\`\`\`bash
-make test
-\`\`\`
-
-Run tests with coverage:
-\`\`\`bash
-make test-coverage
-\`\`\`
-
-### Code Quality
-
-Format code:
-\`\`\`bash
-make fmt
-\`\`\`
-
-Lint code:
-\`\`\`bash
-make lint
-\`\`\`
-
-Security check:
-\`\`\`bash
-make security
-\`\`\`
-
-### Performance Testing
-
-Run performance tests:
-\`\`\`bash
-make perf-test
-\`\`\`
-
-## Project Structure
-
-\`\`\`
-$PROJECT_NAME/
-├── cmd/                    # Application entry point
-│   └── main.go
-├── internal/               # Private application code
-│   ├── service.go         # Service initialization
-│   ├── handlers/          # HTTP handlers
-│   │   └── handlers.go
-│   └── models/            # Data models
-│       └── model.go$([ "$INCLUDE_TESTS" = "true" ] && echo "
-├── tests/                 # Integration tests
-│   ├── integration/
-│   └── helpers/")$([ "$CICD_TYPE" != "none" ] && echo "
-├── .github/workflows/     # CI/CD workflows
-│   └── ci.yml")
-├── config.yml             # Configuration
-├── Dockerfile             # Docker image
-├── docker-compose.yml     # Multi-container setup
-├── Makefile              # Development commands
-├── go.mod                # Go module
-└── README.md             # This file
-\`\`\`
-
-## Monitoring
-
-$([ "$([[ " ${SELECTED_FEATURES[*]} " == *" health "* ]] && echo "true" || echo "false")" = "true" ] && echo "### Health Checks
-- Service health: \`GET /health\`")
-
-$([ "$([[ " ${SELECTED_FEATURES[*]} " == *" metrics "* ]] && echo "true" || echo "false")" = "true" ] && echo "### Metrics
-$([ "$METRICS_TYPE" = "prometheus" ] && echo "- Prometheus metrics: \`http://localhost:9090/metrics\`
-- Prometheus UI: \`http://localhost:9090\`" || echo "- Metrics endpoint: \`GET /metrics\`")")
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests for new functionality
-5. Run tests and linting
-6. Submit a pull request
-
-## License
-
-This project is licensed under the MIT License.
+# Execute the main command
+exec "$@"
 EOF
+
+    chmod +x scripts/docker-entrypoint.sh
 }
 
-generate_gitignore() {
-    cat > "$PROJECT_NAME/.gitignore" << EOF
-# Binaries for programs and plugins
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-$PROJECT_NAME
+# Функция создания тестов
+create_tests() {
+    if [[ "$INCLUDE_TESTS" == "true" ]]; then
+        print_info "Creating integration tests..."
 
-# Test binary, built with \`go test -c\`
-*.test
+        mkdir -p tests
 
-# Output of the go coverage tool
-*.out
-coverage.html
-
-# Dependency directories
-vendor/
-
-# Go workspace file
-go.work
-
-# IDE files
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS generated files
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-
-# Logs
-*.log
-logs/
-
-# Local environment files
-.env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
-
-# Database files
-*.db
-*.sqlite
-*.sqlite3
-
-# Docker volumes
-docker-volumes/
-
-# Build artifacts
-dist/
-build/
-
-# Temporary files
-tmp/
-temp/
-*.tmp
-
-# Configuration overrides
-config.local.yml
-config.*.yml
-!config.yml
-
-# Cache directories
-.cache/
-node_modules/
-
-# Application specific
-webhooks.db
-certs/
-EOF
-}
-
-generate_integration_tests() {
-    if [ "$INCLUDE_TESTS" = "true" ]; then
-        mkdir -p "$PROJECT_NAME/tests/integration"
-        mkdir -p "$PROJECT_NAME/tests/helpers"
-
-        cat > "$PROJECT_NAME/tests/integration/api_test.go" << EOF
-package integration
+        cat > tests/integration_test.go << 'EOF'
+package tests
 
 import (
-	"bytes"
-	"encoding/json"
-	"net/http"
-	"testing"
-	"time"
+  "context"
+  "testing"
+  "time"
 
-	"$MODULE_NAME/tests/helpers"
+  "github.com/stretchr/testify/assert"
+  "github.com/stretchr/testify/require"
+  "github.com/valyala/fasthttp"
 )
 
-func TestUserAPI(t *testing.T) {
-	// Setup test server
-	baseURL := helpers.SetupTestServer(t)
+func TestHealthCheck(t *testing.T) {
+  // Тест проверяет что endpoint /hello доступен
+  // В реальном тесте здесь должна быть инициализация тестового сервера
 
-	client := &http.Client{Timeout: 10 * time.Second}
+  req := fasthttp.AcquireRequest()
+  resp := fasthttp.AcquireResponse()
+  defer fasthttp.ReleaseRequest(req)
+  defer fasthttp.ReleaseResponse(resp)
 
-	t.Run("Health Check", func(t *testing.T) {
-		resp, err := client.Get(baseURL + "/health")
-		if err != nil {
-			t.Fatalf("Health check failed: %v", err)
-		}
-		defer resp.Body.Close()
+  req.SetRequestURI("http://localhost:8080/api/v1/hello")
+  req.Header.SetMethod("GET")
 
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("Expected status 200, got %d", resp.StatusCode)
-		}
-	})
+  client := &fasthttp.Client{
+    ReadTimeout:  time.Second * 10,
+    WriteTimeout: time.Second * 10,
+  }
 
-	t.Run("Get Users", func(t *testing.T) {
-		resp, err := client.Get(baseURL + "/api/v1/users")
-		if err != nil {
-			t.Fatalf("Get users failed: %v", err)
-		}
-		defer resp.Body.Close()
+  ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+  defer cancel()
 
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("Expected status 200, got %d", resp.StatusCode)
-		}
-	})
+  err := client.DoTimeout(req, resp, 10*time.Second)
+  if err != nil {
+    t.Skip("Service not running, skipping integration test")
+    return
+  }
 
-	t.Run("Create User", func(t *testing.T) {
-		user := map[string]interface{}{
-			"name":  "Test User",
-			"email": "test@example.com",
-			"age":   25,
-		}
-
-		jsonData, _ := json.Marshal(user)
-		resp, err := client.Post(
-			baseURL+"/api/v1/users",
-			"application/json",
-			bytes.NewBuffer(jsonData),
-		)
-		if err != nil {
-			t.Fatalf("Create user failed: %v", err)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusCreated {
-			t.Errorf("Expected status 201, got %d", resp.StatusCode)
-		}
-	})
-
-	t.Run("Get User by ID", func(t *testing.T) {
-		resp, err := client.Get(baseURL + "/api/v1/users/1")
-		if err != nil {
-			t.Fatalf("Get user by ID failed: %v", err)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("Expected status 200, got %d", resp.StatusCode)
-		}
-	})
-
-	t.Run("Update User", func(t *testing.T) {
-		user := map[string]interface{}{
-			"name": "Updated User",
-		}
-
-		jsonData, _ := json.Marshal(user)
-		req, err := http.NewRequest(
-			http.MethodPut,
-			baseURL+"/api/v1/users/1",
-			bytes.NewBuffer(jsonData),
-		)
-		if err != nil {
-			t.Fatalf("Create request failed: %v", err)
-		}
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := client.Do(req)
-		if err != nil {
-			t.Fatalf("Update user failed: %v", err)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("Expected status 200, got %d", resp.StatusCode)
-		}
-	})
-
-	t.Run("Delete User", func(t *testing.T) {
-		req, err := http.NewRequest(
-			http.MethodDelete,
-			baseURL+"/api/v1/users/1",
-			nil,
-		)
-		if err != nil {
-			t.Fatalf("Create request failed: %v", err)
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			t.Fatalf("Delete user failed: %v", err)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusNoContent {
-			t.Errorf("Expected status 204, got %d", resp.StatusCode)
-		}
-	})
+  assert.Equal(t, fasthttp.StatusOK, resp.StatusCode())
 }
 
-func TestErrorHandling(t *testing.T) {
-	baseURL := helpers.SetupTestServer(t)
+func TestServiceAPI(t *testing.T) {
+  // Тест для API endpoints
+  req := fasthttp.AcquireRequest()
+  resp := fasthttp.AcquireResponse()
+  defer fasthttp.ReleaseRequest(req)
+  defer fasthttp.ReleaseResponse(resp)
 
-	client := &http.Client{Timeout: 10 * time.Second}
+  req.SetRequestURI("http://localhost:8080/api/v1/hello")
+  req.Header.SetMethod("GET")
 
-	t.Run("Get Non-existent User", func(t *testing.T) {
-		resp, err := client.Get(baseURL + "/api/v1/users/999")
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-		defer resp.Body.Close()
+  client := &fasthttp.Client{
+    ReadTimeout:  time.Second * 10,
+    WriteTimeout: time.Second * 10,
+  }
 
-		if resp.StatusCode != http.StatusNotFound {
-			t.Errorf("Expected status 404, got %d", resp.StatusCode)
-		}
-	})
+  err := client.DoTimeout(req, resp, 10*time.Second)
+  if err != nil {
+    t.Skip("Service not running, skipping integration test")
+    return
+  }
 
-	t.Run("Create User with Invalid Data", func(t *testing.T) {
-		user := map[string]interface{}{
-			"name": "", // Invalid: empty name
-			"email": "invalid-email",
-			"age": -1,
-		}
+  assert.Equal(t, fasthttp.StatusOK, resp.StatusCode())
 
-		jsonData, _ := json.Marshal(user)
-		resp, err := client.Post(
-			baseURL+"/api/v1/users",
-			"application/json",
-			bytes.NewBuffer(jsonData),
-		)
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusBadRequest {
-			t.Errorf("Expected status 400, got %d", resp.StatusCode)
-		}
-	})
+  // Проверяем что ответ содержит JSON
+  contentType := string(resp.Header.Peek("Content-Type"))
+  assert.Contains(t, contentType, "application/json")
 }
 EOF
 
-        cat > "$PROJECT_NAME/tests/helpers/setup.go" << EOF
-package helpers
+        # Обновляем go.mod для тестов
+        cat >> go.mod << 'EOF'
 
-import (
-	"context"
-	"fmt"
-	"testing"
-	"time"
-
-	"github.com/saiset-co/sai-service/service"
-	"$MODULE_NAME/internal"
+require (
+  github.com/stretchr/testify v1.8.4
+  github.com/valyala/fasthttp v1.51.0
 )
-
-// SetupTestServer creates a test server for integration tests
-// Returns the base URL of the running server
-func SetupTestServer(t *testing.T) string {
-	ctx := context.Background()
-
-	// Create service with test configuration
-	// Path is relative to the project root where tests are run from
-	srv, err := service.NewService(ctx, "config.yml")
-	if err != nil {
-		t.Fatalf("Failed to create service: %v", err)
-	}
-
-	// Register business logic
-	if err := internal.RegisterBusinessLogic(); err != nil {
-		t.Fatalf("Failed to register business logic: %v", err)
-	}
-
-	// Start service in background
-	go func() {
-		if err := srv.Start(); err != nil {
-			t.Logf("Service start error: %v", err)
-		}
-	}()
-
-	// Wait for service to be ready
-	time.Sleep(2 * time.Second)
-
-	// Get server configuration for base URL
-	config := srv.Context() // Assuming we can get config somehow
-	baseURL := "http://localhost:8080" // Default for tests
-
-	// Cleanup function
-	t.Cleanup(func() {
-		srv.Stop()
-	})
-
-	return baseURL
-}
-
-// CreateTestUser creates a test user for use in tests
-func CreateTestUser() map[string]interface{} {
-	return map[string]interface{}{
-		"name":  "Test User",
-		"email": "test@example.com",
-		"age":   25,
-	}
-}
 EOF
     fi
 }
 
-generate_github_workflow() {
-    if [ "$CICD_TYPE" = "github" ]; then
-        mkdir -p "$PROJECT_NAME/.github/workflows"
+# Функция создания CI/CD файлов
+create_cicd() {
+    case $CICD_TYPE in
+        github)
+            print_info "Creating GitHub Actions workflow..."
+            mkdir -p .github/workflows
 
-        cat > "$PROJECT_NAME/.github/workflows/ci.yml" << EOF
+            cat > .github/workflows/ci.yml << 'EOF'
 name: CI/CD Pipeline
 
 on:
@@ -1806,183 +1542,86 @@ on:
   pull_request:
     branches: [ main ]
 
-env:
-  GO_VERSION: '1.21'
-  REGISTRY: ghcr.io
-  IMAGE_NAME: \${{ github.repository }}
-
 jobs:
   test:
-    name: Test
     runs-on: ubuntu-latest
 
-    services:$([ "$CACHE_TYPE" = "redis" ] && echo "
+    services:
       redis:
         image: redis:7-alpine
         ports:
           - 6379:6379
         options: >-
-          --health-cmd \"redis-cli ping\"
+          --health-cmd "redis-cli ping"
           --health-interval 10s
           --health-timeout 5s
-          --health-retries 5")$([ "$METRICS_TYPE" = "prometheus" ] && echo "
-      prometheus:
-        image: prom/prometheus:latest
-        ports:
-          - 9090:9090")
+          --health-retries 5
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
     - name: Set up Go
       uses: actions/setup-go@v4
       with:
-        go-version: \${{ env.GO_VERSION }}
+        go-version: '1.21'
 
     - name: Cache Go modules
       uses: actions/cache@v3
       with:
         path: ~/go/pkg/mod
-        key: \${{ runner.os }}-go-\${{ hashFiles('**/go.sum') }}
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
         restore-keys: |
-          \${{ runner.os }}-go-
+          ${{ runner.os }}-go-
 
     - name: Install dependencies
       run: go mod download
 
     - name: Run tests
-      run: go test -v -race -coverprofile=coverage.out ./...
+      run: make test
+      env:
+        REDIS_HOST: localhost
+        REDIS_PORT: 6379
 
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v3
-      with:
-        file: ./coverage.out
-        flags: unittests
-        name: codecov-umbrella
-
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: \${{ env.GO_VERSION }}
-
-    - name: Run golangci-lint
+    - name: Run linter
       uses: golangci/golangci-lint-action@v3
       with:
-        version: latest
-        args: --timeout=5m
+        version: v1.54
 
-  security:
-    name: Security Scan
-    runs-on: ubuntu-latest
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: \${{ env.GO_VERSION }}
-
-    - name: Run Gosec Security Scanner
-      uses: securecodewarrior/github-action-gosec@master
+    - name: Run security scan
+      uses: securecodewarrior/github-action-gosec@v1
       with:
         args: './...'
 
   build:
-    name: Build
+    needs: test
     runs-on: ubuntu-latest
-    needs: [test, lint]
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
     - name: Set up Go
       uses: actions/setup-go@v4
       with:
-        go-version: \${{ env.GO_VERSION }}
+        go-version: '1.21'
 
     - name: Build binary
-      run: |
-        CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o $PROJECT_NAME ./cmd
+      run: make build
 
-    - name: Upload binary
+    - name: Build Docker image
+      run: make docker-build
+
+    - name: Upload artifacts
       uses: actions/upload-artifact@v3
       with:
-        name: $PROJECT_NAME-binary
-        path: $PROJECT_NAME
-
-  docker:
-    name: Build Docker Image
-    runs-on: ubuntu-latest
-    needs: [test, lint]
-    if: github.event_name == 'push'
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-
-    - name: Log in to Container Registry
-      uses: docker/login-action@v3
-      with:
-        registry: \${{ env.REGISTRY }}
-        username: \${{ github.actor }}
-        password: \${{ secrets.GITHUB_TOKEN }}
-
-    - name: Extract metadata
-      id: meta
-      uses: docker/metadata-action@v5
-      with:
-        images: \${{ env.REGISTRY }}/\${{ env.IMAGE_NAME }}
-        tags: |
-          type=ref,event=branch
-          type=ref,event=pr
-          type=sha,prefix={{branch}}-
-          type=raw,value=latest,enable={{is_default_branch}}
-
-    - name: Build and push Docker image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        platforms: linux/amd64,linux/arm64
-        push: true
-        tags: \${{ steps.meta.outputs.tags }}
-        labels: \${{ steps.meta.outputs.labels }}
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
-
-  deploy:
-    name: Deploy
-    runs-on: ubuntu-latest
-    needs: [docker]
-    if: github.ref == 'refs/heads/main'
-    environment: production
-
-    steps:
-    - name: Deploy to production
-      run: |
-        echo "Add your deployment steps here"
-        echo "For example: kubectl, docker-compose, etc."
+        name: binary
+        path: bin/
 EOF
-    fi
-}
+            ;;
 
-generate_gitlab_ci() {
-    if [ "$CICD_TYPE" = "gitlab" ]; then
-        cat > "$PROJECT_NAME/.gitlab-ci.yml" << EOF
+        gitlab)
+            print_info "Creating GitLab CI pipeline..."
+
+            cat > .gitlab-ci.yml << 'EOF'
 stages:
   - test
   - build
@@ -1991,315 +1630,384 @@ stages:
 variables:
   GO_VERSION: "1.21"
   DOCKER_DRIVER: overlay2
-  DOCKER_TLS_CERTDIR: "/certs"
 
 before_script:
+  - apk add --no-cache git make gettext
   - go version
-  - go mod download
 
 test:
   stage: test
-  image: golang:\$GO_VERSION
-  services:$([ "$CACHE_TYPE" = "redis" ] && echo "
-    - redis:7-alpine")$([ "$METRICS_TYPE" = "prometheus" ] && echo "
-    - prom/prometheus:latest")
+  image: golang:${GO_VERSION}-alpine
+
+  services:
+    - redis:7-alpine
+
+  variables:
+    REDIS_HOST: redis
+    REDIS_PORT: 6379
+
   script:
-    - go test -v -race -coverprofile=coverage.out ./...
-    - go tool cover -html=coverage.out -o coverage.html
+    - go mod download
+    - make test
+
+  coverage: '/coverage: \d+\.\d+% of statements/'
+
   artifacts:
     reports:
+      junit: report.xml
       coverage_report:
         coverage_format: cobertura
         path: coverage.xml
-    paths:
-      - coverage.html
-      - coverage.out
-  coverage: '/coverage: \d+\.\d+% of statements/'
-
-lint:
-  stage: test
-  image: golangci/golangci-lint:latest
-  script:
-    - golangci-lint run --timeout=5m
-
-security:
-  stage: test
-  image: golang:\$GO_VERSION
-  script:
-    - go install github.com/securecodewarrior/gosec/v2/cmd/gosec@latest
-    - gosec ./...
 
 build:
   stage: build
-  image: golang:\$GO_VERSION
+  image: golang:${GO_VERSION}-alpine
+
   script:
-    - CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o $PROJECT_NAME ./cmd
+    - make build
+    - make docker-build
+
   artifacts:
     paths:
-      - $PROJECT_NAME
+      - bin/
     expire_in: 1 week
 
-docker:
-  stage: build
-  image: docker:latest
-  services:
-    - docker:dind
-  script:
-    - docker build -t \$CI_REGISTRY_IMAGE:\$CI_COMMIT_SHA .
-    - docker push \$CI_REGISTRY_IMAGE:\$CI_COMMIT_SHA
   only:
     - main
     - develop
 
 deploy:
   stage: deploy
-  image: alpine:latest
+  image: docker:latest
+
+  services:
+    - docker:dind
+
   script:
-    - echo "Add your deployment steps here"
+    - echo "Deploy stage - implement your deployment logic here"
+
   only:
     - main
-  environment:
-    name: production
+EOF
+            ;;
+    esac
+}
+
+# Функция создания дополнительных файлов в зависимости от фич
+create_feature_files() {
+    # Prometheus конфигурация
+    if [[ "$METRICS_TYPE" == "prometheus" ]]; then
+        print_info "Creating prometheus.yml..."
+
+        cat > prometheus.yml << 'EOF'
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'app'
+    static_configs:
+      - targets: ['app:9090']
+    scrape_interval: 5s
+    metrics_path: '/metrics'
+EOF
+    fi
+
+    # Создание cron jobs если включен cron
+    if [[ "$FEATURES" == *"cron"* ]]; then
+        print_info "Adding cron job example to service.go..."
+
+        cat >> internal/service.go << 'EOF'
+
+// InitializeCronJobs инициализирует задачи cron
+func (s *BusinessService) InitializeCronJobs() error {
+  // Пример cron задачи - выполняется каждую минуту
+  err := sai.Cron().Add("example_job", "0 * * * * *", func() {
+    sai.Logger().Info("Example cron job executed")
+  })
+
+  if err != nil {
+    return err
+  }
+
+  sai.Logger().Info("Cron jobs initialized")
+  return nil
+}
+EOF
+    fi
+
+    # Создание примера клиента если включены clients
+    if [[ "$FEATURES" == *"client"* ]]; then
+        print_info "Adding client example to service.go..."
+
+        cat >> internal/service.go << 'EOF'
+
+// ExampleAPICall демонстрирует использование HTTP клиента
+func (s *BusinessService) ExampleAPICall() error {
+  response, statusCode, err := sai.ClientManager().Call(
+    "example-service",
+    "GET",
+    "/api/status",
+    nil,
+    &types.CallOptions{
+      Headers: map[string]string{
+        "User-Agent": "SAI-Service-Client/1.0",
+      },
+      Timeout: 30 * time.Second,
+      Retry:   3,
+    },
+  )
+
+  if err != nil {
+    return err
+  }
+
+  sai.Logger().Info("API call completed",
+    zap.Int("status_code", statusCode),
+    zap.ByteString("response", response))
+
+  return nil
+}
 EOF
     fi
 }
 
-# Directory creation
-create_project_structure() {
-    print_info "Creating project structure..."
+# Функция обновления main.go для включения дополнительных фич
+update_main_go() {
+    if [[ "$FEATURES" == *"cron"* ]]; then
+        print_info "Updating main.go with cron features..."
 
-    mkdir -p "$PROJECT_NAME"/{cmd,internal/{handlers,models}}
-
-    if [ "$INCLUDE_TESTS" = "true" ]; then
-        mkdir -p "$PROJECT_NAME/tests"/{integration,helpers}
+        # Добавляем инициализацию cron в main.go
+        sed -i '/businessService.Initialize()/a\\n\t// Инициализация cron задач\n\tif err := businessService.InitializeCronJobs(); err != nil {\n\t\tlog.Fatalf("Failed to initialize cron jobs: %v", err)\n\t}' cmd/main.go
     fi
-
-    if [ "$CICD_TYPE" = "github" ]; then
-        mkdir -p "$PROJECT_NAME/.github/workflows"
-    fi
-
-    print_success "Project structure created"
 }
 
-# File generation
-generate_project_files() {
-    print_info "Generating project files..."
+# Функция создания README.md
+create_readme() {
+    print_info "Creating README.md..."
 
-    generate_main_go
-    generate_service_go
-    generate_handlers_go
-    generate_models_go
-    generate_config_yml
-    generate_go_mod
-    generate_dockerfile
-    generate_docker_compose
-    generate_prometheus_config
-    generate_makefile
-    generate_readme
-    generate_gitignore
+    local readme_content="# ${PROJECT_NAME}
 
-    if [ "$INCLUDE_TESTS" = "true" ]; then
-        generate_integration_tests
+Сервис, созданный с помощью SAI Service Generator.
+
+## Возможности
+
+Этот сервис включает следующие возможности:"
+
+    if [[ -n "$FEATURES" ]]; then
+        IFS=',' read -ra FEATURE_ARRAY <<< "$FEATURES"
+        for feature in "${FEATURE_ARRAY[@]}"; do
+            feature=$(echo "$feature" | xargs)
+            case $feature in
+                auth) readme_content+="
+- 🔐 Аутентификация ($AUTH_TYPES)" ;;
+                cache) readme_content+="
+- 💾 Кэширование ($CACHE_TYPE)" ;;
+                metrics) readme_content+="
+- 📊 Метрики ($METRICS_TYPE)" ;;
+                docs) readme_content+="
+- 📚 API документация" ;;
+                cron) readme_content+="
+- ⏰ Планировщик задач" ;;
+                actions) readme_content+="
+- 🔄 Система событий ($ACTIONS)" ;;
+                tls) readme_content+="
+- 🔒 TLS/SSL поддержка" ;;
+                middlewares) readme_content+="
+- 🔧 Middleware ($MIDDLEWARES)" ;;
+                health) readme_content+="
+- ❤️ Health checks" ;;
+                client) readme_content+="
+- 🌐 HTTP клиент" ;;
+            esac
+        done
     fi
 
-    if [ "$CICD_TYPE" = "github" ]; then
-        generate_github_workflow
-    elif [ "$CICD_TYPE" = "gitlab" ]; then
-        generate_gitlab_ci
+    readme_content+="
+
+## Быстрый старт
+
+### Локальная разработка
+
+1. Скопируйте переменные окружения:
+   \`\`\`bash
+   cp .env.example .env
+   \`\`\`
+
+2. Отредактируйте \`.env\` файл под ваши нужды
+
+3. Запустите сервис:
+   \`\`\`bash
+   make run
+   \`\`\`
+
+### Docker
+
+1. Запустите через Docker Compose:
+   \`\`\`bash
+   make docker-run
+   \`\`\`
+
+## Доступные команды
+
+- \`make build\` - Собрать приложение
+- \`make run\` - Запустить приложение
+- \`make test\` - Запустить тесты
+- \`make clean\` - Очистить артефакты сборки
+- \`make fmt\` - Форматировать код
+- \`make lint\` - Проверить код линтером
+- \`make docker-build\` - Собрать Docker образ
+- \`make docker-run\` - Запустить с Docker Compose
+
+## API Endpoints
+
+- \`GET /api/v1/hello\` - Тестовый endpoint"
+
+    if [[ "$TEMPLATE" == "api" ]]; then
+        readme_content+="
+- \`POST /api/v1/documents/\` - Создать документы
+- \`GET /api/v1/documents/\` - Получить документы
+- \`PUT /api/v1/documents/\` - Обновить документы
+- \`DELETE /api/v1/documents/\` - Удалить документы"
     fi
 
-    print_success "Project files generated"
+    if [[ "$FEATURES" == *"health"* ]]; then
+        readme_content+="
+- \`GET /health\` - Health check
+- \`GET /version\` - Версия сервиса"
+    fi
+
+    if [[ "$FEATURES" == *"metrics"* ]]; then
+        readme_content+="
+- \`GET /metrics\` - Метрики для Prometheus"
+    fi
+
+    if [[ "$FEATURES" == *"docs"* ]]; then
+        readme_content+="
+- \`GET /docs\` - Swagger документация"
+    fi
+
+    readme_content+="
+
+## Конфигурация
+
+Сервис настраивается через файл \`config.yml\`, который генерируется из \`config.template.yml\` с использованием переменных окружения из \`.env\`.
+
+## Структура проекта
+
+\`\`\`
+.
+├── cmd/                # Точка входа приложения
+├── internal/           # Внутренняя логика
+├── types/              # Типы и интерфейсы
+├── scripts/            # Скрипты
+├── tests/              # Интеграционные тесты (если включены)
+├── config.template.yml # Шаблон конфигурации
+├── docker-compose.yml  # Docker Compose конфигурация
+├── Dockerfile          # Docker образ
+├── Makefile           # Команды сборки
+└── README.md          # Документация
+\`\`\`
+
+## Разработка
+
+### Добавление новых endpoints
+
+1. Добавьте новые роуты в \`internal/handlers.go\`
+2. Реализуйте бизнес-логику в \`internal/service.go\`
+3. Добавьте необходимые типы в \`types/types.go\`
+
+### Тестирование
+
+Запустите тесты командой:
+\`\`\`bash
+make test
+\`\`\`"
+    if [[ "$INCLUDE_TESTS" == "true" ]]; then
+        readme_content+="
+
+Интеграционные тесты находятся в папке \`tests/\`."
+    fi
+
+    readme_content+="
+
+## Лицензия
+
+MIT License"
+
+    printf "%s\n" "$readme_content" > README.md
 }
 
-# Post-generation tasks
-post_generation() {
-    print_info "Finalizing project..."
+# Основная функция генерации
+generate_project() {
+    print_header "=== Starting Project Generation ==="
 
-    cd "$PROJECT_NAME"
-
-    # Initialize git repository
-    if command -v git &> /dev/null; then
-        git init
-        git add .
-        git commit -m "Initial commit: Generated $PROJECT_NAME with SAI Service"
-        print_success "Git repository initialized"
-    fi
-
-    # Generate go.sum
-    if command -v go &> /dev/null; then
-        go mod tidy
-        print_success "Go modules initialized"
-    fi
-
-    cd ..
-}
-
-# Main execution
-main() {
-    print_header
-
-    # Collect configuration
-    collect_configuration
-
-    # Check if project directory exists after input
-    if [ -d "$PROJECT_NAME" ]; then
-        print_error "Directory '$PROJECT_NAME' already exists!"
-        exit 1
-    fi
-
-    # Show configuration summary
-    show_configuration
-
-    # Confirm generation
-    proceed=$(prompt_yes_no "Proceed with generation?" "y")
-    if [ "$proceed" != "true" ]; then
-        echo -e "${YELLOW}Generation cancelled.${NC}"
-        exit 0
-    fi
-
-    echo
-    print_info "Starting project generation..."
-
-    # Create project structure
     create_project_structure
+    create_go_mod
+    create_main_go
+    create_handlers
+    create_service
+    create_types
+    create_config
+    create_env_example
+    create_dockerfile
+    create_docker_compose
+    create_makefile
+    create_docker_entrypoint
+    create_tests
+    create_cicd
+    create_feature_files
+    update_main_go
+    create_readme
 
-    # Generate all files
-    generate_project_files
-
-    # Post-generation tasks
-    post_generation
-
-    # Success message
-    echo
-    print_success "Project '$PROJECT_NAME' generated successfully!"
-    echo
-    echo -e "${CYAN}Next steps:${NC}"
-    echo -e "${GREEN}  1.${NC} cd $PROJECT_NAME"
-    echo -e "${GREEN}  2.${NC} make install-deps"
-    echo -e "${GREEN}  3.${NC} make run"
-    echo
-    echo -e "${BLUE}Available commands:${NC}"
-    echo -e "${GREEN}  make help${NC}          - Show all available commands"
-    echo -e "${GREEN}  make run${NC}           - Run the service locally"
-    echo -e "${GREEN}  make docker-run${NC}    - Run with Docker Compose"
-    echo -e "${GREEN}  make test${NC}          - Run tests"
-    echo -e "${GREEN}  make fmt${NC}           - Format code"
-    echo
-
-    if [[ " ${SELECTED_FEATURES[*]} " == *" docs "* ]]; then
-        echo -e "${BLUE}Documentation:${NC}"
-        echo -e "${GREEN}  http://localhost:$PORT/docs${NC} - API Documentation"
-        echo
-    fi
-
-    if [[ " ${SELECTED_FEATURES[*]} " == *" health "* ]]; then
-        echo -e "${BLUE}Health Check:${NC}"
-        echo -e "${GREEN}  http://localhost:$PORT/health${NC} - Service Health"
-        echo
-    fi
-
-    if [ "$METRICS_TYPE" = "prometheus" ]; then
-        echo -e "${BLUE}Monitoring:${NC}"
-        echo -e "${GREEN}  http://localhost:9090${NC} - Prometheus UI"
-        echo -e "${GREEN}  http://localhost:$PORT/metrics${NC} - Metrics Endpoint"
-        echo
-    fi
-
-    echo -e "${PURPLE}Happy coding! 🚀${NC}"
+    print_success "Project generated successfully!"
+    print_info "Next steps:"
+    echo "  1. cd $(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/ /-/g')"
+    echo "  2. cp .env.example .env"
+    echo "  3. Edit .env file with your settings"
+    echo "  4. make run"
+    echo ""
+    print_info "For more information, see README.md"
 }
 
-# Check dependencies
-check_dependencies() {
-    local missing_deps=()
+# Основная логика скрипта
+main() {
+    # Проверяем аргументы командной строки
+    if [[ $# -eq 0 ]]; then
+        # Интерактивный режим
+        interactive_mode
+    else
+        # Режим с параметрами
+        parse_args "$@"
 
-    if ! command -v go &> /dev/null; then
-        missing_deps+=("go")
+        # Проверяем обязательные параметры
+        if [[ -z "$PROJECT_NAME" ]]; then
+            print_error "Project name is required. Use --name parameter or run without arguments for interactive mode."
+            exit 1
+        fi
+
+        if [[ -z "$PKG_NAME" ]]; then
+            PKG_NAME=$(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/ /-/g')
+        fi
+
+        # Если тесты не указаны, по умолчанию false
+        if [[ -z "$INCLUDE_TESTS" ]]; then
+            INCLUDE_TESTS="false"
+        fi
+
+        # Если CI/CD не указан, по умолчанию none
+        if [[ -z "$CICD_TYPE" ]]; then
+            CICD_TYPE="none"
+        fi
     fi
 
-    if [ ${#missing_deps[@]} -gt 0 ]; then
-        print_warning "Missing dependencies: ${missing_deps[*]}"
-        print_info "Please install the missing dependencies and run the generator again."
-        print_info "The project files will still be generated, but you may need to run 'go mod tidy' manually."
-    fi
+    # Валидация конфигурации
+    validate_configuration
+
+    # Генерация проекта
+    generate_project
 }
 
-# Help function
-show_help() {
-    cat << EOF
-SAI Service Generator
+# Запуск скрипта
+main "$@"
 
-USAGE:
-    $0 [PROJECT_NAME]
-
-DESCRIPTION:
-    Generates a complete microservice project based on SAI Service library.
-    If PROJECT_NAME is provided, it will be used as the default project name.
-
-EXAMPLES:
-    $0                          # Interactive mode
-    $0 my-awesome-api          # Set project name upfront
-
-OPTIONS:
-    -h, --help                 Show this help message
-
-FEATURES:
-    Templates:    basic, api, microservice, full
-    Features:     cache, metrics, docs, cron, actions, tls, middleware, health, client
-    Middlewares:  cache, auth, bodylimit, compression, cors, logging, ratelimit, recovery
-    Cache Types:  memory, redis
-    Metrics:      memory, prometheus
-    CI/CD:        none, github, gitlab
-
-GENERATED STRUCTURE:
-    project-name/
-    ├── cmd/                   # Application entry point
-    ├── internal/              # Private application code
-    ├── tests/                 # Integration tests (optional)
-    ├── .github/workflows/     # CI/CD workflows (optional)
-    ├── config.yml             # Configuration
-    ├── Dockerfile             # Container image
-    ├── docker-compose.yml     # Multi-container setup
-    ├── Makefile              # Development commands
-    ├── go.mod                # Go module
-    └── README.md             # Documentation
-
-EOF
-}
-
-# Parse command line arguments
-parse_args() {
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            -h|--help)
-                show_help
-                exit 0
-                ;;
-            -*)
-                print_error "Unknown option: $1"
-                show_help
-                exit 1
-                ;;
-            *)
-                if [ -z "$PROJECT_NAME" ]; then
-                    PROJECT_NAME="$1"
-                else
-                    print_error "Multiple project names provided: '$PROJECT_NAME' and '$1'"
-                    exit 1
-                fi
-                ;;
-        esac
-        shift
-    done
-}
-
-# Script entry point
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    # Parse command line arguments
-    parse_args "$@"
-
-    # Check dependencies
-    check_dependencies
-
-    # Run main function
-    main
-fi
