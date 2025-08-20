@@ -39,12 +39,12 @@ type CORSMiddleware struct {
 }
 
 type CORSConfig struct {
-	ExposedHeaders   []string `json:"ExposedHeaders"`
-	AllowedOrigins   []string `json:"AllowedOrigins"`
-	AllowedMethods   []string `json:"AllowedMethods"`
-	AllowedHeaders   []string `json:"AllowedHeaders"`
-	AllowCredentials bool     `json:"AllowCredentials"`
-	MaxAge           int      `json:"MaxAge"`
+	ExposedHeaders   []string `json:"exposed_headers"`
+	AllowedOrigins   []string `json:"allowed_origins"`
+	AllowedMethods   []string `json:"allowed_methods"`
+	AllowedHeaders   []string `json:"allowed_headers"`
+	AllowCredentials bool     `json:"allow_credentials"`
+	MaxAge           int      `json:"max_age"`
 }
 
 func NewCORSMiddleware(config types.ConfigManager, logger types.Logger, metrics types.MetricsManager) *CORSMiddleware {

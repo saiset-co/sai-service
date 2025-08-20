@@ -13,6 +13,7 @@ import (
 
 var (
 	challengeError = []byte("basic_auth_challenge_sent")
+	optionsMethod  = []byte("OPTIONS")
 	successMsg     = "Authentication successful"
 	challengeMsg   = "Basic auth challenge sent to browser"
 	failedMsg      = "Authentication failed"
@@ -68,7 +69,16 @@ func (a *AuthMiddleware) Name() string          { return a.name }
 func (a *AuthMiddleware) Weight() int           { return a.weight }
 func (a *AuthMiddleware) Provider() interface{} { return a.provider }
 
-func (a *AuthMiddleware) Handle(ctx *types.RequestCtx, next func(*types.RequestCtx), _ *types.RouteConfig) {
+func (a *AuthMiddleware) Handle(ctx *types.RequestCtx, next func(*types.RequestCtx), config *types.RouteConfig) {
+	if bytes.Equal(ctx.Method(), optionsMethod) {
+		next(ctx)
+		return
+	}
+
+	if a.isDisabledPath(config) {
+		next(ctx)
+		return
+	}
 	err := a.provider.ApplyToIncomingRequest(ctx)
 
 	if err == nil {
@@ -95,4 +105,14 @@ func (a *AuthMiddleware) Handle(ctx *types.RequestCtx, next func(*types.RequestC
 
 func (a *AuthMiddleware) isBasicAuthChallenge(err error) bool {
 	return bytes.Contains([]byte(err.Error()), challengeError)
+}
+
+func (a *AuthMiddleware) isDisabledPath(config *types.RouteConfig) bool {
+	for _, middleware := range config.DisabledMiddlewares {
+		if middleware == a.name {
+			return true
+		}
+	}
+
+	return false
 }

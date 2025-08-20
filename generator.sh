@@ -2,29 +2,27 @@
 
 set -e
 
-# Цвета для вывода
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Глобальные переменные
 PROJECT_NAME=""
 PKG_NAME=""
 TEMPLATE=""
 FEATURES=""
 AUTH_TYPES=""
 CACHE_TYPE=""
+DATABASE_TYPE=""
 METRICS_TYPE=""
 ACTIONS=""
 MIDDLEWARES=""
 INCLUDE_TESTS="false"
 CICD_TYPE=""
 
-# Функции для вывода
 print_info() {
     echo -e "${BLUE}ℹ ${1}${NC}"
 }
@@ -45,7 +43,6 @@ print_header() {
     echo -e "${PURPLE}${1}${NC}"
 }
 
-# Функция для отображения справки
 show_help() {
     echo -e "${CYAN}SAI Service Generator${NC}"
     echo ""
@@ -54,9 +51,11 @@ show_help() {
     echo "Options:"
     echo "  --name STRING          Project name"
     echo "  --pkg STRING           Go package name (e.g., github.com/user/project)"
-    echo "  --features STRING      Comma-separated features: auth,cache,metrics,docs,cron,actions,tls,middlewares,health,client"
+    echo "  --template STRING      Template type: basic,api,microservice,full,custom"
+    echo "  --features STRING      Comma-separated features: auth,cache,database,metrics,docs,cron,actions,tls,middlewares,health,client"
     echo "  --auth STRING          Auth types: basic,token (comma-separated)"
     echo "  --cache STRING         Cache type: memory,redis"
+    echo "  --database STRING      Database type: clover,memory"
     echo "  --metrics STRING       Metrics type: memory,prometheus"
     echo "  --actions STRING       Actions: websocket,webhook (comma-separated)"
     echo "  --middlewares STRING   Middlewares: auth,bodylimit,cache,compression,cors,logging,ratelimit,recovery (comma-separated)"
@@ -73,10 +72,9 @@ show_help() {
     echo ""
     echo "Examples:"
     echo "  $0 --name \"Hello World\" --pkg \"github.com/user/hello\" --features \"auth,cache\" --middlewares \"auth,recovery,logging\""
-    echo "  $0  # Interactive mode"
+    echo "  $0"
 }
 
-# Функция для парсинга аргументов командной строки
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -86,6 +84,10 @@ parse_args() {
                 ;;
             --pkg)
                 PKG_NAME="$2"
+                shift 2
+                ;;
+            --template)
+                TEMPLATE="$2"
                 shift 2
                 ;;
             --features)
@@ -98,6 +100,10 @@ parse_args() {
                 ;;
             --cache)
                 CACHE_TYPE="$2"
+                shift 2
+                ;;
+            --database)
+                DATABASE_TYPE="$2"
                 shift 2
                 ;;
             --metrics)
@@ -133,26 +139,22 @@ parse_args() {
     done
 }
 
-# Функция для интерактивного ввода
 interactive_mode() {
     print_header "=== SAI Service Generator - Interactive Mode ==="
     echo ""
 
-    # Project name
     read -p "Project name: " PROJECT_NAME
     while [[ -z "$PROJECT_NAME" ]]; do
         print_warning "Project name is required"
         read -p "Project name: " PROJECT_NAME
     done
 
-    # Package name
     local default_pkg=$(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/ /-/g')
     read -p "Go pkg name [$default_pkg]: " PKG_NAME
     if [[ -z "$PKG_NAME" ]]; then
         PKG_NAME="$default_pkg"
     fi
 
-    # Template selection
     echo ""
     print_info "Available templates: custom basic api microservice full"
     read -p "Select template [custom]: " TEMPLATE
@@ -160,21 +162,18 @@ interactive_mode() {
         TEMPLATE="custom"
     fi
 
-    # Если выбран не custom, применяем предустановки
     if [[ "$TEMPLATE" != "custom" ]]; then
         apply_template_preset "$TEMPLATE"
     else
         configure_custom_template
     fi
 
-    # Tests
     echo ""
     read -p "Include integration tests? [y/N]: " test_choice
     if [[ "$test_choice" =~ ^[Yy]$ ]]; then
         INCLUDE_TESTS="true"
     fi
 
-    # CI/CD
     echo ""
     print_info "Available CI/CD: none github gitlab"
     read -p "Generate CI/CD files [none]: " CICD_TYPE
@@ -183,7 +182,6 @@ interactive_mode() {
     fi
 }
 
-# Функция для применения предустановок шаблонов
 apply_template_preset() {
     local template=$1
 
@@ -197,39 +195,40 @@ apply_template_preset() {
             ACTIONS=""
             ;;
         api)
-            FEATURES="health,middlewares,docs,cache"
+            FEATURES="health,middlewares,docs,cache,database"
             MIDDLEWARES="auth,cache,recovery,logging,cors,bodylimit"
             AUTH_TYPES="token"
             CACHE_TYPE="redis"
+            DATABASE_TYPE="clover"
             METRICS_TYPE=""
             ACTIONS=""
             ;;
         microservice)
-            FEATURES="health,middlewares,docs,cache,client,actions"
+            FEATURES="health,middlewares,docs,cache,database,client,actions"
             MIDDLEWARES="auth,cache,recovery,logging,cors,bodylimit"
             AUTH_TYPES="token"
             CACHE_TYPE="redis"
+            DATABASE_TYPE="clover"
             METRICS_TYPE=""
             ACTIONS="webhook"
             ;;
         full)
-            FEATURES="auth,cache,metrics,docs,cron,actions,tls,middlewares,health,client"
+            FEATURES="auth,cache,database,metrics,docs,cron,actions,tls,middlewares,health,client"
             MIDDLEWARES="auth,bodylimit,cache,compression,cors,logging,ratelimit,recovery"
             AUTH_TYPES="basic,token"
             CACHE_TYPE="redis"
+            DATABASE_TYPE="clover"
             METRICS_TYPE="prometheus"
             ACTIONS="websocket,webhook"
             ;;
     esac
 }
 
-# Функция для настройки custom шаблона
 configure_custom_template() {
     echo ""
-    print_info "Available features: auth cache metrics docs cron actions tls middlewares health client"
+    print_info "Available features: auth cache database metrics docs cron actions tls middlewares health client"
     read -p "Enable features (comma-separated): " FEATURES
 
-    # Настройка actions
     if [[ "$FEATURES" == *"actions"* ]]; then
         echo ""
         read -p "Enable websocket actions? [y/N]: " websocket_choice
@@ -248,7 +247,6 @@ configure_custom_template() {
         fi
     fi
 
-    # Настройка auth
     if [[ "$FEATURES" == *"auth"* ]]; then
         echo ""
         read -p "Enable basic auth support? [y/N]: " basic_choice
@@ -267,26 +265,28 @@ configure_custom_template() {
         fi
     fi
 
-    # Настройка cache
     if [[ "$FEATURES" == *"cache"* ]]; then
         echo ""
         print_info "Available cache: memory redis"
         read -p "Select cache type: " CACHE_TYPE
     fi
 
-    # Настройка metrics
+    if [[ "$FEATURES" == *"database"* ]]; then
+        echo ""
+        print_info "Available database: clover memory"
+        read -p "Select database type: " DATABASE_TYPE
+    fi
+
     if [[ "$FEATURES" == *"metrics"* ]]; then
         echo ""
         print_info "Available metrics: memory prometheus"
         read -p "Select metrics type: " METRICS_TYPE
     fi
 
-    # Настройка middlewares
     if [[ "$FEATURES" == *"middlewares"* ]]; then
         echo ""
         local available_mw="recovery,logging,ratelimit,bodylimit,cors"
 
-        # Добавляем доступные middleware в зависимости от выбранных фич
         if [[ "$FEATURES" == *"cache"* ]]; then
             available_mw="$available_mw,cache"
         fi
@@ -301,7 +301,6 @@ configure_custom_template() {
     fi
 }
 
-# Функция для валидации конфигурации
 validate_configuration() {
     echo ""
     print_header "=== Configuration ==="
@@ -319,6 +318,9 @@ validate_configuration() {
     if [[ -n "$CACHE_TYPE" ]]; then
         echo "   • Cache: $CACHE_TYPE"
     fi
+    if [[ -n "$DATABASE_TYPE" ]]; then
+        echo "   • Database: $DATABASE_TYPE"
+    fi
     if [[ -n "$METRICS_TYPE" ]]; then
         echo "   • Metrics: $METRICS_TYPE"
     fi
@@ -331,34 +333,22 @@ validate_configuration() {
     echo "   • Tests: $INCLUDE_TESTS"
     echo "   • CI/CD: $CICD_TYPE"
     echo ""
-
-    read -p "Proceed with generation? [Y/n]: " confirm
-    if [[ "$confirm" =~ ^[Nn]$ ]]; then
-        if [[ -n "$TEMPLATE" && "$TEMPLATE" != "custom" ]]; then
-            print_info "Returning to template selection..."
-            interactive_mode
-            return
-        else
-            print_info "Returning to feature configuration..."
-            configure_custom_template
-            validate_configuration
-            return
-        fi
-    fi
 }
 
-# Функция создания директории проекта
 create_project_structure() {
     local project_dir=$(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/ /-/g')
 
     print_info "Creating project structure in: $project_dir"
 
     mkdir -p "$project_dir"/{cmd,internal,scripts,types}
+    
+    if [[ "$FEATURES" == *"database"* ]]; then
+        mkdir -p "$project_dir"/data/db
+    fi
 
     cd "$project_dir"
 }
 
-# Функция создания go.mod
 create_go_mod() {
     print_info "Creating go.mod..."
 
@@ -366,10 +356,15 @@ create_go_mod() {
 module ${PKG_NAME}
 
 go 1.21
+
+require (
+    github.com/saiset-co/sai-service v1.0.0
+)
+
+replace github.com/saiset-co/sai-service => ../sai-service
 EOF
 }
 
-# Функция создания main.go
 create_main_go() {
     print_info "Creating cmd/main.go..."
 
@@ -389,12 +384,11 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	srv, err := service.NewService(ctx, "./config.yaml")
+	srv, err := service.NewService(ctx, "./config.yml")
 	if err != nil {
 		log.Fatalf("Failed to create service: %v", err)
 	}
 
-	// Инициализация бизнес-логики
 	businessService := internal.NewBusinessService(ctx)
 	if err := businessService.Initialize(); err != nil {
 		log.Fatalf("Failed to initialize business service: %v", err)
@@ -411,7 +405,6 @@ func main() {
 EOF
 }
 
-# Функция создания handlers.go
 create_handlers() {
     print_info "Creating internal/handlers.go..."
 
@@ -422,13 +415,11 @@ create_handlers() {
     fi
 }
 
-# Функция создания basic handlers
 create_basic_handlers() {
     local handlers_content='package internal
 
 import ('
 
-    # Добавляем импорт time если включен cache
     if [[ "$FEATURES" == *"cache"* ]]; then
         handlers_content+='
 	"time"'
@@ -442,12 +433,9 @@ import ('
 	"github.com/saiset-co/sai-service/types"
 )
 
-// RegisterRoutes регистрирует все роуты приложения
 func RegisterRoutes() {
-	// Группа API v1
 	api := sai.Router().Group("/api/v1")'
 
-    # Добавляем cache если включен
     if [[ "$FEATURES" == *"cache"* ]]; then
         handlers_content+='.
 		WithCache("api_cache", time.Hour)'
@@ -455,11 +443,9 @@ func RegisterRoutes() {
 
     handlers_content+='
 
-	// Базовый роут
 	api.GET("/hello", handleHello)
 }
 
-// handleHello базовый тестовый handler
 func handleHello(ctx *types.RequestCtx) {
 	response := map[string]interface{}{
 		"message": "Hello from '"${PROJECT_NAME}"'!",
@@ -475,14 +461,12 @@ func handleHello(ctx *types.RequestCtx) {
     echo "$handlers_content" > internal/handlers.go
 }
 
-# Функция создания API handlers с CRUD
 create_api_handlers() {
     local handlers_content='package internal
 
 import (
 	"fmt"'
 
-    # Добавляем импорт time если включен cache
     if [[ "$FEATURES" == *"cache"* ]]; then
         handlers_content+='
 	"time"'
@@ -497,12 +481,9 @@ import (
 	projectTypes "'${PKG_NAME}'/types"
 )
 
-// RegisterRoutes регистрирует все роуты приложения
 func RegisterRoutes() {
-	// Группа API v1
 	api := sai.Router().Group("/api/v1")'
 
-    # Добавляем cache если включен
     if [[ "$FEATURES" == *"cache"* ]]; then
         handlers_content+='.
 		WithCache("api_cache", time.Hour)'
@@ -510,12 +491,10 @@ func RegisterRoutes() {
 
     handlers_content+='
 
-	// CRUD группа
 	crud := api.Group("/documents")
 
-	// CRUD endpoints'
+'
 
-    # Добавляем docs если включен
     if [[ "$FEATURES" == *"docs"* ]]; then
         handlers_content+='
 	crud.POST("/", handleCreate).
@@ -536,11 +515,9 @@ func RegisterRoutes() {
 
     handlers_content+='
 
-	// Базовый роут
 	api.GET("/hello", handleHello)
 }
 
-// handleCreate создает новые документы
 func handleCreate(ctx *types.RequestCtx) {
 	var req projectTypes.CreateRequest
 	if err := ctx.Read(&req); err != nil {
@@ -548,7 +525,6 @@ func handleCreate(ctx *types.RequestCtx) {
 		return
 	}
 
-	// Здесь должна быть бизнес-логика создания
 	response := &projectTypes.CreateResponse{
 		Success: true,
 		Created: len(req.Documents),
@@ -561,12 +537,9 @@ func handleCreate(ctx *types.RequestCtx) {
 	}
 }
 
-// handleRead читает документы с фильтрацией и пагинацией
 func handleRead(ctx *types.RequestCtx) {
 	var req projectTypes.ReadRequest
-	// Здесь должно быть чтение параметров из query string
 
-	// Пример данных
 	documents := []map[string]interface{}{
 		{"id": "1", "name": "Document 1", "content": "Sample content 1"},
 		{"id": "2", "name": "Document 2", "content": "Sample content 2"},
@@ -586,7 +559,6 @@ func handleRead(ctx *types.RequestCtx) {
 	}
 }
 
-// handleUpdate обновляет документы по фильтру
 func handleUpdate(ctx *types.RequestCtx) {
 	var req projectTypes.UpdateRequest
 	if err := ctx.Read(&req); err != nil {
@@ -594,10 +566,9 @@ func handleUpdate(ctx *types.RequestCtx) {
 		return
 	}
 
-	// Здесь должна быть бизнес-логику обновления
 	response := &projectTypes.UpdateResponse{
 		Success: true,
-		Updated: 1, // Пример
+		Updated: 1,
 	}
 
 	_, err := ctx.SuccessJSON(response)
@@ -606,7 +577,6 @@ func handleUpdate(ctx *types.RequestCtx) {
 	}
 }
 
-// handleDelete удаляет документы по фильтру
 func handleDelete(ctx *types.RequestCtx) {
 	var req projectTypes.DeleteRequest
 	if err := ctx.Read(&req); err != nil {
@@ -614,10 +584,9 @@ func handleDelete(ctx *types.RequestCtx) {
 		return
 	}
 
-	// Здесь должна быть бизнес-логика удаления
 	response := &projectTypes.DeleteResponse{
 		Success: true,
-		Deleted: 1, // Пример
+		Deleted: 1,
 	}
 
 	_, err := ctx.SuccessJSON(response)
@@ -626,7 +595,6 @@ func handleDelete(ctx *types.RequestCtx) {
 	}
 }
 
-// handleHello базовый тестовый handler
 func handleHello(ctx *types.RequestCtx) {
 	response := map[string]interface{}{
 		"message": "Hello from '"${PROJECT_NAME}"'!",
@@ -639,7 +607,6 @@ func handleHello(ctx *types.RequestCtx) {
 	}
 }
 
-// generateIDs генерирует примеры ID для созданных документов
 func generateIDs(count int) []string {
 	ids := make([]string, count)
 	for i := 0; i < count; i++ {
@@ -651,37 +618,52 @@ func generateIDs(count int) []string {
     echo "$handlers_content" > internal/handlers.go
 }
 
-# Функция создания service.go
 create_service() {
     print_info "Creating internal/service.go..."
 
-    cat > internal/service.go << 'EOF'
+    local service_imports='import (
+	"context"'
+	
+    if [[ "$FEATURES" == *"client"* || "$FEATURES" == *"cron"* ]]; then
+        service_imports+='
+	"time"'
+    fi
+    
+    service_imports+='
+
+	"github.com/saiset-co/sai-service/sai"'
+    
+    if [[ "$FEATURES" == *"client"* ]]; then
+        service_imports+='
+	"github.com/saiset-co/sai-service/types"'
+    fi
+    
+    if [[ "$FEATURES" == *"client"* ]]; then
+        service_imports+='
+	"go.uber.org/zap"'
+    fi
+    
+    service_imports+='
+)'
+
+    cat > internal/service.go << EOF
 package internal
 
-import (
-	"context"
+${service_imports}
 
-	"github.com/saiset-co/sai-service/sai"
-)
-
-// BusinessService представляет основную бизнес-логику сервиса
 type BusinessService struct {
 	ctx context.Context
 }
 
-// NewBusinessService создает новый экземпляр бизнес-сервиса
 func NewBusinessService(ctx context.Context) *BusinessService {
 	return &BusinessService{
 		ctx: ctx,
 	}
 }
 
-// Initialize инициализирует бизнес-логику
 func (s *BusinessService) Initialize() error {
-	// Регистрируем роуты
 	RegisterRoutes()
 
-	// Здесь можно добавить дополнительную инициализацию
 	sai.Logger().Info("Business service initialized")
 
 	return nil
@@ -689,7 +671,6 @@ func (s *BusinessService) Initialize() error {
 EOF
 }
 
-# Функция создания types.go
 create_types() {
     print_info "Creating types/types.go..."
 
@@ -698,28 +679,20 @@ create_types() {
     fi
 }
 
-# Функция создания API types с CRUD структурами
 create_api_types() {
     cat > types/types.go << 'EOF'
 package types
 
-// Общие структуры и интерфейсы проекта
-
-// CRUD типы для API
-
-// CreateRequest запрос на создание документов
 type CreateRequest struct {
 	Documents []map[string]interface{} `json:"documents" validate:"required,min=1"`
 }
 
-// CreateResponse ответ на создание документов
 type CreateResponse struct {
 	Success bool     `json:"success"`
 	Created int      `json:"created"`
 	IDs     []string `json:"ids"`
 }
 
-// ReadRequest запрос на чтение документов
 type ReadRequest struct {
 	Filter map[string]interface{} `json:"filter,omitempty"`
 	Page   int                    `json:"page,omitempty"`
@@ -727,7 +700,6 @@ type ReadRequest struct {
 	Count  bool                   `json:"count,omitempty"`
 }
 
-// ReadResponse ответ на чтение документов
 type ReadResponse struct {
 	Success   bool                     `json:"success"`
 	Documents []map[string]interface{} `json:"documents"`
@@ -736,24 +708,20 @@ type ReadResponse struct {
 	Limit     int                      `json:"limit,omitempty"`
 }
 
-// UpdateRequest запрос на обновление документов
 type UpdateRequest struct {
 	Filter map[string]interface{} `json:"filter" validate:"required"`
 	Update map[string]interface{} `json:"update" validate:"required"`
 }
 
-// UpdateResponse ответ на обновление документов
 type UpdateResponse struct {
 	Success bool `json:"success"`
 	Updated int  `json:"updated"`
 }
 
-// DeleteRequest запрос на удаление документов
 type DeleteRequest struct {
 	Filter map[string]interface{} `json:"filter" validate:"required"`
 }
 
-// DeleteResponse ответ на удаление документов
 type DeleteResponse struct {
 	Success bool `json:"success"`
 	Deleted int  `json:"deleted"`
@@ -761,7 +729,6 @@ type DeleteResponse struct {
 EOF
 }
 
-# Функция создания конфигурации
 create_config() {
     print_info "Creating config.template.yml..."
 
@@ -776,7 +743,6 @@ server:
     write_timeout: ${SERVER_WRITE_TIMEOUT}
     idle_timeout: ${SERVER_IDLE_TIMEOUT}'
 
-    # TLS конфигурация
     if [[ "$FEATURES" == *"tls"* ]]; then
         config_content+='
   tls:
@@ -787,14 +753,13 @@ server:
     cache_dir: "${TLS_CACHE_DIR}"'
     fi
 
-    # Logger всегда включен
     config_content+='
 
 logger:
-  level: "${LOGGER_LEVEL}"
-  type: "${LOGGER_TYPE}"'
+  level: "${LOG_LEVEL}"
+  format: "${LOG_FORMAT}"
+  output: "${LOG_OUTPUT}"'
 
-    # Auth providers
     if [[ -n "$AUTH_TYPES" ]]; then
         config_content+='
 
@@ -814,7 +779,6 @@ auth_providers:'
         fi
     fi
 
-    # Cache конфигурация
     if [[ "$FEATURES" == *"cache"* ]]; then
         config_content+='
 
@@ -833,7 +797,16 @@ cache:
         fi
     fi
 
-    # Metrics конфигурация
+    if [[ "$FEATURES" == *"database"* ]]; then
+        config_content+='
+
+database:
+  enabled: ${DATABASE_ENABLED}
+  type: "${DATABASE_TYPE}"
+  path: "${DATABASE_PATH}"
+  name: "${DATABASE_NAME}"'
+    fi
+
     if [[ "$FEATURES" == *"metrics"* ]]; then
         config_content+='
 
@@ -854,7 +827,6 @@ metrics:
         fi
     fi
 
-    # Actions конфигурация
     if [[ "$FEATURES" == *"actions"* ]]; then
         config_content+='
 
@@ -877,7 +849,6 @@ actions:
         fi
     fi
 
-    # Cron конфигурация
     if [[ "$FEATURES" == *"cron"* ]]; then
         config_content+='
 
@@ -886,7 +857,6 @@ cron:
   timezone: "${CRON_TIMEZONE}"'
     fi
 
-    # Middlewares конфигурация
     if [[ "$FEATURES" == *"middlewares"* && -n "$MIDDLEWARES" ]]; then
         config_content+='
 
@@ -895,7 +865,7 @@ middlewares:
 
         IFS=',' read -ra MW_ARRAY <<< "$MIDDLEWARES"
         for mw in "${MW_ARRAY[@]}"; do
-            mw=$(echo "$mw" | xargs) # trim whitespace
+            mw=$(echo "$mw" | xargs)
             case $mw in
                 recovery)
                     config_content+='
@@ -972,7 +942,6 @@ middlewares:
         done
     fi
 
-    # Docs конфигурация
     if [[ "$FEATURES" == *"docs"* ]]; then
         config_content+='
 
@@ -981,7 +950,6 @@ docs:
   path: "${DOCS_PATH}"'
     fi
 
-    # Health конфигурация
     if [[ "$FEATURES" == *"health"* ]]; then
         config_content+='
 
@@ -989,7 +957,6 @@ health:
   enabled: ${HEALTH_ENABLED}'
     fi
 
-    # Clients конфигурация
     if [[ "$FEATURES" == *"client"* ]]; then
         config_content+='
 
@@ -1010,29 +977,27 @@ clients:
     echo "$config_content" > config.template.yml
 }
 
-# Функция создания .env.example
 create_env_example() {
     print_info "Creating .env.example..."
 
-    local env_content="SERVICE_NAME=${PROJECT_NAME}
+    local env_content="DOCKERFILE=Dockerfile
+SERVICE_NAME=\"${PROJECT_NAME}\"
 SERVICE_VERSION=1.0.0
 
-# Server configuration
-SERVER_HOST=0.0.0.0
+SERVER_HOST=127.0.0.1
 SERVER_PORT=8080
+SERVER_EXTERNAL_PORT=8080
 SERVER_READ_TIMEOUT=30
 SERVER_WRITE_TIMEOUT=30
 SERVER_IDLE_TIMEOUT=120
 
-# Logger configuration
-LOGGER_LEVEL=info
-LOGGER_TYPE=default"
+LOG_LEVEL=debug
+LOG_OUTPUT=stdout
+LOG_FORMAT=console"
 
-    # TLS configuration
     if [[ "$FEATURES" == *"tls"* ]]; then
         env_content+="
 
-# TLS configuration
 TLS_ENABLED=false
 TLS_AUTO_CERT=false
 TLS_EMAIL=
@@ -1040,11 +1005,8 @@ TLS_CACHE_DIR=./certs
 TLS_DOMAINS=\"example.com\",\"www.example.com\""
     fi
 
-    # Auth configuration
     if [[ -n "$AUTH_TYPES" ]]; then
-        env_content+="
 
-# Auth configuration"
         if [[ "$AUTH_TYPES" == *"token"* ]]; then
             env_content+="
 AUTH_TOKEN=your-secret-token-here"
@@ -1056,11 +1018,9 @@ AUTH_PASSWORD=secure-password"
         fi
     fi
 
-    # Cache configuration
     if [[ "$FEATURES" == *"cache"* ]]; then
         env_content+="
 
-# Cache configuration
 CACHE_ENABLED=true
 CACHE_TYPE=$CACHE_TYPE
 CACHE_DEFAULT_TTL=1h"
@@ -1074,11 +1034,18 @@ REDIS_DB=0"
         fi
     fi
 
-    # Metrics configuration
+    if [[ "$FEATURES" == *"database"* ]]; then
+        env_content+="
+
+DATABASE_ENABLED=true
+DATABASE_TYPE=$DATABASE_TYPE
+DATABASE_PATH=./data/db
+DATABASE_NAME=\${SERVICE_NAME}"
+    fi
+
     if [[ "$FEATURES" == *"metrics"* ]]; then
         env_content+="
 
-# Metrics configuration
 METRICS_ENABLED=true
 METRICS_TYPE=$METRICS_TYPE
 METRICS_HTTP_ENABLED=true
@@ -1093,11 +1060,9 @@ METRICS_COLLECTORS_HTTP=true"
         fi
     fi
 
-    # Actions configuration
     if [[ "$FEATURES" == *"actions"* ]]; then
         env_content+="
 
-# Actions configuration
 ACTIONS_ENABLED=true"
 
         if [[ "$ACTIONS" == *"websocket"* ]]; then
@@ -1113,20 +1078,16 @@ ACTIONS_WEBHOOKS_ENABLED=true"
         fi
     fi
 
-    # Cron configuration
     if [[ "$FEATURES" == *"cron"* ]]; then
         env_content+="
 
-# Cron configuration
 CRON_ENABLED=true
 CRON_TIMEZONE=UTC"
     fi
 
-    # Middlewares configuration
     if [[ "$FEATURES" == *"middlewares"* && -n "$MIDDLEWARES" ]]; then
         env_content+="
 
-# Middlewares configuration
 MIDDLEWARES_ENABLED=true"
 
         IFS=',' read -ra MW_ARRAY <<< "$MIDDLEWARES"
@@ -1191,28 +1152,22 @@ MIDDLEWARE_CACHE_TTL=5m"
         done
     fi
 
-    # Docs configuration
     if [[ "$FEATURES" == *"docs"* ]]; then
         env_content+="
 
-# Docs configuration
 DOCS_ENABLED=true
 DOCS_PATH=/docs"
     fi
 
-    # Health configuration
     if [[ "$FEATURES" == *"health"* ]]; then
         env_content+="
 
-# Health configuration
 HEALTH_ENABLED=true"
     fi
 
-    # Clients configuration
     if [[ "$FEATURES" == *"client"* ]]; then
         env_content+="
 
-# Clients configuration
 CLIENTS_ENABLED=true
 CLIENTS_DEFAULT_TIMEOUT=30s
 CLIENTS_MAX_IDLE_CONNECTIONS=100
@@ -1227,65 +1182,74 @@ CLIENTS_CIRCUIT_BREAKER_HALF_OPEN_REQUESTS=3"
     printf "%s\n" "$env_content" > .env.example
 }
 
-# Функция создания Dockerfile
 create_dockerfile() {
     print_info "Creating Dockerfile..."
 
-    cat > Dockerfile << 'EOF'
-# Build stage
-FROM golang:1.21-alpine AS builder
+    local project_name_lower=$(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/ /-/g')
+
+    cat > Dockerfile << EOF
+FROM golang:1.24-alpine AS builder
+
+RUN apk add --no-cache git ca-certificates tzdata gcc musl-dev
+
+WORKDIR /build
+
+COPY go.mod go.sum ./
+
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build \\
+    -ldflags='-w -s -extldflags "-static"' \\
+    -a -installsuffix cgo \\
+    -o ${project_name_lower} \\
+    ./cmd/main.go
+
+FROM alpine:latest
+
+RUN apk --no-cache add ca-certificates tzdata gettext
+
+RUN addgroup -g 1001 -S appgroup && adduser -u 1001 -S appuser -G appgroup
 
 WORKDIR /app
 
-# Install dependencies
-RUN apk add --no-cache git ca-certificates tzdata
+COPY --from=builder /build/${project_name_lower} .
+COPY --from=builder /build/scripts/docker-entrypoint.sh /usr/local/bin/
 
-# Copy go mod files
-COPY go.mod go.sum ./
-RUN go mod download
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+RUN chown -R appuser:appgroup /app
 
-# Copy source code
-COPY . .
-
-# Build binary
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o main ./cmd
-
-# Runtime stage
-FROM alpine:latest
-
-RUN apk --no-cache add ca-certificates tzdata
-WORKDIR /root/
-
-# Copy binary and configs
-COPY --from=builder /app/main .
-COPY --from=builder /app/config.template.yml .
-COPY --from=builder /app/scripts/docker-entrypoint.sh .
-
-# Make script executable
-RUN chmod +x ./docker-entrypoint.sh
+USER appuser
 
 EXPOSE 8080
 
-ENTRYPOINT ["./docker-entrypoint.sh"]
-CMD ["./main"]
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["./${project_name_lower}"]
 EOF
 }
 
-# Функция создания docker-compose.yml
 create_docker_compose() {
     print_info "Creating docker-compose.yml..."
 
-    local compose_content='version: "3.8"
+    local project_name_lower=$(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/ /-/g')
 
-services:
-  app:
-    build: .
+    local compose_content="services:
+  ${project_name_lower}:
+    build:
+      context: ..
+      dockerfile: ./${project_name_lower}/\${DOCKERFILE}
+    container_name: ${project_name_lower}
     ports:
-      - "8080:8080"
+      - \${SERVER_EXTERNAL_PORT}:\${SERVER_PORT}
     env_file:
-      - .env'
+      - .env
+    networks:
+      - sai-network
+    restart: unless-stopped
+    volumes:
+      - ./config.template.yml:/app/config.template.yml"
 
-    # Добавляем зависимости
     local dependencies=()
     if [[ "$CACHE_TYPE" == "redis" ]]; then
         dependencies+=("redis")
@@ -1295,76 +1259,86 @@ services:
     fi
 
     if [[ ${#dependencies[@]} -gt 0 ]]; then
-        compose_content+='
-    depends_on:'
+        compose_content+="
+    depends_on:"
         for dep in "${dependencies[@]}"; do
             compose_content+="
       - $dep"
         done
     fi
 
-    # Добавляем Redis если нужен
     if [[ "$CACHE_TYPE" == "redis" ]]; then
-        compose_content+='
+        compose_content+="
 
   redis:
     image: redis:7-alpine
+    container_name: ${project_name_lower}-redis
     ports:
-      - "6379:6379"'
+      - \"6379:6379\"
+    networks:
+      - sai-network
+    restart: unless-stopped"
     fi
 
-    # Добавляем Prometheus если нужен
     if [[ "$METRICS_TYPE" == "prometheus" ]]; then
-        compose_content+='
+        compose_content+="
 
   prometheus:
     image: prom/prometheus:latest
+    container_name: ${project_name_lower}-prometheus
     ports:
-      - "9091:9090"
+      - \"9091:9090\"
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml'
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - sai-network
+    restart: unless-stopped"
     fi
+
+    compose_content+="
+
+networks:
+  sai-network:
+    name: sai-network
+    driver: bridge"
 
     echo "$compose_content" > docker-compose.yml
 }
 
-# Функция создания Makefile
 create_makefile() {
     print_info "Creating Makefile..."
 
-    cat > Makefile << 'EOF'
+    local project_name_lower=$(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/ /-/g')
+
+    cat > Makefile << EOF
 .PHONY: help config build run test clean fmt lint security docker-build docker-run docker-stop docker-logs docker-log
 
-# Default target
 .DEFAULT_GOAL := help
 
-# Variables
 BINARY_NAME=main
 BUILD_DIR=./bin
-CONFIG_FILE=config.yml
-CONFIG_TEMPLATE=config.template.yml
 
 help: ## Show this help message
 	@echo "Available commands:"
-	@grep -E '^[a-zA-Z_-]+:.*?## .* $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $1, $2}'
+	@grep -E '^[a-zA-Z_-]+:.*?## .*\$\$' \$(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\\033[36m%-20s\\033[0m %s\\n", \$\$1, \$\$2}'
 
 config: ## Build config.yml from template and .env
 	@echo "Building configuration..."
 	@if [ ! -f .env ]; then cp .env.example .env; fi
-	@export $(cat .env | xargs) && envsubst < $(CONFIG_TEMPLATE) > $(CONFIG_FILE)
+	@set -a && . ./.env && set +a && envsubst < config.template.yml > config.yml
 	@echo "Configuration built successfully"
 
 build: config ## Build the application
 	@echo "Building application..."
 	@if [ ! -f .env ]; then cp .env.example .env; fi
 	@go mod tidy
-	@mkdir -p $(BUILD_DIR)
-	@go build -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd
+	@mkdir -p \$(BUILD_DIR)
+	@go build -o \$(BUILD_DIR)/\$(BINARY_NAME) ./cmd
 	@echo "Build completed successfully"
 
 run: build ## Build and run the application
 	@echo "Starting application..."
-	@./$(BUILD_DIR)/$(BINARY_NAME)
+	@\$(BUILD_DIR)/\$(BINARY_NAME)
 
 test: build ## Run tests
 	@echo "Running tests..."
@@ -1372,8 +1346,8 @@ test: build ## Run tests
 
 clean: ## Clean build artifacts
 	@echo "Cleaning build artifacts..."
-	@rm -rf $(BUILD_DIR)
-	@rm -f $(CONFIG_FILE)
+	@rm -rf \$(BUILD_DIR)
+	@rm -f config.yml
 	@echo "Clean completed"
 
 fmt: ## Format code
@@ -1393,7 +1367,7 @@ security: ## Run security checks
 
 docker-build: ## Build Docker image
 	@echo "Building Docker image..."
-	@docker build -t $(echo "$(pwd)" | sed 's/.*\///'):latest .
+	@docker build -t \$(shell basename \$(CURDIR)):latest .
 	@echo "Docker image built successfully"
 
 docker-run: ## Run with Docker Compose
@@ -1414,7 +1388,6 @@ docker-log: ## Show main service logs
 EOF
 }
 
-# Функция создания docker-entrypoint.sh
 create_docker_entrypoint() {
     print_info "Creating scripts/docker-entrypoint.sh..."
 
@@ -1423,21 +1396,18 @@ create_docker_entrypoint() {
 
 set -e
 
-# Build config from template using environment variables
 echo "Building configuration from template..."
 envsubst < "./config.template.yml" > "./config.yml"
 
 echo "Configuration built successfully"
 echo "Starting application..."
 
-# Execute the main command
 exec "$@"
 EOF
 
     chmod +x scripts/docker-entrypoint.sh
 }
 
-# Функция создания тестов
 create_tests() {
     if [[ "$INCLUDE_TESTS" == "true" ]]; then
         print_info "Creating integration tests..."
@@ -1458,8 +1428,6 @@ import (
 )
 
 func TestHealthCheck(t *testing.T) {
-  // Тест проверяет что endpoint /hello доступен
-  // В реальном тесте здесь должна быть инициализация тестового сервера
 
   req := fasthttp.AcquireRequest()
   resp := fasthttp.AcquireResponse()
@@ -1487,7 +1455,6 @@ func TestHealthCheck(t *testing.T) {
 }
 
 func TestServiceAPI(t *testing.T) {
-  // Тест для API endpoints
   req := fasthttp.AcquireRequest()
   resp := fasthttp.AcquireResponse()
   defer fasthttp.ReleaseRequest(req)
@@ -1509,13 +1476,11 @@ func TestServiceAPI(t *testing.T) {
 
   assert.Equal(t, fasthttp.StatusOK, resp.StatusCode())
 
-  // Проверяем что ответ содержит JSON
   contentType := string(resp.Header.Peek("Content-Type"))
   assert.Contains(t, contentType, "application/json")
 }
 EOF
 
-        # Обновляем go.mod для тестов
         cat >> go.mod << 'EOF'
 
 require (
@@ -1526,7 +1491,6 @@ EOF
     fi
 }
 
-# Функция создания CI/CD файлов
 create_cicd() {
     case $CICD_TYPE in
         github)
@@ -1693,9 +1657,7 @@ EOF
     esac
 }
 
-# Функция создания дополнительных файлов в зависимости от фич
 create_feature_files() {
-    # Prometheus конфигурация
     if [[ "$METRICS_TYPE" == "prometheus" ]]; then
         print_info "Creating prometheus.yml..."
 
@@ -1713,15 +1675,12 @@ scrape_configs:
 EOF
     fi
 
-    # Создание cron jobs если включен cron
     if [[ "$FEATURES" == *"cron"* ]]; then
         print_info "Adding cron job example to service.go..."
 
         cat >> internal/service.go << 'EOF'
 
-// InitializeCronJobs инициализирует задачи cron
 func (s *BusinessService) InitializeCronJobs() error {
-  // Пример cron задачи - выполняется каждую минуту
   err := sai.Cron().Add("example_job", "0 * * * * *", func() {
     sai.Logger().Info("Example cron job executed")
   })
@@ -1736,13 +1695,11 @@ func (s *BusinessService) InitializeCronJobs() error {
 EOF
     fi
 
-    # Создание примера клиента если включены clients
     if [[ "$FEATURES" == *"client"* ]]; then
         print_info "Adding client example to service.go..."
 
         cat >> internal/service.go << 'EOF'
 
-// ExampleAPICall демонстрирует использование HTTP клиента
 func (s *BusinessService) ExampleAPICall() error {
   response, statusCode, err := sai.ClientManager().Call(
     "example-service",
@@ -1772,173 +1729,14 @@ EOF
     fi
 }
 
-# Функция обновления main.go для включения дополнительных фич
 update_main_go() {
     if [[ "$FEATURES" == *"cron"* ]]; then
         print_info "Updating main.go with cron features..."
 
-        # Добавляем инициализацию cron в main.go
-        sed -i '/businessService.Initialize()/a\\n\t// Инициализация cron задач\n\tif err := businessService.InitializeCronJobs(); err != nil {\n\t\tlog.Fatalf("Failed to initialize cron jobs: %v", err)\n\t}' cmd/main.go
+        sed -i '/businessService.Initialize()/a\\n\tif err := businessService.InitializeCronJobs(); err != nil {\n\t\tlog.Fatalf("Failed to initialize cron jobs: %v", err)\n\t}' cmd/main.go
     fi
 }
 
-# Функция создания README.md
-create_readme() {
-    print_info "Creating README.md..."
-
-    local readme_content="# ${PROJECT_NAME}
-
-Сервис, созданный с помощью SAI Service Generator.
-
-## Возможности
-
-Этот сервис включает следующие возможности:"
-
-    if [[ -n "$FEATURES" ]]; then
-        IFS=',' read -ra FEATURE_ARRAY <<< "$FEATURES"
-        for feature in "${FEATURE_ARRAY[@]}"; do
-            feature=$(echo "$feature" | xargs)
-            case $feature in
-                auth) readme_content+="
-- 🔐 Аутентификация ($AUTH_TYPES)" ;;
-                cache) readme_content+="
-- 💾 Кэширование ($CACHE_TYPE)" ;;
-                metrics) readme_content+="
-- 📊 Метрики ($METRICS_TYPE)" ;;
-                docs) readme_content+="
-- 📚 API документация" ;;
-                cron) readme_content+="
-- ⏰ Планировщик задач" ;;
-                actions) readme_content+="
-- 🔄 Система событий ($ACTIONS)" ;;
-                tls) readme_content+="
-- 🔒 TLS/SSL поддержка" ;;
-                middlewares) readme_content+="
-- 🔧 Middleware ($MIDDLEWARES)" ;;
-                health) readme_content+="
-- ❤️ Health checks" ;;
-                client) readme_content+="
-- 🌐 HTTP клиент" ;;
-            esac
-        done
-    fi
-
-    readme_content+="
-
-## Быстрый старт
-
-### Локальная разработка
-
-1. Скопируйте переменные окружения:
-   \`\`\`bash
-   cp .env.example .env
-   \`\`\`
-
-2. Отредактируйте \`.env\` файл под ваши нужды
-
-3. Запустите сервис:
-   \`\`\`bash
-   make run
-   \`\`\`
-
-### Docker
-
-1. Запустите через Docker Compose:
-   \`\`\`bash
-   make docker-run
-   \`\`\`
-
-## Доступные команды
-
-- \`make build\` - Собрать приложение
-- \`make run\` - Запустить приложение
-- \`make test\` - Запустить тесты
-- \`make clean\` - Очистить артефакты сборки
-- \`make fmt\` - Форматировать код
-- \`make lint\` - Проверить код линтером
-- \`make docker-build\` - Собрать Docker образ
-- \`make docker-run\` - Запустить с Docker Compose
-
-## API Endpoints
-
-- \`GET /api/v1/hello\` - Тестовый endpoint"
-
-    if [[ "$TEMPLATE" == "api" ]]; then
-        readme_content+="
-- \`POST /api/v1/documents/\` - Создать документы
-- \`GET /api/v1/documents/\` - Получить документы
-- \`PUT /api/v1/documents/\` - Обновить документы
-- \`DELETE /api/v1/documents/\` - Удалить документы"
-    fi
-
-    if [[ "$FEATURES" == *"health"* ]]; then
-        readme_content+="
-- \`GET /health\` - Health check
-- \`GET /version\` - Версия сервиса"
-    fi
-
-    if [[ "$FEATURES" == *"metrics"* ]]; then
-        readme_content+="
-- \`GET /metrics\` - Метрики для Prometheus"
-    fi
-
-    if [[ "$FEATURES" == *"docs"* ]]; then
-        readme_content+="
-- \`GET /docs\` - Swagger документация"
-    fi
-
-    readme_content+="
-
-## Конфигурация
-
-Сервис настраивается через файл \`config.yml\`, который генерируется из \`config.template.yml\` с использованием переменных окружения из \`.env\`.
-
-## Структура проекта
-
-\`\`\`
-.
-├── cmd/                # Точка входа приложения
-├── internal/           # Внутренняя логика
-├── types/              # Типы и интерфейсы
-├── scripts/            # Скрипты
-├── tests/              # Интеграционные тесты (если включены)
-├── config.template.yml # Шаблон конфигурации
-├── docker-compose.yml  # Docker Compose конфигурация
-├── Dockerfile          # Docker образ
-├── Makefile           # Команды сборки
-└── README.md          # Документация
-\`\`\`
-
-## Разработка
-
-### Добавление новых endpoints
-
-1. Добавьте новые роуты в \`internal/handlers.go\`
-2. Реализуйте бизнес-логику в \`internal/service.go\`
-3. Добавьте необходимые типы в \`types/types.go\`
-
-### Тестирование
-
-Запустите тесты командой:
-\`\`\`bash
-make test
-\`\`\`"
-    if [[ "$INCLUDE_TESTS" == "true" ]]; then
-        readme_content+="
-
-Интеграционные тесты находятся в папке \`tests/\`."
-    fi
-
-    readme_content+="
-
-## Лицензия
-
-MIT License"
-
-    printf "%s\n" "$readme_content" > README.md
-}
-
-# Основная функция генерации
 generate_project() {
     print_header "=== Starting Project Generation ==="
 
@@ -1958,7 +1756,6 @@ generate_project() {
     create_cicd
     create_feature_files
     update_main_go
-    create_readme
 
     print_success "Project generated successfully!"
     print_info "Next steps:"
@@ -1966,21 +1763,14 @@ generate_project() {
     echo "  2. cp .env.example .env"
     echo "  3. Edit .env file with your settings"
     echo "  4. make run"
-    echo ""
-    print_info "For more information, see README.md"
 }
 
-# Основная логика скрипта
 main() {
-    # Проверяем аргументы командной строки
     if [[ $# -eq 0 ]]; then
-        # Интерактивный режим
         interactive_mode
     else
-        # Режим с параметрами
         parse_args "$@"
 
-        # Проверяем обязательные параметры
         if [[ -z "$PROJECT_NAME" ]]; then
             print_error "Project name is required. Use --name parameter or run without arguments for interactive mode."
             exit 1
@@ -1990,24 +1780,18 @@ main() {
             PKG_NAME=$(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/ /-/g')
         fi
 
-        # Если тесты не указаны, по умолчанию false
         if [[ -z "$INCLUDE_TESTS" ]]; then
             INCLUDE_TESTS="false"
         fi
 
-        # Если CI/CD не указан, по умолчанию none
         if [[ -z "$CICD_TYPE" ]]; then
             CICD_TYPE="none"
         fi
     fi
 
-    # Валидация конфигурации
     validate_configuration
 
-    # Генерация проекта
     generate_project
 }
 
-# Запуск скрипта
 main "$@"
-
