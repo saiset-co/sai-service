@@ -16,6 +16,7 @@ type ServiceConfig struct {
 	Server        *ServerConfig        `yaml:"server" json:"server"`
 	Logger        *LoggerConfig        `yaml:"logger" json:"logger"`
 	Cache         *CacheConfig         `yaml:"cache" json:"cache"`
+	Database      *DatabaseConfig      `yaml:"database" json:"database"`
 	Actions       *ActionsConfig       `yaml:"actions" json:"actions"`
 	Cron          *CronConfig          `yaml:"cron" json:"cron"`
 	AuthProviders *AuthProvidersConfig `yaml:"auth_providers" json:"auth_providers"`
@@ -62,6 +63,12 @@ type CacheConfig struct {
 	Type       string        `yaml:"type" json:"type" validate:"required_if=Enabled true"`
 	Config     interface{}   `yaml:"config" json:"config"`
 	DefaultTTL time.Duration `yaml:"default_ttl" json:"default_ttl" validate:"min=0"`
+}
+
+type DatabaseConfig struct {
+	Enabled bool   `yaml:"enabled" json:"enabled"`
+	Type    string `yaml:"type" json:"type" validate:"required_if=Enabled true"`
+	Path    string `yaml:"path" json:"path"`
 }
 
 type ActionsConfig struct {

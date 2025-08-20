@@ -14,6 +14,7 @@
 - [Basic CRUD API](#-basic-crud-api)
 - [Authentication](#-authentication)
 - [Cache System](#-cache-system)
+- [Database Manager](#-database-manager)
 - [Middleware](#-middleware)
 - [Documentation Manager](#-documentation-manager)
 - [Clients System](#-clients-system)
@@ -32,8 +33,10 @@ SAI Service Framework is a comprehensive, enterprise-grade Go framework designed
 - **Zero-config startup** - Works out of the box with sensible defaults
 - **Modular architecture** - Enable only the components you need
 - **Performance-first** - Built on FastHTTP for maximum throughput
+- **Lightweight database** - Embedded CloverDB with MongoDB-style queries
 - **Production-ready** - Comprehensive logging, metrics, and health checks
 - **Developer-friendly** - Intuitive APIs and extensive documentation
+- **sai-storage compatible** - Easy migration from lightweight to full database
 
 ## 🚀 Quick Start
 
@@ -60,13 +63,16 @@ More [GENERATOR DOCS](./GENERATOR.md)
 # Create a basic API service
 ./generator.sh --name "My API" --features "auth,cache,docs"
 
+# Create a microservice with database
+./generator.sh --name "User Service" --features "auth,cache,database,docs"
+
 # Create a full-featured microservice
-./generator.sh --name "User Service" --features "auth,cache,metrics,cron,actions,health"
+./generator.sh --name "Data Service" --features "auth,cache,database,metrics,cron,actions,health"
 
 # Create with specific configurations
 ./generator.sh \
   --name "Enterprise API" \
-  --features "auth,cache,metrics,docs,tls" \
+  --features "auth,cache,database,metrics,docs,tls" \
   --auth "token,basic" \
   --cache "redis" \
   --metrics "prometheus"
@@ -79,9 +85,9 @@ my-service/
 ├── internal/
 │   ├── handlers.go          # HTTP handlers
 │   └── service.go           # Business logic
-├── .env.example             # Configuration
-├── go.mod                   # Configuration
-├── config.template.yml      # Configuration
+├── .env.example             # Environment variables template
+├── go.mod                   # Go module definition
+├── config.template.yml     # Configuration template
 ├── docker-compose.yml       # Docker setup
 ├── Dockerfile               # Container image
 ├── Makefile                 # Build commands
@@ -171,6 +177,7 @@ config := sai.Config()           // Configuration manager
 
 // Optional components (if enabled in config)
 cache := sai.Cache()             // Cache manager (panic if disabled)
+database := sai.Database()       // Database manager (panic if disabled)
 metrics := sai.Metrics()         // Metrics manager (panic if disabled)
 cron := sai.Cron()              // Cron scheduler (panic if disabled)
 actions := sai.Actions()         // Event broker (panic if disabled)
@@ -1341,6 +1348,165 @@ cache:
   config:
     addrs: ["localhost:7000", "localhost:7001", "localhost:7002"]
     password: ""
+```
+
+## 🗄️ Database Manager
+
+The framework provides a lightweight database manager with CloverDB support for small microservices where full database solutions like sai-storage might be overkill. It maintains API compatibility with sai-storage for easy migration.
+
+### Database Configuration
+
+```yaml
+database:
+  enabled: true
+  type: "clover"        # clover, memory, or custom
+  path: "./data/db"     # Database file path (for CloverDB)
+  name: "myapp"         # Database name
+```
+
+### Supported Database Types
+
+#### CloverDB (Embedded NoSQL)
+Perfect for small to medium microservices:
+```yaml
+database:
+  enabled: true
+  type: "clover"
+  path: "./data/myapp.db"
+  name: "myapp"
+```
+
+#### In-Memory Database
+For testing and development:
+```yaml
+database:
+  enabled: true
+  type: "memory"
+  name: "test_db"
+```
+
+### Database Usage
+
+```go
+// Create documents
+createReq := types.CreateDocumentsRequest{
+    Collection: "users",
+    Data: []interface{}{
+        map[string]interface{}{
+            "name":  "John Doe",
+            "email": "john@example.com",
+            "age":   30,
+        },
+    },
+}
+
+ids, err := sai.Database().CreateDocuments(ctx, createReq)
+if err != nil {
+    return err
+}
+
+// Read documents with MongoDB-style filters
+readReq := types.ReadDocumentsRequest{
+    Collection: "users",
+    Filter: map[string]interface{}{
+        "age": map[string]interface{}{
+            "$gte": 18,
+        },
+    },
+    Limit: 10,
+    Skip:  0,
+}
+
+documents, total, err := sai.Database().ReadDocuments(ctx, readReq)
+if err != nil {
+    return err
+}
+
+// Update documents
+updateReq := types.UpdateDocumentsRequest{
+    Collection: "users",
+    Filter: map[string]interface{}{
+        "email": "john@example.com",
+    },
+    Data: map[string]interface{}{
+        "$set": map[string]interface{}{
+            "age": 31,
+        },
+    },
+    Upsert: false,
+}
+
+updated, err := sai.Database().UpdateDocuments(ctx, updateReq)
+
+// Delete documents
+deleteReq := types.DeleteDocumentsRequest{
+    Collection: "users",
+    Filter: map[string]interface{}{
+        "age": map[string]interface{}{
+            "$lt": 18,
+        },
+    },
+}
+
+deleted, err := sai.Database().DeleteDocuments(ctx, deleteReq)
+```
+
+### MongoDB-Style Query Operators
+
+The Database Manager supports familiar MongoDB query operators:
+
+```go
+// Comparison operators
+filter := map[string]interface{}{
+    "age": map[string]interface{}{
+        "$eq":  25,           // Equal to
+        "$ne":  25,           // Not equal to
+        "$gt":  18,           // Greater than
+        "$gte": 18,           // Greater than or equal
+        "$lt":  65,           // Less than
+        "$lte": 65,           // Less than or equal
+        "$in":  []int{25, 30, 35}, // In array
+        "$nin": []int{25, 30},     // Not in array
+    },
+    "status": map[string]interface{}{
+        "$exists": true,      // Field exists
+    },
+}
+
+// Update operators
+update := map[string]interface{}{
+    "$set": map[string]interface{}{
+        "status": "active",
+        "updated_at": time.Now(),
+    },
+    "$inc": map[string]interface{}{
+        "login_count": 1,
+    },
+    "$unset": map[string]interface{}{
+        "temp_field": "",
+    },
+}
+```
+
+### Collection Management
+
+```go
+// Create collection
+err := sai.Database().CreateCollection("new_collection")
+
+// Drop collection
+err := sai.Database().DropCollection("old_collection")
+```
+
+### Custom Database Providers
+
+You can register custom database providers:
+
+```go
+// Register custom database type
+sai.RegisterDatabaseManager("custom", func(ctx context.Context, logger types.Logger, config *types.DatabaseConfig) (types.DatabaseManager, error) {
+    return NewCustomDB(ctx, logger, config)
+})
 ```
 
 ## 🚧 Middleware

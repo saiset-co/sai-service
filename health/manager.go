@@ -193,7 +193,7 @@ func (hm *Manager) registerRoutes() {
 			Enabled: false,
 		},
 		Timeout:             time.Duration(5) * time.Second,
-		DisabledMiddlewares: []string{"cache"},
+		DisabledMiddlewares: []string{"auth", "cache"},
 		Doc:                 nil,
 	}
 

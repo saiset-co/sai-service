@@ -42,6 +42,16 @@ var (
 )
 
 var (
+	ErrDatabaseNotFound         = NewError("database not found")
+	ErrDatabaseConnectionFailed = NewError("database connection failed")
+	ErrDatabaseTypeUnknown      = NewError("database type unknown")
+	ErrDatabaseOperationFailed  = NewError("database operation failed")
+	ErrDatabaseIsDisabled       = NewError("database manager is disabled")
+	ErrDatabaseCollectionExists = NewError("database collection exists")
+	ErrDatabaseDocumentNotFound = NewError("database document not found")
+)
+
+var (
 	ErrActionNotInitialized   = NewError("action not initialized")
 	ErrActionPublishFailed    = NewError("action publish failed")
 	ErrActionConnectionFailed = NewError("action connection failed")

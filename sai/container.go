@@ -1,6 +1,8 @@
 package sai
 
 import (
+	"github.com/pkg/errors"
+	"github.com/saiset-co/sai-service/database"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -18,6 +20,7 @@ type Container struct {
 	AuthProvider  atomic.Pointer[types.AuthProviderManager]
 	Router        atomic.Pointer[types.HTTPRouter]
 	Cache         atomic.Pointer[types.CacheManager]
+	Database      atomic.Pointer[types.DatabaseManager]
 	HTTPServer    atomic.Pointer[types.HTTPServer]
 	ClientManager atomic.Pointer[types.ClientManager]
 	Cron          atomic.Pointer[types.CronManager]
@@ -76,6 +79,13 @@ func Cron() types.CronManager {
 		return *ptr
 	}
 	panic("CronManager not initialized")
+}
+
+func Database() types.DatabaseManager {
+	if ptr := globalContainer.Database.Load(); ptr != nil {
+		return *ptr
+	}
+	panic("DatabaseManager not initialized")
 }
 
 func Actions() types.ActionBroker {
@@ -176,12 +186,34 @@ func (c *Container) Has(name string) bool {
 	return ok
 }
 
+func RegisterAuthProvider(name string, provider types.AuthProvider) error {
+	if ptr := globalContainer.AuthProvider.Load(); ptr != nil {
+		providerManager := (*ptr).(types.AuthProviderManager)
+		return providerManager.Register(name, provider)
+	}
+
+	return errors.New("AuthProvider not initialized")
+}
+
+func RegisterMiddleware(middleware types.Middleware) error {
+	if ptr := globalContainer.AuthProvider.Load(); ptr != nil {
+		middlewareManager := (*ptr).(types.MiddlewareManager)
+		return middlewareManager.Register(middleware)
+	}
+
+	return errors.New("AuthProvider not initialized")
+}
+
 func RegisterActionBroker(actionBrokerName string, creator types.ActionBrokerCreator) {
 	action.RegisterActionBroker(actionBrokerName, creator)
 }
 
 func RegisterCacheManager(cacheManagerName string, creator types.CacheManagerCreator) {
 	cache.RegisterCacheManager(cacheManagerName, creator)
+}
+
+func RegisterDatabaseManager(databaseType string, creator types.DatabaseManagerCreator) {
+	database.RegisterDatabaseManager(databaseType, creator)
 }
 
 func RegisterMetricsManager(metricsManagerName string, creator types.MetricsManagerCreator) {
@@ -210,6 +242,10 @@ func (c *Container) SetRouter(router types.HTTPRouter) {
 
 func (c *Container) SetCache(cache types.CacheManager) {
 	c.Cache.Store(&cache)
+}
+
+func (c *Container) SetDatabase(database types.DatabaseManager) {
+	c.Database.Store(&database)
 }
 
 func (c *Container) SetHTTPServer(server types.HTTPServer) {

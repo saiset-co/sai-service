@@ -286,6 +286,11 @@ func (h *FastHTTPServer) mainHandler() fasthttp.RequestHandler {
 			return
 		}
 
+		if string(methodBytes) == "OPTIONS" {
+			h.executeHandler(&types.RequestCtx{RequestCtx: ctx}, func(ctx *types.RequestCtx) {}, &types.RouteConfig{})
+			return
+		}
+
 		ctx.Error("Not found", fasthttp.StatusNotFound)
 	}
 }

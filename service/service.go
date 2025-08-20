@@ -20,6 +20,7 @@ import (
 	"github.com/saiset-co/sai-service/client"
 	"github.com/saiset-co/sai-service/config"
 	"github.com/saiset-co/sai-service/cron"
+	"github.com/saiset-co/sai-service/database"
 	"github.com/saiset-co/sai-service/documentations"
 	"github.com/saiset-co/sai-service/health"
 	"github.com/saiset-co/sai-service/logger"
@@ -303,6 +304,23 @@ func (s *Service) startComponents(ctx context.Context) error {
 		})
 	}
 
+	if _config.Database.Enabled {
+		g.Go(func() error {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+				if ptr := s.container.Database.Load(); ptr != nil {
+					manager := (*ptr).(types.LifecycleManager)
+					if err := manager.Start(); err != nil {
+						sai.Logger().Error("Failed to start database manager", zap.Error(err))
+					}
+				}
+				return nil
+			}
+		})
+	}
+
 	if _config.Server.TLS.Enabled {
 		g.Go(func() error {
 			select {
@@ -530,6 +548,17 @@ func (s *Service) stopComponents() error {
 		})
 	}
 
+	if ptr := s.container.Database.Load(); ptr != nil {
+		manager := (*ptr).(types.LifecycleManager)
+		g.Go(func() error {
+			if err := manager.Stop(); err != nil {
+				sai.Logger().Error("Failed to stop database manager", zap.Error(err))
+				return err
+			}
+			return nil
+		})
+	}
+
 	if ptr := s.container.Metrics.Load(); ptr != nil {
 		manager := (*ptr).(types.LifecycleManager)
 		g.Go(func() error {
@@ -687,6 +716,14 @@ func registerProviders(container *sai.Container, ctx context.Context, configPath
 			return types.WrapError(err, "failed to register cache manager")
 		}
 		container.SetCache(cacheManager)
+	}
+
+	if _config.Database.Enabled {
+		databaseManager, err := database.NewManager(ctx, configManager, loggerManager, metricsManager, healthManager)
+		if err != nil {
+			return types.WrapError(err, "failed to register database manager")
+		}
+		container.SetDatabase(databaseManager)
 	}
 
 	if _config.Middlewares.Enabled {
