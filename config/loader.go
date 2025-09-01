@@ -373,10 +373,10 @@ func (l *Loader) Defaults() *types.ServiceConfig {
 			CORS: &types.MiddlewareItemConfig{
 				Enabled: false,
 				Params: map[string]interface{}{
-					"allowed_origins": []string{"*"},
-					"allowed_methods": []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-					"allowed_headers": []string{"*"},
-					"max_age":         86400,
+					"AllowedOrigins": []string{"*"},
+					"AllowedMethods": []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+					"AllowedHeaders": []string{"Content-Type", "Authorization", "X-API-Key", "X-Request-ID"},
+					"MaxAge":         86400,
 				},
 				Weight: 50,
 			},
