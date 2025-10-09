@@ -2,10 +2,11 @@ package middleware
 
 import (
 	"bytes"
-	"github.com/valyala/fasthttp"
-	"go.uber.org/zap"
 	"strconv"
 	"strings"
+
+	"github.com/valyala/fasthttp"
+	"go.uber.org/zap"
 
 	"github.com/saiset-co/sai-service/types"
 	"github.com/saiset-co/sai-service/utils"
@@ -39,20 +40,20 @@ type CORSMiddleware struct {
 }
 
 type CORSConfig struct {
-	ExposedHeaders   []string `json:"exposed_headers"`
-	AllowedOrigins   []string `json:"allowed_origins"`
-	AllowedMethods   []string `json:"allowed_methods"`
-	AllowedHeaders   []string `json:"allowed_headers"`
-	AllowCredentials bool     `json:"allow_credentials"`
-	MaxAge           int      `json:"max_age"`
+	ExposedHeaders   string `json:"exposed_headers"`
+	AllowedOrigins   string `json:"allowed_origins"`
+	AllowedMethods   string `json:"allowed_methods"`
+	AllowedHeaders   string `json:"allowed_headers"`
+	AllowCredentials bool   `json:"allow_credentials"`
+	MaxAge           int    `json:"max_age"`
 }
 
 func NewCORSMiddleware(config types.ConfigManager, logger types.Logger, metrics types.MetricsManager) *CORSMiddleware {
 	var corsConfig = &CORSConfig{
-		ExposedHeaders:   []string{},
-		AllowedOrigins:   []string{"*"},
-		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Content-Type", "Authorization", "X-API-Key", "X-Request-ID"},
+		ExposedHeaders:   "",
+		AllowedOrigins:   "*",
+		AllowedMethods:   "GET, POST, PUT, DELETE, OPTIONS",
+		AllowedHeaders:   "Content-Type, Authorization, X-API-Key, X-Request-ID",
 		AllowCredentials: false,
 		MaxAge:           86400,
 	}
@@ -197,13 +198,18 @@ func (c *CORSMiddleware) createCORSErrorResponseFast(ctx *types.RequestCtx) {
 }
 
 func (c *CORSMiddleware) precompileConfiguration() {
-	c.allowsAll = len(c.corsConfig.AllowedOrigins) == 1 && c.corsConfig.AllowedOrigins[0] == "*"
+	c.allowsAll = c.corsConfig.AllowedOrigins == "*"
 
 	if !c.allowsAll {
-		c.allowedOriginsMap = make(map[string]bool, len(c.corsConfig.AllowedOrigins))
+		origins := strings.Split(c.corsConfig.AllowedOrigins, ",")
+		c.allowedOriginsMap = make(map[string]bool, len(origins))
 		c.wildcardDomains = make([]string, 0)
 
-		for _, origin := range c.corsConfig.AllowedOrigins {
+		for _, origin := range origins {
+			origin = strings.TrimSpace(origin)
+			if origin == "" {
+				continue
+			}
 			if strings.HasPrefix(origin, "*.") {
 				domain := strings.TrimPrefix(origin, "*.")
 				c.wildcardDomains = append(c.wildcardDomains, domain)
@@ -213,11 +219,11 @@ func (c *CORSMiddleware) precompileConfiguration() {
 		}
 	}
 
-	c.allowedMethodsStr = []byte(strings.Join(c.corsConfig.AllowedMethods, ", "))
-	c.allowedHeadersStr = []byte(strings.Join(c.corsConfig.AllowedHeaders, ", "))
+	c.allowedMethodsStr = []byte(c.corsConfig.AllowedMethods)
+	c.allowedHeadersStr = []byte(c.corsConfig.AllowedHeaders)
 
 	if c.hasExposedHeaders {
-		c.exposedHeadersStr = []byte(strings.Join(c.corsConfig.ExposedHeaders, ", "))
+		c.exposedHeadersStr = []byte(c.corsConfig.ExposedHeaders)
 	}
 
 	c.maxAgeStr = []byte(strconv.Itoa(c.corsConfig.MaxAge))
