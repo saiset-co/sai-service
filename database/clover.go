@@ -142,12 +142,18 @@ func (c *CloverDB) CreateDocuments(ctx context.Context, request types.CreateDocu
 
 		// Generate internal_id if not provided
 		internalID, _ := dataMap["internal_id"].(string)
-		if internalID == "" {
+		if _, exists := dataMap["internal_id"]; !exists || internalID == "" {
 			internalID = uuid.New().String()
 			dataMap["internal_id"] = internalID
 		}
-		dataMap["cr_time"] = now + int64(i)
-		dataMap["ch_time"] = now + int64(i)
+
+		if _, exists := dataMap["cr_time"]; !exists {
+			dataMap["cr_time"] = now + int64(i)
+		}
+
+		if _, exists := dataMap["ch_time"]; !exists {
+			dataMap["ch_time"] = now + int64(i)
+		}
 
 		// Create CloverDB document
 		doc := clover.NewDocument()
@@ -263,7 +269,7 @@ func (c *CloverDB) UpdateDocuments(ctx context.Context, request types.UpdateDocu
 	query := c.db.Query(request.Collection)
 
 	// Apply filters
-	if request.Filter != nil && len(request.Filter) > 0 {
+	if len(request.Filter) > 0 {
 		query = c.applyFilters(query, request.Filter)
 	}
 
@@ -277,6 +283,8 @@ func (c *CloverDB) UpdateDocuments(ctx context.Context, request types.UpdateDocu
 		return 0, nil
 	}
 
+	now := time.Now().UnixNano()
+
 	// Handle upsert case
 	if count == 0 && request.Upsert {
 		// Create new document
@@ -288,9 +296,19 @@ func (c *CloverDB) UpdateDocuments(ctx context.Context, request types.UpdateDocu
 		}
 
 		// Add metadata
-		newDoc["internal_id"] = uuid.New().String()
-		newDoc["cr_time"] = time.Now().UnixNano()
-		newDoc["ch_time"] = time.Now().UnixNano()
+		internalID, _ := newDoc["internal_id"].(string)
+		if _, exists := newDoc["internal_id"]; !exists || internalID == "" {
+			internalID = uuid.New().String()
+			newDoc["internal_id"] = internalID
+		}
+
+		if _, exists := newDoc["cr_time"]; !exists {
+			newDoc["cr_time"] = now
+		}
+
+		if _, exists := newDoc["ch_time"]; !exists {
+			newDoc["ch_time"] = now
+		}
 
 		// Create CloverDB document
 		doc := clover.NewDocument()
@@ -314,7 +332,9 @@ func (c *CloverDB) UpdateDocuments(ctx context.Context, request types.UpdateDocu
 	}
 
 	// Add timestamp
-	updateMap["ch_time"] = time.Now().UnixNano()
+	if _, exists := updateMap["ch_time"]; !exists {
+		updateMap["ch_time"] = now
+	}
 
 	// Execute update
 	err = query.Update(updateMap)
@@ -340,7 +360,7 @@ func (c *CloverDB) DeleteDocuments(ctx context.Context, request types.DeleteDocu
 	query := c.db.Query(request.Collection)
 
 	// Apply filters
-	if request.Filter != nil && len(request.Filter) > 0 {
+	if len(request.Filter) > 0 {
 		query = c.applyFilters(query, request.Filter)
 	}
 
