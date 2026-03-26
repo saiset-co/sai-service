@@ -302,13 +302,14 @@ func (h *FastHTTPServer) findStaticRoute(method, path []byte) (types.FastHTTPHan
 
 	path = normalizePathBytes(path)
 
-	var buf [32]byte
-	n := copy(buf[:], method)
+	keyLen := len(method) + 1 + len(path)
+	buf := make([]byte, keyLen)
+	n := copy(buf, method)
 	buf[n] = ':'
 	copy(buf[n+1:], path)
 
 	h.routingMu.RLock()
-	info := h.staticRoutes[string(buf[:n+1+len(path)])]
+	info := h.staticRoutes[string(buf)]
 	h.routingMu.RUnlock()
 
 	if info != nil {

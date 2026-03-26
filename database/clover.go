@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/saiset-co/sai-service/types"
+	"github.com/saiset-co/sai-service/utils"
 )
 
 type CloverDB struct {
@@ -134,15 +135,17 @@ func (c *CloverDB) CreateDocuments(ctx context.Context, request types.CreateDocu
 	now := time.Now().UnixNano()
 
 	for i, data := range request.Data {
-		// Convert to map
-		dataMap, ok := data.(map[string]interface{})
-		if !ok {
-			return nil, types.NewError("data must be a map")
+		dataMap, err := normalizeDocumentMap(data)
+		if err != nil {
+			return nil, err
 		}
 
 		// Generate internal_id if not provided
-		internalID := uuid.New().String()
-		dataMap["internal_id"] = internalID
+		internalID, _ := dataMap["internal_id"].(string)
+		if internalID == "" {
+			internalID = uuid.New().String()
+			dataMap["internal_id"] = internalID
+		}
 		dataMap["cr_time"] = now + int64(i)
 		dataMap["ch_time"] = now + int64(i)
 
@@ -227,7 +230,7 @@ func (c *CloverDB) ReadDocuments(ctx context.Context, request types.ReadDocument
 		if err != nil {
 			continue
 		}
-		
+
 		// Remove CloverDB internal fields
 		delete(docMap, "_id")
 
@@ -419,8 +422,8 @@ func (c *CloverDB) applyFieldFilter(query *clover.Query, key string, value inter
 }
 
 func (c *CloverDB) applyUpdateOperations(doc map[string]interface{}, update interface{}) error {
-	updateMap, ok := update.(map[string]interface{})
-	if !ok {
+	updateMap, err := normalizeDocumentMap(update)
+	if err != nil {
 		return types.NewError("update data must be a map")
 	}
 
@@ -429,7 +432,7 @@ func (c *CloverDB) applyUpdateOperations(doc map[string]interface{}, update inte
 		case "$set":
 			if setMap, ok := value.(map[string]interface{}); ok {
 				for key, val := range setMap {
-					doc[key] = val
+					doc[key] = normalizeDocumentValue(val)
 				}
 			}
 		case "$unset":
@@ -454,11 +457,55 @@ func (c *CloverDB) applyUpdateOperations(doc map[string]interface{}, update inte
 			}
 		default:
 			// Direct field assignment
-			doc[op] = value
+			doc[op] = normalizeDocumentValue(value)
 		}
 	}
 
 	return nil
+}
+
+func normalizeDocumentMap(data interface{}) (map[string]interface{}, error) {
+	if data == nil {
+		return nil, types.NewError("data must be a map")
+	}
+
+	if dataMap, ok := data.(map[string]interface{}); ok {
+		normalized := make(map[string]interface{}, len(dataMap))
+		for key, value := range dataMap {
+			normalized[key] = normalizeDocumentValue(value)
+		}
+		return normalized, nil
+	}
+
+	raw, err := utils.Marshal(data)
+	if err != nil {
+		return nil, types.WrapError(err, "failed to marshal document data")
+	}
+
+	var dataMap map[string]interface{}
+	if err := utils.Unmarshal(raw, &dataMap); err != nil {
+		return nil, types.NewError("data must be a map")
+	}
+
+	for key, value := range dataMap {
+		dataMap[key] = normalizeDocumentValue(value)
+	}
+
+	return dataMap, nil
+}
+
+func normalizeDocumentValue(value interface{}) interface{} {
+	raw, err := utils.Marshal(value)
+	if err != nil {
+		return value
+	}
+
+	var normalized interface{}
+	if err := utils.Unmarshal(raw, &normalized); err != nil {
+		return value
+	}
+
+	return normalized
 }
 
 func (c *CloverDB) toFloat64(v interface{}) (float64, bool) {

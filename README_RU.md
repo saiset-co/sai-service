@@ -57,6 +57,21 @@ chmod +x generator.sh
 ```
 Больше информации в [ДОКУМЕНТАЦИИ ГЕНЕРАТОРА](./GENERATOR.md)
 
+### Локальная сборка и запуск
+
+Собирать и запускать сервисы нужно вне sandbox-окружения. На практике используй обычный shell и команды проекта напрямую.
+
+Рекомендуемая команда локального запуска:
+
+```bash
+env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache make run
+```
+
+Почему это важно:
+- встроенные базы вроде CloverDB используют файловые lock-и
+- локальный HTTP-сервер должен реально занять порт
+- sandbox-сборки могут оставлять медленные или stale фоновые процессы
+
 ### Опции генератора
 
 ```bash
@@ -718,6 +733,51 @@ func setupCRUDAPI() {
     admin.POST("/maintenance", enableMaintenance)
 }
 ```
+
+### Выбор Auth Provider Для Маршрута
+
+По умолчанию middleware `auth` использует глобальный провайдер из конфига:
+
+```yaml
+middlewares:
+  auth:
+    enabled: true
+    params:
+      provider: "token"
+```
+
+Если для конкретного маршрута или группы нужен другой провайдер из `auth_providers`, его можно задать явно через `WithAuthProvider(...)`.
+
+Важно:
+- `WithMiddlewares("auth")` отвечает за то, применяется ли auth middleware
+- `WithAuthProvider("...")` только выбирает, какой auth provider будет использовать этот middleware
+- эти методы дополняют друг друга, а не заменяют
+
+```go
+func setupRouteLevelAuth() {
+    router := sai.Router()
+
+    api := router.Group("/api/v1").
+        WithMiddlewares("auth") // auth middleware включён, используется provider по умолчанию из конфига
+
+    admin := router.Group("/admin").
+        WithMiddlewares("auth", "rate_limit").
+        WithAuthProvider("basic").
+        WithTimeout(15 * time.Second)
+
+    admin.GET("/stats", getAdminStats)
+
+    router.GET("/internal/health", getInternalHealth).
+        WithMiddlewares("auth").
+        WithAuthProvider("token")
+}
+```
+
+Правила:
+- `WithAuthProvider("...")` должен ссылаться на имя провайдера, объявленного в `auth_providers`
+- если `WithAuthProvider(...)` не задан, auth middleware использует provider по умолчанию из middleware config
+- если auth middleware отключён для route или group, один только `WithAuthProvider(...)` ничего не меняет
+- для целого namespace лучше задавать `WithAuthProvider(...)` на group level, а на route level оставлять только исключения
 
 ### Реализация CRUD
 
@@ -1680,6 +1740,72 @@ func registerCustomMiddleware() {
     middlewareManager.Register(NewRequestIDMiddleware(sai.Logger()))
 }
 ```
+
+## 🧩 Модуль админки
+
+### Быстрое создание лёгкой админки
+
+```go
+import "github.com/saiset-co/sai-service/admin"
+
+func setupAdmin() {
+    sai.Admin("/admin").
+        WithTitle("WhatsApp Router Admin").
+        WithAuthProvider("basic").
+        PageWithConfig("overview", admin.PageConfig{
+            Title:       "Обзор",
+            Description: "Операционная сводка сервиса",
+            Handler: func(ctx *types.RequestCtx) (*admin.PageData, error) {
+                return &admin.PageData{
+                    Stats: []admin.Stat{
+                        {Label: "Серверы", Value: 3},
+                        {Label: "Подключённые устройства", Value: 12},
+                    },
+                    Sections: []admin.Section{
+                        {
+                            Title: "Заметки",
+                            ContentHTML: admin.HTML("<p>Сервис работает штатно.</p>"),
+                        },
+                    },
+                }, nil
+            },
+        }).
+        Resource("servers", admin.ResourceConfig{
+            Title:       "Серверы",
+            Description: "Известные upstream-ноды",
+            Columns: []admin.Column{
+                {Key: "name", Title: "Имя"},
+                {Key: "base_url", Title: "Базовый URL"},
+                {Key: "metadata.connected_count", Title: "Подключено"},
+            },
+            ListHandler: func(ctx *types.RequestCtx) ([]map[string]interface{}, error) {
+                return []map[string]interface{}{
+                    {
+                        "name": "wa-1",
+                        "base_url": "84.247.181.211:8080",
+                        "metadata": map[string]interface{}{
+                            "connected_count": 2,
+                        },
+                    },
+                }, nil
+            },
+        }).
+        Mount()
+}
+```
+
+Маршруты создаются автоматически:
+- `GET /admin`
+- `GET /admin/pages/<slug>`
+- `GET /admin/resources/<name>`
+
+Рекомендуемые правила для админки:
+- защищай админку отдельным провайдером, например `.WithAuthProvider("basic")`
+- держи админку server-rendered и внутренней, а не продуктовой UI-панелью
+- сначала используй `Stats`, `Sections` и `Resource`-таблицы для внутренних операций
+- write-действия вроде add/update/delete лучше выносить в обычные POST-маршруты рядом с `/admin`
+- flash-сообщения лучше хранить вне query string
+- auth для админки должен жить в route config `sai-service`, а не в кастомных проверках внутри страницы
 
 ## 📚 Менеджер документации
 

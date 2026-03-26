@@ -38,6 +38,11 @@ func (rb *RouteBuilder) WithoutMiddlewares(names ...string) types.RouteBuilder {
 	return rb
 }
 
+func (rb *RouteBuilder) WithAuthProvider(provider string) types.RouteBuilder {
+	rb.config.AuthProvider = provider
+	return rb
+}
+
 func (rb *RouteBuilder) WithTimeout(duration time.Duration) types.RouteBuilder {
 	rb.config.Timeout = duration
 	return rb
@@ -76,6 +81,7 @@ func (rb *RouteBuilder) finalize() error {
 		Cache:               rb.config.Cache,
 		Middlewares:         make([]string, len(rb.config.Middlewares)),
 		DisabledMiddlewares: make([]string, len(rb.config.DisabledMiddlewares)),
+		AuthProvider:        rb.config.AuthProvider,
 		Timeout:             rb.config.Timeout,
 		Doc:                 rb.config.Doc,
 	}

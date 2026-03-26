@@ -23,6 +23,7 @@ type AuthMiddleware struct {
 	config     types.ConfigManager
 	logger     types.Logger
 	metrics    types.MetricsManager
+	providers  types.AuthProviderManager
 	provider   types.AuthProvider
 	authConfig *AuthConfig
 	name       string
@@ -57,6 +58,7 @@ func NewAuthMiddleware(provider types.AuthProviderManager, config types.ConfigMa
 		config:     config,
 		logger:     logger,
 		metrics:    metrics,
+		providers:  provider,
 		provider:   authProvider,
 		authConfig: authConfig,
 		weight:     config.GetConfig().Middlewares.Auth.Weight,
@@ -79,12 +81,23 @@ func (a *AuthMiddleware) Handle(ctx *types.RequestCtx, next func(*types.RequestC
 		next(ctx)
 		return
 	}
-	err := a.provider.ApplyToIncomingRequest(ctx)
+
+	authProvider, err := a.resolveProvider(config)
+	if err != nil {
+		a.logger.Warn(failedMsg,
+			zap.ByteString("path", ctx.Path()),
+			zap.String("provider_type", config.AuthProvider),
+			zap.Error(err))
+		ctx.Error(types.NewError("Authentication require"), fasthttp.StatusUnauthorized)
+		return
+	}
+
+	err = authProvider.ApplyToIncomingRequest(ctx)
 
 	if err == nil {
 		a.logger.Debug(successMsg,
 			zap.ByteString("path", ctx.Path()),
-			zap.String("provider_type", a.provider.Type()))
+			zap.String("provider_type", authProvider.Type()))
 		next(ctx)
 		return
 	}
@@ -97,10 +110,17 @@ func (a *AuthMiddleware) Handle(ctx *types.RequestCtx, next func(*types.RequestC
 
 	a.logger.Warn(failedMsg,
 		zap.ByteString("path", ctx.Path()),
-		zap.String("provider_type", a.provider.Type()),
+		zap.String("provider_type", authProvider.Type()),
 		zap.Error(err))
 
 	ctx.Error(types.NewError("Authentication require"), fasthttp.StatusUnauthorized)
+}
+
+func (a *AuthMiddleware) resolveProvider(config *types.RouteConfig) (types.AuthProvider, error) {
+	if config != nil && config.AuthProvider != "" {
+		return a.providers.GetProvider(config.AuthProvider)
+	}
+	return a.provider, nil
 }
 
 func (a *AuthMiddleware) isBasicAuthChallenge(err error) bool {
