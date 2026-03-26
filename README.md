@@ -1,4 +1,4 @@
-## ❤️ Health Manager# SAI Service Framework
+# SAI Service Framework
 
 🚀 **A powerful, production-ready Go framework for building high-performance microservices and APIs**
 
