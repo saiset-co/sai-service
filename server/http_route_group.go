@@ -32,9 +32,18 @@ func (gb *GroupBuilder) WithoutMiddlewares(names ...string) types.GroupBuilder {
 	return gb
 }
 
+func (gb *GroupBuilder) WithAuthProvider(provider string) types.GroupBuilder {
+	gb.config.AuthProvider = provider
+	return gb
+}
+
 func (gb *GroupBuilder) WithTimeout(duration time.Duration) types.GroupBuilder {
 	gb.config.Timeout = duration
 	return gb
+}
+
+func (gb *GroupBuilder) BasePath() string {
+	return gb.prefix
 }
 
 func (gb *GroupBuilder) Route(method, path string, handler types.FastHTTPHandler) types.RouteBuilder {
@@ -48,6 +57,9 @@ func (gb *GroupBuilder) Route(method, path string, handler types.FastHTTPHandler
 		}
 		if gb.config.Timeout > 0 {
 			routeBuilder.config.Timeout = gb.config.Timeout
+		}
+		if gb.config.AuthProvider != "" {
+			routeBuilder.config.AuthProvider = gb.config.AuthProvider
 		}
 		if gb.config.Doc != nil {
 			routeBuilder.config.Doc = gb.config.Doc

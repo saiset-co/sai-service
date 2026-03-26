@@ -1,14 +1,16 @@
 package sai
 
 import (
-	"github.com/pkg/errors"
-	"github.com/saiset-co/sai-service/database"
 	"reflect"
 	"sync"
 	"sync/atomic"
 
+	"github.com/pkg/errors"
+
 	"github.com/saiset-co/sai-service/action"
+	"github.com/saiset-co/sai-service/admin"
 	"github.com/saiset-co/sai-service/cache"
+	"github.com/saiset-co/sai-service/database"
 	"github.com/saiset-co/sai-service/logger"
 	"github.com/saiset-co/sai-service/metrics"
 	"github.com/saiset-co/sai-service/types"
@@ -65,6 +67,10 @@ func Router() types.HTTPRouter {
 		return *ptr
 	}
 	panic("Router not initialized")
+}
+
+func Admin(group types.GroupBuilder) *admin.Builder {
+	return admin.New(group)
 }
 
 func ClientManager() types.ClientManager {
@@ -188,20 +194,18 @@ func (c *Container) Has(name string) bool {
 
 func RegisterAuthProvider(name string, provider types.AuthProvider) error {
 	if ptr := globalContainer.AuthProvider.Load(); ptr != nil {
-		providerManager := (*ptr).(types.AuthProviderManager)
-		return providerManager.Register(name, provider)
+		return (*ptr).Register(name, provider)
 	}
 
 	return errors.New("AuthProvider not initialized")
 }
 
 func RegisterMiddleware(middleware types.Middleware) error {
-	if ptr := globalContainer.AuthProvider.Load(); ptr != nil {
-		middlewareManager := (*ptr).(types.MiddlewareManager)
-		return middlewareManager.Register(middleware)
+	if ptr := globalContainer.Middlewares.Load(); ptr != nil {
+		return (*ptr).Register(middleware)
 	}
 
-	return errors.New("AuthProvider not initialized")
+	return errors.New("Middleware manager not initialized")
 }
 
 func RegisterActionBroker(actionBrokerName string, creator types.ActionBrokerCreator) {

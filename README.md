@@ -57,6 +57,21 @@ chmod +x generator.sh
 ```
 More [GENERATOR DOCS](./GENERATOR.md)
 
+### Local Build and Run
+
+Build and run generated services outside any sandboxed environment. In practice, use the project Makefile or `go run` directly in a normal shell session.
+
+Recommended local command:
+
+```bash
+env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache make run
+```
+
+Why this matters:
+- embedded databases such as CloverDB use file locks
+- local HTTP servers must bind real ports
+- repeated sandboxed builds can leave slow or stale background processes behind
+
 ### Generator Options
 
 ```bash
@@ -722,6 +737,51 @@ func setupCRUDAPI() {
     admin.POST("/maintenance", enableMaintenance)
 }
 ```
+
+### Route-Level Auth Provider Selection
+
+`auth` middleware still uses the global provider from config by default:
+
+```yaml
+middlewares:
+  auth:
+    enabled: true
+    params:
+      provider: "token"
+```
+
+If a specific route or group must use another provider from `auth_providers`, set it explicitly with `WithAuthProvider(...)`.
+
+Important:
+- `WithMiddlewares("auth")` controls whether the auth middleware is applied
+- `WithAuthProvider("...")` only selects which auth provider that middleware should use
+- these methods complement each other and do not replace one another
+
+```go
+func setupRouteLevelAuth() {
+    router := sai.Router()
+
+    api := router.Group("/api/v1").
+        WithMiddlewares("auth") // auth middleware enabled, default provider from config
+
+    admin := router.Group("/admin").
+        WithMiddlewares("auth", "rate_limit").
+        WithAuthProvider("basic").
+        WithTimeout(15 * time.Second)
+
+    admin.GET("/stats", getAdminStats)
+
+    router.GET("/internal/health", getInternalHealth).
+        WithMiddlewares("auth").
+        WithAuthProvider("token")
+}
+```
+
+Rules:
+- `WithAuthProvider("...")` must reference a provider name present in `auth_providers`
+- when `WithAuthProvider(...)` is not set, auth middleware uses the default provider from middleware config
+- if auth middleware is disabled for a route or group, `WithAuthProvider(...)` has no effect by itself
+- use group-level `WithAuthProvider(...)` for whole admin/API namespaces, and route-level `WithAuthProvider(...)` only for exceptions
 
 ### CRUD Implementation
 
@@ -1695,6 +1755,72 @@ func registerCustomMiddleware() {
     middlewareManager.Register(NewRequestIDMiddleware(sai.Logger()))
 }
 ```
+
+## 🧩 Admin Module
+
+### Generate a Lightweight Admin Panel
+
+```go
+import "github.com/saiset-co/sai-service/admin"
+
+func setupAdmin() {
+    sai.Admin("/admin").
+        WithTitle("WhatsApp Router Admin").
+        WithAuthProvider("basic").
+        PageWithConfig("overview", admin.PageConfig{
+            Title:       "Overview",
+            Description: "Operational summary for the service",
+            Handler: func(ctx *types.RequestCtx) (*admin.PageData, error) {
+                return &admin.PageData{
+                    Stats: []admin.Stat{
+                        {Label: "Servers", Value: 3},
+                        {Label: "Connected Devices", Value: 12},
+                    },
+                    Sections: []admin.Section{
+                        {
+                            Title: "Notes",
+                            ContentHTML: admin.HTML("<p>Everything looks healthy.</p>"),
+                        },
+                    },
+                }, nil
+            },
+        }).
+        Resource("servers", admin.ResourceConfig{
+            Title:       "Servers",
+            Description: "Known upstream nodes",
+            Columns: []admin.Column{
+                {Key: "name", Title: "Name"},
+                {Key: "base_url", Title: "Base URL"},
+                {Key: "metadata.connected_count", Title: "Connected"},
+            },
+            ListHandler: func(ctx *types.RequestCtx) ([]map[string]interface{}, error) {
+                return []map[string]interface{}{
+                    {
+                        "name": "wa-1",
+                        "base_url": "84.247.181.211:8080",
+                        "metadata": map[string]interface{}{
+                            "connected_count": 2,
+                        },
+                    },
+                }, nil
+            },
+        }).
+        Mount()
+}
+```
+
+Routes created automatically:
+- `GET /admin`
+- `GET /admin/pages/<slug>`
+- `GET /admin/resources/<name>`
+
+Recommended admin rules:
+- protect admin routes with a dedicated provider such as `.WithAuthProvider("basic")`
+- keep admin pages server-rendered and operational, not product-facing
+- use `Stats`, `Sections`, and `Resource` tables for internal workflows first
+- put write actions like refresh/delete/add in regular POST routes near the admin namespace
+- store flash messages outside the URL when possible
+- keep admin auth in `sai-service` route config, not in custom page-level checks
 
 ## 📚 Documentation Manager
 
@@ -3341,5 +3467,14 @@ func setupCertificateAlerts() {
 ## 📄 License
 
 MIT License - see LICENSE file for details.
+
+## 🆘 Support
+
+- 📧 Email: support@sai-service.com
+- 💬 Discord: [SAI Community](https://discord.gg/sai)
+- 📖 Documentation: [docs.sai-service.com](https://docs.sai-service.com)
+- 🐛 Issues: [GitHub Issues](https://github.com/saiset-co/sai-service/issues)
+
+---
 
 **Build powerful Go services in minutes, not days!**

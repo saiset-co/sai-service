@@ -112,10 +112,19 @@ func (m *MemoryDB) CreateDocuments(ctx context.Context, request types.CreateDocu
 		}
 
 		// Generate internal_id if not provided
-		internalID := uuid.New().String()
-		dataMap["internal_id"] = internalID
-		dataMap["cr_time"] = now + int64(i)
-		dataMap["ch_time"] = now + int64(i)
+		internalID, _ := dataMap["internal_id"].(string)
+		if _, exists := dataMap["internal_id"]; !exists || internalID == "" {
+			internalID = uuid.New().String()
+			dataMap["internal_id"] = internalID
+		}
+
+		if _, exists := dataMap["cr_time"]; !exists {
+			dataMap["cr_time"] = now + int64(i)
+		}
+
+		if _, exists := dataMap["ch_time"]; !exists {
+			dataMap["ch_time"] = now + int64(i)
+		}
 
 		// Deep copy the document
 		docCopy := make(map[string]interface{})
@@ -154,7 +163,7 @@ func (m *MemoryDB) ReadDocuments(ctx context.Context, request types.ReadDocument
 	total := int64(len(allDocs))
 
 	// Apply sorting
-	if request.Sort != nil && len(request.Sort) > 0 {
+	if len(request.Sort) > 0 {
 		m.sortDocuments(allDocs, request.Sort)
 	}
 
@@ -200,6 +209,8 @@ func (m *MemoryDB) UpdateDocuments(ctx context.Context, request types.UpdateDocu
 		return 0, nil
 	}
 
+	now := time.Now().UnixNano()
+
 	// Handle upsert case
 	if len(matchingDocs) == 0 && request.Upsert {
 		// Create new document
@@ -211,10 +222,19 @@ func (m *MemoryDB) UpdateDocuments(ctx context.Context, request types.UpdateDocu
 		}
 
 		// Add metadata
-		internalID := uuid.New().String()
-		newDoc["internal_id"] = internalID
-		newDoc["cr_time"] = time.Now().UnixNano()
-		newDoc["ch_time"] = time.Now().UnixNano()
+		internalID, _ := newDoc["internal_id"].(string)
+		if _, exists := newDoc["internal_id"]; !exists || internalID == "" {
+			internalID = uuid.New().String()
+			newDoc["internal_id"] = internalID
+		}
+
+		if _, exists := newDoc["cr_time"]; !exists {
+			newDoc["cr_time"] = now
+		}
+
+		if _, exists := newDoc["ch_time"]; !exists {
+			newDoc["ch_time"] = now
+		}
 
 		// Store new document
 		collection[internalID] = newDoc
@@ -222,8 +242,8 @@ func (m *MemoryDB) UpdateDocuments(ctx context.Context, request types.UpdateDocu
 	}
 
 	// Update existing documents
-	now := time.Now().UnixNano()
-	for _, id := range matchingDocs {
+
+	for i, id := range matchingDocs {
 		doc := collection[id]
 
 		// Apply update operations
@@ -232,7 +252,9 @@ func (m *MemoryDB) UpdateDocuments(ctx context.Context, request types.UpdateDocu
 		}
 
 		// Update timestamp
-		doc["ch_time"] = now
+		if _, exists := doc["ch_time"]; !exists {
+			doc["ch_time"] = now + int64(i)
+		}
 	}
 
 	return int64(len(matchingDocs)), nil

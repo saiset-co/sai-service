@@ -22,6 +22,7 @@ type RouteBuilder interface {
 	WithCache(key string, ttl time.Duration, dependencies ...string) RouteBuilder
 	WithMiddlewares(names ...string) RouteBuilder
 	WithoutMiddlewares(names ...string) RouteBuilder
+	WithAuthProvider(provider string) RouteBuilder
 	WithTimeout(duration time.Duration) RouteBuilder
 	WithDoc(title, description, tag string, requestType, responseType interface{}) RouteBuilder
 }
@@ -30,7 +31,9 @@ type GroupBuilder interface {
 	WithCache(key string, ttl time.Duration, dependencies ...string) GroupBuilder
 	WithMiddlewares(names ...string) GroupBuilder
 	WithoutMiddlewares(names ...string) GroupBuilder
+	WithAuthProvider(provider string) GroupBuilder
 	WithTimeout(duration time.Duration) GroupBuilder
+	BasePath() string
 	Route(method, path string, handler FastHTTPHandler) RouteBuilder
 	GET(path string, handler FastHTTPHandler) RouteBuilder
 	POST(path string, handler FastHTTPHandler) RouteBuilder
@@ -44,6 +47,7 @@ type RouteConfig struct {
 	Cache               *CacheHandlerConfig
 	Middlewares         []string
 	DisabledMiddlewares []string
+	AuthProvider        string
 	Timeout             time.Duration
 	Doc                 *DocConfig
 }
