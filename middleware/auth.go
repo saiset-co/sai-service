@@ -117,8 +117,11 @@ func (a *AuthMiddleware) Handle(ctx *types.RequestCtx, next func(*types.RequestC
 }
 
 func (a *AuthMiddleware) resolveProvider(config *types.RouteConfig) (types.AuthProvider, error) {
-	if config != nil && config.AuthProvider != "" {
-		return a.providers.GetProvider(config.AuthProvider)
+	if config != nil && config.AuthProvider != "" && config.AuthProvider != a.authConfig.Provider {
+		provider, err := a.providers.GetProvider(config.AuthProvider)
+		if err == nil {
+			return provider, nil
+		}
 	}
 	return a.provider, nil
 }

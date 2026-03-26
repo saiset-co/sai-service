@@ -157,6 +157,7 @@ func (dm *DocumentationManager) registerRoutes() {
 		},
 		Timeout:             time.Duration(5) * time.Second,
 		DisabledMiddlewares: []string{"cache"},
+		AuthProvider:        "basic",
 		Doc:                 nil,
 	}
 
