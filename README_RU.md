@@ -1,4 +1,4 @@
-## ❤️ Менеджер здоровья# SAI Service Framework
+# SAI Service Framework
 
 🚀 **Мощный, готовый к продакшену Go фреймворк для создания высокопроизводительных микросервисов и API**
 
@@ -54,7 +54,7 @@ chmod +x generator.sh
 ./generator.sh
 
 # Следуйте подсказкам для настройки вашего сервиса
-```
+
 Больше информации в [ДОКУМЕНТАЦИИ ГЕНЕРАТОРА](./GENERATOR.md)
 
 ### Локальная сборка и запуск
@@ -71,6 +71,7 @@ env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache make run
 - встроенные базы вроде CloverDB используют файловые lock-и
 - локальный HTTP-сервер должен реально занять порт
 - sandbox-сборки могут оставлять медленные или stale фоновые процессы
+=======
 
 ### Опции генератора
 
@@ -6791,14 +6792,5 @@ func setupCertificateAlerts() {
 ## 📄 Лицензия
 
 MIT Лицензия - см. файл LICENSE для подробностей.
-
-## 🆘 Поддержка
-
-- 📧 Email: support@sai-service.com
-- 💬 Discord: [SAI Сообщество](https://discord.gg/sai)
-- 📖 Документация: [docs.sai-service.com](https://docs.sai-service.com)
-- 🐛 Проблемы: [GitHub Issues](https://github.com/saiset-co/sai-service/issues)
-
----
 
 **Создавайте мощные Go сервисы за минуты, а не дни!**
