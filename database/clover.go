@@ -189,12 +189,12 @@ func (c *CloverDB) ReadDocuments(ctx context.Context, request types.ReadDocument
 	query := c.db.Query(request.Collection)
 
 	// Apply filters
-	if request.Filter != nil && len(request.Filter) > 0 {
+	if len(request.Filter) > 0 {
 		query = c.applyFilters(query, request.Filter)
 	}
 
 	// Apply sorting
-	if request.Sort != nil && len(request.Sort) > 0 {
+	if len(request.Sort) > 0 {
 		for field, order := range request.Sort {
 			query = query.Sort(clover.SortOption{Field: field, Direction: order})
 		}
@@ -217,7 +217,7 @@ func (c *CloverDB) ReadDocuments(ctx context.Context, request types.ReadDocument
 
 	// Get total count (without pagination)
 	totalQuery := c.db.Query(request.Collection)
-	if request.Filter != nil && len(request.Filter) > 0 {
+	if len(request.Filter) > 0 {
 		totalQuery = c.applyFilters(totalQuery, request.Filter)
 	}
 
