@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -19,6 +20,7 @@ type CloverDB struct {
 	logger types.Logger
 	config *types.DatabaseConfig
 	state  atomic.Value
+	mu     sync.RWMutex
 }
 
 func NewCloverDB(ctx context.Context, logger types.Logger, config *types.DatabaseConfig, metrics types.MetricsManager, health types.HealthManager) (types.DatabaseManager, error) {
@@ -113,6 +115,8 @@ func (c *CloverDB) DropCollection(collectionName string) error {
 }
 
 func (c *CloverDB) CreateDocuments(ctx context.Context, request types.CreateDocumentsRequest) ([]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if len(request.Data) == 0 {
 		return []string{}, nil
 	}
@@ -175,6 +179,8 @@ func (c *CloverDB) CreateDocuments(ctx context.Context, request types.CreateDocu
 }
 
 func (c *CloverDB) ReadDocuments(ctx context.Context, request types.ReadDocumentsRequest) ([]map[string]interface{}, int64, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	// Check if collection exists
 	exists, err := c.db.HasCollection(request.Collection)
 	if err != nil {
@@ -226,20 +232,28 @@ func (c *CloverDB) ReadDocuments(ctx context.Context, request types.ReadDocument
 		return nil, 0, types.WrapError(err, "failed to count documents")
 	}
 
-	// Convert to map format
+	fieldSet := make(map[string]struct{}, len(request.Fields))
+	for _, f := range request.Fields {
+		fieldSet[f] = struct{}{}
+	}
+
 	var results []map[string]interface{}
 	for _, doc := range cloverDocs {
 		docMap := make(map[string]interface{})
-
-		// Use Unmarshal to convert document to map
 		err = doc.Unmarshal(&docMap)
 		if err != nil {
 			continue
 		}
-
-		// Remove CloverDB internal fields
 		delete(docMap, "_id")
-
+		if len(fieldSet) > 0 {
+			projected := make(map[string]interface{}, len(fieldSet))
+			for k, v := range docMap {
+				if _, ok := fieldSet[k]; ok {
+					projected[k] = v
+				}
+			}
+			docMap = projected
+		}
 		results = append(results, docMap)
 	}
 
@@ -247,6 +261,8 @@ func (c *CloverDB) ReadDocuments(ctx context.Context, request types.ReadDocument
 }
 
 func (c *CloverDB) UpdateDocuments(ctx context.Context, request types.UpdateDocumentsRequest) (int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	// Check if collection exists
 	exists, err := c.db.HasCollection(request.Collection)
 	if err != nil {
@@ -346,6 +362,8 @@ func (c *CloverDB) UpdateDocuments(ctx context.Context, request types.UpdateDocu
 }
 
 func (c *CloverDB) DeleteDocuments(ctx context.Context, request types.DeleteDocumentsRequest) (int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	// Check if collection exists
 	exists, err := c.db.HasCollection(request.Collection)
 	if err != nil {
