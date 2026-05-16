@@ -221,15 +221,20 @@ func (c *CloverDB) ReadDocuments(ctx context.Context, request types.ReadDocument
 		return nil, 0, types.WrapError(err, "failed to find documents")
 	}
 
-	// Get total count (without pagination)
-	totalQuery := c.db.Query(request.Collection)
-	if len(request.Filter) > 0 {
-		totalQuery = c.applyFilters(totalQuery, request.Filter)
-	}
+	totalCount := len(cloverDocs)
+	if request.Count {
+		// Get total count (without pagination)
+		totalQuery := c.db.Query(request.Collection)
+		if len(request.Filter) > 0 {
+			totalQuery = c.applyFilters(totalQuery, request.Filter)
+		}
 
-	totalCount, err := totalQuery.Count()
-	if err != nil {
-		return nil, 0, types.WrapError(err, "failed to count documents")
+		totalCount, err = totalQuery.Count()
+		if err != nil {
+			return nil, 0, types.WrapError(err, "failed to count documents")
+		}
+	} else {
+		totalCount = 0
 	}
 
 	fieldSet := make(map[string]struct{}, len(request.Fields))
@@ -239,21 +244,23 @@ func (c *CloverDB) ReadDocuments(ctx context.Context, request types.ReadDocument
 
 	var results []map[string]interface{}
 	for _, doc := range cloverDocs {
+		if len(fieldSet) > 0 {
+			projected := make(map[string]interface{}, len(fieldSet))
+			for _, field := range request.Fields {
+				if doc.Has(field) {
+					projected[field] = doc.Get(field)
+				}
+			}
+			results = append(results, projected)
+			continue
+		}
+
 		docMap := make(map[string]interface{})
 		err = doc.Unmarshal(&docMap)
 		if err != nil {
 			continue
 		}
 		delete(docMap, "_id")
-		if len(fieldSet) > 0 {
-			projected := make(map[string]interface{}, len(fieldSet))
-			for k, v := range docMap {
-				if _, ok := fieldSet[k]; ok {
-					projected[k] = v
-				}
-			}
-			docMap = projected
-		}
 		results = append(results, docMap)
 	}
 

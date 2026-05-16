@@ -34,6 +34,7 @@ type ReadDocumentsRequest struct {
 	Limit      int                    `json:"limit,omitempty"`
 	Skip       int                    `json:"skip,omitempty"`
 	Fields     []string               `json:"fields,omitempty"`
+	Count      bool                   `json:"count,omitempty"`
 }
 
 type UpdateDocumentsRequest struct {

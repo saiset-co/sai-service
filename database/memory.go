@@ -179,6 +179,9 @@ func (m *MemoryDB) ReadDocuments(ctx context.Context, request types.ReadDocument
 		allDocs = allDocs[:request.Limit]
 	}
 
+	if !request.Count {
+		total = 0
+	}
 	return allDocs, total, nil
 }
 
