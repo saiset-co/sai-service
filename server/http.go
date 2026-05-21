@@ -126,6 +126,7 @@ func (h *FastHTTPServer) Start() error {
 
 	h.server = &fasthttp.Server{
 		Handler:                       h.mainHandler(),
+		Logger:                        &fasthttpLogger{logger: h.logger},
 		ReadTimeout:                   time.Duration(h.httpConfig.ReadTimeout) * time.Second,
 		WriteTimeout:                  time.Duration(h.httpConfig.WriteTimeout) * time.Second,
 		IdleTimeout:                   time.Duration(h.httpConfig.IdleTimeout) * time.Second,
@@ -277,10 +278,8 @@ func (h *FastHTTPServer) mainHandler() fasthttp.RequestHandler {
 		}
 
 		if handler, config, params := h.findDynamicRoute(methodBytes, pathBytes); handler != nil {
-			if params != nil {
-				for name, value := range params {
-					ctx.SetUserValue(name, value)
-				}
+			for name, value := range params {
+				ctx.SetUserValue(name, value)
 			}
 			h.executeHandler(&types.RequestCtx{RequestCtx: ctx}, handler, config)
 			return
@@ -416,6 +415,14 @@ func (h *FastHTTPServer) matchRoute(pathSegments []string, route *CompiledRoute)
 	}
 
 	return params
+}
+
+type fasthttpLogger struct {
+	logger types.Logger
+}
+
+func (l *fasthttpLogger) Printf(format string, args ...any) {
+	l.logger.Warn(fmt.Sprintf(format, args...))
 }
 
 func (h *FastHTTPServer) executeHandler(ctx *types.RequestCtx, handler types.FastHTTPHandler, config *types.RouteConfig) {
