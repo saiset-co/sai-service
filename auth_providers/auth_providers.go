@@ -118,6 +118,12 @@ func (p *BasicAuthProvider) ApplyToIncomingRequest(ctx *types.RequestCtx) error 
 	ctx.SetUserValue("authenticated_user", username)
 	ctx.SetUserValue("auth_type", "basic")
 
+	isAjax := strings.EqualFold(strings.TrimSpace(string(ctx.Request.Header.Peek("X-Requested-With"))), "fetch")
+	if !isAjax {
+		ctx.Redirect(string(ctx.RequestURI()), fasthttp.StatusFound)
+		return errors.New("redirect_after_auth")
+	}
+
 	return nil
 }
 
