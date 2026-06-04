@@ -5,11 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/valyala/fasthttp"
 
 	"github.com/saiset-co/sai-service/types"
 )
+
+const basicAuthCookieName = "_sai_auth"
+const basicAuthCookieTTL = 24 * time.Hour
 
 type TokenAuthProvider struct {
 	token string
@@ -87,6 +91,16 @@ func (p *BasicAuthProvider) Type() string {
 }
 
 func (p *BasicAuthProvider) ApplyToIncomingRequest(ctx *types.RequestCtx) error {
+	if cookieVal := string(ctx.Request.Header.Cookie(basicAuthCookieName)); cookieVal != "" {
+		if decoded, err := base64.StdEncoding.DecodeString(cookieVal); err == nil {
+			if parts := strings.SplitN(string(decoded), ":", 2); len(parts) == 2 && parts[0] == p.username && parts[1] == p.password {
+				ctx.SetUserValue("authenticated_user", parts[0])
+				ctx.SetUserValue("auth_type", "basic")
+				return nil
+			}
+		}
+	}
+
 	authHeader := string(ctx.Request.Header.Peek("Authorization"))
 
 	if authHeader == "" {
@@ -117,6 +131,14 @@ func (p *BasicAuthProvider) ApplyToIncomingRequest(ctx *types.RequestCtx) error 
 
 	ctx.SetUserValue("authenticated_user", username)
 	ctx.SetUserValue("auth_type", "basic")
+
+	var cookie fasthttp.Cookie
+	cookie.SetKey(basicAuthCookieName)
+	cookie.SetValue(base64.StdEncoding.EncodeToString([]byte(username + ":" + password)))
+	cookie.SetPath("/")
+	cookie.SetHTTPOnly(true)
+	cookie.SetExpire(time.Now().Add(basicAuthCookieTTL))
+	ctx.Response.Header.SetCookie(&cookie)
 
 	isAjax := strings.EqualFold(strings.TrimSpace(string(ctx.Request.Header.Peek("X-Requested-With"))), "fetch")
 	if !isAjax {
