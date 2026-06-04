@@ -132,6 +132,11 @@ func (p *BasicAuthProvider) ApplyToIncomingRequest(ctx *types.RequestCtx) error 
 	ctx.SetUserValue("authenticated_user", username)
 	ctx.SetUserValue("auth_type", "basic")
 
+	isAjax := strings.EqualFold(strings.TrimSpace(string(ctx.Request.Header.Peek("X-Requested-With"))), "fetch")
+	if !isAjax {
+		ctx.Redirect(string(ctx.RequestURI()), fasthttp.StatusFound)
+	}
+
 	var cookie fasthttp.Cookie
 	cookie.SetKey(basicAuthCookieName)
 	cookie.SetValue(base64.StdEncoding.EncodeToString([]byte(username + ":" + password)))
@@ -140,10 +145,8 @@ func (p *BasicAuthProvider) ApplyToIncomingRequest(ctx *types.RequestCtx) error 
 	cookie.SetExpire(time.Now().Add(basicAuthCookieTTL))
 	ctx.Response.Header.SetCookie(&cookie)
 
-	isAjax := strings.EqualFold(strings.TrimSpace(string(ctx.Request.Header.Peek("X-Requested-With"))), "fetch")
 	if !isAjax {
-		ctx.Redirect(string(ctx.RequestURI()), fasthttp.StatusFound)
-		return errors.New("redirect_after_auth")
+		return errors.New("basic_auth_challenge_sent")
 	}
 
 	return nil
