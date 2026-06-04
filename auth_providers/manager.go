@@ -220,7 +220,13 @@ func (pm *AuthProviderManager) initializeDefaultProviders() error {
 
 	if username, ok := providersConfig.Basic.Params["username"].(string); ok {
 		if password, ok := providersConfig.Basic.Params["password"].(string); ok {
-			err := pm.Register("basic", NewBasicAuthProvider(username, password))
+			var cookieTTL time.Duration
+			if hours, ok := providersConfig.Basic.Params["cookie_ttl_hours"].(int); ok {
+				cookieTTL = time.Duration(hours) * time.Hour
+			} else if hours, ok := providersConfig.Basic.Params["cookie_ttl_hours"].(float64); ok {
+				cookieTTL = time.Duration(hours) * time.Hour
+			}
+			err := pm.Register("basic", NewBasicAuthProvider(username, password, cookieTTL))
 			if err != nil {
 				return err
 			}
