@@ -13,7 +13,7 @@ import (
 )
 
 const basicAuthCookieName = "_sai_auth"
-const basicAuthCookieTTL = 24 * time.Hour
+const basicAuthCookieDefaultTTL = 24 * time.Hour
 
 type TokenAuthProvider struct {
 	token string
@@ -73,16 +73,21 @@ func (p *TokenAuthProvider) extractToken(ctx *types.RequestCtx) string {
 }
 
 type BasicAuthProvider struct {
-	username string
-	password string
-	realm    string
+	username  string
+	password  string
+	realm     string
+	cookieTTL time.Duration
 }
 
-func NewBasicAuthProvider(username, password string) *BasicAuthProvider {
+func NewBasicAuthProvider(username, password string, cookieTTL time.Duration) *BasicAuthProvider {
+	if cookieTTL <= 0 {
+		cookieTTL = basicAuthCookieDefaultTTL
+	}
 	return &BasicAuthProvider{
-		username: username,
-		password: password,
-		realm:    "Protected Area",
+		username:  username,
+		password:  password,
+		realm:     "Protected Area",
+		cookieTTL: cookieTTL,
 	}
 }
 
@@ -91,11 +96,18 @@ func (p *BasicAuthProvider) Type() string {
 }
 
 func (p *BasicAuthProvider) ApplyToIncomingRequest(ctx *types.RequestCtx) error {
+	isAjax := strings.EqualFold(strings.TrimSpace(string(ctx.Request.Header.Peek("X-Requested-With"))), "fetch")
+	hasAuthHeader := string(ctx.Request.Header.Peek("Authorization")) != ""
+
 	if cookieVal := string(ctx.Request.Header.Cookie(basicAuthCookieName)); cookieVal != "" {
 		if decoded, err := base64.StdEncoding.DecodeString(cookieVal); err == nil {
 			if parts := strings.SplitN(string(decoded), ":", 2); len(parts) == 2 && parts[0] == p.username && parts[1] == p.password {
 				ctx.SetUserValue("authenticated_user", parts[0])
 				ctx.SetUserValue("auth_type", "basic")
+				if !isAjax && hasAuthHeader {
+					ctx.Redirect(string(ctx.RequestURI()), fasthttp.StatusFound)
+					return errors.New("basic_auth_challenge_sent")
+				}
 				return nil
 			}
 		}
@@ -132,7 +144,6 @@ func (p *BasicAuthProvider) ApplyToIncomingRequest(ctx *types.RequestCtx) error 
 	ctx.SetUserValue("authenticated_user", username)
 	ctx.SetUserValue("auth_type", "basic")
 
-	isAjax := strings.EqualFold(strings.TrimSpace(string(ctx.Request.Header.Peek("X-Requested-With"))), "fetch")
 	if !isAjax {
 		ctx.Redirect(string(ctx.RequestURI()), fasthttp.StatusFound)
 	}
@@ -142,7 +153,7 @@ func (p *BasicAuthProvider) ApplyToIncomingRequest(ctx *types.RequestCtx) error 
 	cookie.SetValue(base64.StdEncoding.EncodeToString([]byte(username + ":" + password)))
 	cookie.SetPath("/")
 	cookie.SetHTTPOnly(true)
-	cookie.SetExpire(time.Now().Add(basicAuthCookieTTL))
+	cookie.SetExpire(time.Now().Add(p.cookieTTL))
 	ctx.Response.Header.SetCookie(&cookie)
 
 	if !isAjax {
