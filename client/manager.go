@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -242,6 +243,32 @@ func (m *Manager) getState() ManagerState {
 func (m *Manager) setState(newState ManagerState) bool {
 	currentState := m.getState()
 	return m.state.CompareAndSwap(currentState, newState)
+}
+
+func (m *Manager) CallWithContext(ctx *types.RequestCtx, serviceName, method, path string, data interface{}, opts *types.CallOptions) ([]byte, int, error) {
+	if opts == nil {
+		opts = &types.CallOptions{}
+	}
+	if opts.Headers == nil {
+		opts.Headers = make(map[string]string)
+	}
+	if _, exists := opts.Headers["X-Forwarded-For"]; !exists {
+		opts.Headers["X-Forwarded-For"] = extractClientIP(ctx)
+	}
+	return m.Call(serviceName, method, path, data, opts)
+}
+
+func extractClientIP(ctx *types.RequestCtx) string {
+	if v := string(ctx.Request.Header.Peek("X-Forwarded-For")); v != "" {
+		if idx := strings.IndexByte(v, ','); idx > 0 {
+			return strings.TrimSpace(v[:idx])
+		}
+		return v
+	}
+	if v := string(ctx.Request.Header.Peek("X-Real-IP")); v != "" {
+		return v
+	}
+	return ctx.RemoteIP().String()
 }
 
 func (m *Manager) transitionState(from, to ManagerState) bool {

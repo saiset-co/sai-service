@@ -30,6 +30,9 @@ type Builder struct {
 	pages        []*PageConfig
 	resources    []*ResourceConfig
 	mounted      bool
+	currentGroup string
+	homeGroup    string
+	pageGroupMap map[string]string
 }
 
 type ActionResponse struct {
@@ -91,12 +94,17 @@ type Section struct {
 	Title       string
 	Description string
 	ContentHTML template.HTML
+	Actions     template.HTML
 }
 
 type navItem struct {
 	Title string
 	Href  string
-	Kind  string
+}
+
+type navGroupData struct {
+	Title string
+	Items []navItem
 }
 
 type dashboardCard struct {
@@ -123,8 +131,9 @@ type layoutViewData struct {
 	FrameworkURL string
 	HeadHTML     template.HTML
 	CurrentPath  string
-	Nav          []navItem
+	NavGroups    []navGroupData
 	PageTitle    string
+	PageGroup    string
 	Subtitle     string
 	Content      contentViewData
 	Now          string
@@ -184,8 +193,9 @@ func New(group types.GroupBuilder) *Builder {
 				`<link rel="stylesheet" href="` + basePath + `/assets/fonts/inter.css">`,
 		),
 		tmpl:      tmpl,
-		pages:     make([]*PageConfig, 0),
-		resources: make([]*ResourceConfig, 0),
+		pages:        make([]*PageConfig, 0),
+		resources:    make([]*ResourceConfig, 0),
+		pageGroupMap: make(map[string]string),
 	}
 }
 
@@ -218,6 +228,11 @@ func (b *Builder) WithAuthProvider(provider string) *Builder {
 	return b
 }
 
+func (b *Builder) Group(title string) *Builder {
+	b.currentGroup = strings.TrimSpace(title)
+	return b
+}
+
 func (b *Builder) WithHomePage(title, description string, handler PageHandler) *Builder {
 	return b.WithHomePageConfig(PageConfig{
 		Title:       title,
@@ -227,6 +242,7 @@ func (b *Builder) WithHomePage(title, description string, handler PageHandler) *
 }
 
 func (b *Builder) WithHomePageConfig(cfg PageConfig) *Builder {
+	b.homeGroup = b.currentGroup
 	b.homePage = &PageConfig{
 		Slug:        "home",
 		Title:       strings.TrimSpace(cfg.Title),
@@ -245,6 +261,7 @@ func (b *Builder) Page(slug, title string, handler PageHandler) *Builder {
 
 func (b *Builder) PageWithConfig(slug string, cfg PageConfig) *Builder {
 	cfg.Slug = normalizeSlug(slug)
+	b.pageGroupMap[cfg.Slug] = b.currentGroup
 	b.pages = append(b.pages, &PageConfig{
 		Slug:        cfg.Slug,
 		Title:       strings.TrimSpace(cfg.Title),
@@ -256,6 +273,7 @@ func (b *Builder) PageWithConfig(slug string, cfg PageConfig) *Builder {
 
 func (b *Builder) Resource(name string, cfg ResourceConfig) *Builder {
 	cfg.Name = normalizeSlug(name)
+	b.pageGroupMap["res:"+cfg.Name] = b.currentGroup
 	if strings.TrimSpace(cfg.Title) == "" {
 		cfg.Title = humanize(cfg.Name)
 	}
@@ -435,14 +453,24 @@ func (b *Builder) render(ctx *types.RequestCtx, currentPath, pageTitle, subtitle
 		return
 	}
 
+	pageGroup := b.homeGroup
+	if currentPath != b.basePath {
+		if slug, ok := strings.CutPrefix(currentPath, b.basePath+"/pages/"); ok {
+			pageGroup = b.pageGroupMap[slug]
+		} else if name, ok := strings.CutPrefix(currentPath, b.basePath+"/resources/"); ok {
+			pageGroup = b.pageGroupMap["res:"+name]
+		}
+	}
+
 	data := layoutViewData{
 		LayoutTitle:  b.title,
 		LayoutSub:    b.subtitle,
 		FrameworkURL: b.frameworkURL,
 		HeadHTML:     b.headHTML,
 		CurrentPath:  currentPath,
-		Nav:          b.navItems(),
+		NavGroups:    b.navGroups(),
 		PageTitle:    pageTitle,
+		PageGroup:    pageGroup,
 		Subtitle:     subtitle,
 		Content:      content,
 		Now:          time.Now().Format("2006-01-02 15:04:05"),
@@ -467,30 +495,38 @@ func (b *Builder) renderContent(ctx *types.RequestCtx, content contentViewData) 
 	_, _ = ctx.Success([]byte(buf.String()), []byte("text/html; charset=UTF-8"))
 }
 
-func (b *Builder) navItems() []navItem {
-	homeTitle := "Overview"
-	if b.homePage != nil && strings.TrimSpace(b.homePage.Title) != "" {
-		homeTitle = b.homePage.Title
+func (b *Builder) navGroups() []navGroupData {
+	order := make([]string, 0)
+	groups := make(map[string][]navItem)
+
+	add := func(group, title, href string) {
+		if _, exists := groups[group]; !exists {
+			order = append(order, group)
+		}
+		groups[group] = append(groups[group], navItem{Title: title, Href: href})
 	}
-	items := []navItem{{Title: homeTitle, Href: b.basePath, Kind: "Home"}}
+
+	if b.homePage != nil {
+		homeTitle := "Overview"
+		if strings.TrimSpace(b.homePage.Title) != "" {
+			homeTitle = b.homePage.Title
+		}
+		add(b.homeGroup, homeTitle, b.basePath)
+	}
 
 	for _, page := range b.pages {
-		items = append(items, navItem{
-			Title: page.Title,
-			Href:  b.basePath + "/pages/" + page.Slug,
-			Kind:  "Page",
-		})
+		add(b.pageGroupMap[page.Slug], page.Title, b.basePath+"/pages/"+page.Slug)
 	}
 
 	for _, resource := range b.resources {
-		items = append(items, navItem{
-			Title: resource.Title,
-			Href:  b.basePath + "/resources/" + resource.Name,
-			Kind:  "Resource",
-		})
+		add(b.pageGroupMap["res:"+resource.Name], resource.Title, b.basePath+"/resources/"+resource.Name)
 	}
 
-	return items
+	result := make([]navGroupData, 0, len(order))
+	for _, g := range order {
+		result = append(result, navGroupData{Title: g, Items: groups[g]})
+	}
+	return result
 }
 
 func HTML(value string) template.HTML {
@@ -776,12 +812,16 @@ const layoutTemplate = `
           <h1 class="text-2xl font-semibold tracking-tight">{{.LayoutTitle}}</h1>
           {{if .LayoutSub}}<p class="mt-3 text-sm leading-6 text-slate-300">{{.LayoutSub}}</p>{{end}}
         </div>
-        <nav class="space-y-2">
-          {{range .Nav}}
-          <a href="{{.Href}}" class="block rounded-2xl px-4 py-3 transition {{if eq $.CurrentPath .Href}}bg-white text-slate-900 shadow-panel{{else}}bg-white/5 text-slate-100 hover:bg-white/10{{end}}">
-            <div class="text-[11px] font-semibold uppercase tracking-[0.18em] {{if eq $.CurrentPath .Href}}text-slate-500{{else}}text-slate-300{{end}}">{{.Kind}}</div>
-            <div class="mt-1 text-sm font-medium">{{.Title}}</div>
-          </a>
+        <nav class="space-y-4">
+          {{range .NavGroups}}
+          <div>
+            {{if .Title}}<div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.22em] text-slate-400">{{.Title}}</div>{{end}}
+            <div class="space-y-0.5">
+              {{range .Items}}
+              <a href="{{.Href}}" class="block rounded-xl px-3 py-2 text-sm font-medium transition {{if eq $.CurrentPath .Href}}bg-white text-slate-900 shadow-sm{{else}}text-slate-300 hover:bg-white/10 hover:text-white{{end}}">{{.Title}}</a>
+              {{end}}
+            </div>
+          </div>
           {{end}}
         </nav>
       </aside>
@@ -804,9 +844,7 @@ const layoutTemplate = `
         <section class="rounded-[28px] border border-slate-200 bg-gradient-to-br from-slate-900 via-slate-800 to-indigo-900 px-6 py-6 text-white shadow-panel sm:px-8">
           <div class="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
             <div>
-              <div class="mb-3 inline-flex rounded-full bg-white/10 px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] text-indigo-100">
-                Dashboard
-              </div>
+              {{if .PageGroup}}<div class="mb-3 inline-flex rounded-full bg-white/10 px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] text-indigo-100">{{.PageGroup}}</div>{{end}}
               <h2 class="text-3xl font-semibold tracking-tight sm:text-4xl">{{.PageTitle}}</h2>
               {{if .Subtitle}}<p class="mt-3 max-w-3xl text-sm leading-6 text-slate-200 sm:text-base">{{.Subtitle}}</p>{{end}}
             </div>
@@ -1021,7 +1059,10 @@ const layoutTemplate = `
   <section class="mt-6 space-y-5">
     {{range .Sections}}
     <article class="rounded-[24px] border border-slate-200 bg-white p-6 shadow-panel">
-      <h3 class="text-xl font-semibold tracking-tight text-slate-900">{{.Title}}</h3>
+      <div class="flex items-center justify-between">
+        <h3 class="text-xl font-semibold tracking-tight text-slate-900">{{.Title}}</h3>
+        {{if .Actions}}<div class="flex items-center gap-2">{{.Actions}}</div>{{end}}
+      </div>
       {{if .Description}}<p class="mt-2 text-sm leading-6 text-slate-600">{{.Description}}</p>{{end}}
       <div class="prose prose-slate mt-5 max-w-none">{{.ContentHTML}}</div>
     </article>

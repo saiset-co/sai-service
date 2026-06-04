@@ -6,6 +6,7 @@ import (
 
 type ClientManager interface {
 	Call(serviceName, method, path string, data interface{}, opts *CallOptions) ([]byte, int, error)
+	CallWithContext(ctx *RequestCtx, serviceName, method, path string, data interface{}, opts *CallOptions) ([]byte, int, error)
 	//RegisterWebhook(serviceName, event, webhookURL string) ([]byte, int, error)
 }
 
