@@ -933,7 +933,7 @@ const layoutTemplate = `
               submitter.textContent = 'Working...';
             }
 
-            var response = await fetch(form.action, {
+            var response = await fetch(window.location.origin + form.getAttribute('action'), {
               method: form.method || 'POST',
               body: new FormData(form),
               headers: { 'X-Requested-With': 'fetch' }

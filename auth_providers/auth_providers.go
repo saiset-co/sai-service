@@ -96,18 +96,11 @@ func (p *BasicAuthProvider) Type() string {
 }
 
 func (p *BasicAuthProvider) ApplyToIncomingRequest(ctx *types.RequestCtx) error {
-	isAjax := strings.EqualFold(strings.TrimSpace(string(ctx.Request.Header.Peek("X-Requested-With"))), "fetch")
-	hasAuthHeader := string(ctx.Request.Header.Peek("Authorization")) != ""
-
 	if cookieVal := string(ctx.Request.Header.Cookie(basicAuthCookieName)); cookieVal != "" {
 		if decoded, err := base64.StdEncoding.DecodeString(cookieVal); err == nil {
 			if parts := strings.SplitN(string(decoded), ":", 2); len(parts) == 2 && parts[0] == p.username && parts[1] == p.password {
 				ctx.SetUserValue("authenticated_user", parts[0])
 				ctx.SetUserValue("auth_type", "basic")
-				if !isAjax && hasAuthHeader {
-					ctx.Redirect(string(ctx.RequestURI()), fasthttp.StatusFound)
-					return errors.New("basic_auth_challenge_sent")
-				}
 				return nil
 			}
 		}
@@ -144,10 +137,6 @@ func (p *BasicAuthProvider) ApplyToIncomingRequest(ctx *types.RequestCtx) error 
 	ctx.SetUserValue("authenticated_user", username)
 	ctx.SetUserValue("auth_type", "basic")
 
-	if !isAjax {
-		ctx.Redirect(string(ctx.RequestURI()), fasthttp.StatusFound)
-	}
-
 	var cookie fasthttp.Cookie
 	cookie.SetKey(basicAuthCookieName)
 	cookie.SetValue(base64.StdEncoding.EncodeToString([]byte(username + ":" + password)))
@@ -155,10 +144,6 @@ func (p *BasicAuthProvider) ApplyToIncomingRequest(ctx *types.RequestCtx) error 
 	cookie.SetHTTPOnly(true)
 	cookie.SetExpire(time.Now().Add(p.cookieTTL))
 	ctx.Response.Header.SetCookie(&cookie)
-
-	if !isAjax {
-		return errors.New("basic_auth_challenge_sent")
-	}
 
 	return nil
 }
