@@ -146,6 +146,12 @@ func (m *Manager) Log(lvl zapcore.Level, msg string, fields ...zap.Field) {
 	m.logger.Log(lvl, msg, fields...)
 }
 
+func (m *Manager) WrapCore(f func(zapcore.Core) zapcore.Core) {
+	if zw, ok := m.logger.(*ZapWrapper); ok {
+		zw.Logger = zw.Logger.WithOptions(zap.WrapCore(f))
+	}
+}
+
 func (m *Manager) getState() State {
 	return m.state.Load().(State)
 }

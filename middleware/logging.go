@@ -77,6 +77,7 @@ func NewLoggingMiddleware(config types.ConfigManager, logger types.Logger, metri
 		metrics:       metrics,
 		loggingConfig: loggingConfig,
 		logLevel:      logLevel,
+		serviceName:   []byte(config.GetConfig().Name),
 		sensitiveHeaders: map[string]bool{
 			"authorization": true,
 			"x-api-key":     true,
@@ -180,14 +181,17 @@ func (l *LoggingMiddleware) logResponse(ctx *types.RequestCtx, duration time.Dur
 	}
 
 	if l.loggingConfig.LogBody && len(ctx.Response.Body()) > 0 {
-		body := ctx.Response.Body()
-		if len(body) > 1000 {
-			*fields = append(*fields,
-				zap.ByteString("response", body[:1000]),
-				zap.Int("response_body_truncated", len(body)),
-			)
-		} else {
-			*fields = append(*fields, zap.ByteString("response", body))
+		ct := string(ctx.Response.Header.ContentType())
+		if strings.Contains(ct, "json") || strings.Contains(ct, "text") || strings.Contains(ct, "xml") {
+			body := ctx.Response.Body()
+			if len(body) > 1000 {
+				*fields = append(*fields,
+					zap.ByteString("response", body[:1000]),
+					zap.Int("response_body_truncated", len(body)),
+				)
+			} else {
+				*fields = append(*fields, zap.ByteString("response", body))
+			}
 		}
 	}
 
