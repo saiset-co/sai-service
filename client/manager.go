@@ -255,6 +255,13 @@ func (m *Manager) CallWithContext(ctx *types.RequestCtx, serviceName, method, pa
 	if _, exists := opts.Headers["X-Forwarded-For"]; !exists {
 		opts.Headers["X-Forwarded-For"] = extractClientIP(ctx)
 	}
+	if _, exists := opts.Headers["X-Forwarded-User-ID"]; !exists {
+		if v := ctx.UserValue("user_id"); v != nil {
+			if userID, ok := v.(string); ok && userID != "" {
+				opts.Headers["X-Forwarded-User-ID"] = userID
+			}
+		}
+	}
 	return m.Call(serviceName, method, path, data, opts)
 }
 
