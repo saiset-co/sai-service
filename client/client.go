@@ -158,12 +158,6 @@ func (c *HTTPClient) IsRunning() bool {
 	return c.getClientState() == StateRunning
 }
 
-func (c *HTTPClient) getState() (state int32, failures int32, lastFail int64) {
-	if c.circuitBreaker == nil {
-		return 0, 0, 0
-	}
-	return c.circuitBreaker.GetState()
-}
 
 func (c *HTTPClient) getClientState() State {
 	return c.state.Load().(State)

@@ -185,7 +185,7 @@ func (m *Manager) Call(serviceName, method, path string, data interface{}, opts 
 		return nil, 500, types.ErrActionNotInitialized
 	}
 
-	callCtx, cancel := context.WithTimeout(m.ctx, m.callTimeout)
+	_, cancel := context.WithTimeout(m.ctx, m.callTimeout)
 	defer cancel()
 
 	if opts == nil {
@@ -211,29 +211,6 @@ func (m *Manager) Call(serviceName, method, path string, data interface{}, opts 
 	}
 
 	return client.Call(method, path, data, opts)
-
-	var resp []byte
-	var statusCode int
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		resp, statusCode, err = client.Call(method, path, data, opts)
-	}()
-
-	select {
-	case <-done:
-	case <-callCtx.Done():
-		return nil, 500, types.WrapErrorf(err, "call timeout for service: %s", serviceName)
-	case <-m.ctx.Done():
-		return nil, 500, types.WrapErrorf(err, "manager shutting down, aborting call to service: %s", serviceName)
-	}
-
-	if err != nil {
-		err = types.WrapError(err, "failed to execute client")
-	}
-
-	return resp, statusCode, err
 }
 
 func (m *Manager) getState() ManagerState {
