@@ -360,7 +360,7 @@ func (s *Service) startComponents(ctx context.Context) error {
 		}
 	}
 
-	if _config.Actions != nil && (_config.Actions.Broker != nil || _config.Actions.Webhooks != nil) && _config.Actions.Broker.Enabled {
+	if _config.Actions != nil && _config.Actions.Enabled && (_config.Actions.Broker != nil || _config.Actions.Webhooks != nil) && _config.Actions.Broker.Enabled {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -742,7 +742,7 @@ func registerProviders(container *sai.Container, ctx context.Context, configPath
 		container.SetClientManager(clientManager)
 	}
 
-	if _config.Actions != nil && (_config.Actions.Broker != nil || _config.Actions.Webhooks != nil) {
+	if _config.Actions != nil && _config.Actions.Enabled && (_config.Actions.Broker != nil || _config.Actions.Webhooks != nil) {
 		actionDispatcher, err := action.NewDispatcher(ctx, configManager, loggerManager, router, metricsManager, healthManager, clientManager)
 		if err != nil {
 			return types.WrapError(err, "failed to register unified event dispatcher")
