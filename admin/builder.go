@@ -908,7 +908,7 @@ const layoutTemplate = `
           var target = document.getElementById('admin-page-content');
           if (!target) return;
 
-          var response = await fetch(window.location.pathname + window.location.search, {
+          var response = await fetch(window.location.origin + window.location.pathname + window.location.search, {
             headers: {
               'X-Requested-With': 'fetch',
               'X-SAI-Admin-Fragment': '1'
