@@ -1,10 +1,12 @@
 package auth_providers
 
 import (
+	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/valyala/fasthttp"
@@ -14,6 +16,64 @@ import (
 
 const basicAuthCookieName = "_sai_auth"
 const basicAuthCookieDefaultTTL = 24 * time.Hour
+
+type session struct {
+	username string
+	expireAt time.Time
+}
+
+type sessionStore struct {
+	mu       sync.RWMutex
+	sessions map[string]*session
+	ttl      time.Duration
+}
+
+func newSessionStore(ttl time.Duration) *sessionStore {
+	s := &sessionStore{
+		sessions: make(map[string]*session),
+		ttl:      ttl,
+	}
+	go s.cleanupLoop()
+	return s
+}
+
+func (s *sessionStore) create(username string) string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	token := base64.RawURLEncoding.EncodeToString(b)
+	s.mu.Lock()
+	s.sessions[token] = &session{username: username, expireAt: time.Now().Add(s.ttl)}
+	s.mu.Unlock()
+	return token
+}
+
+func (s *sessionStore) touch(token string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[token]
+	if !ok || time.Now().After(sess.expireAt) {
+		delete(s.sessions, token)
+		return "", false
+	}
+	sess.expireAt = time.Now().Add(s.ttl)
+	return sess.username, true
+}
+
+
+func (s *sessionStore) cleanupLoop() {
+	ticker := time.NewTicker(s.ttl / 2)
+	defer ticker.Stop()
+	for range ticker.C {
+		now := time.Now()
+		s.mu.Lock()
+		for token, sess := range s.sessions {
+			if now.After(sess.expireAt) {
+				delete(s.sessions, token)
+			}
+		}
+		s.mu.Unlock()
+	}
+}
 
 type TokenAuthProvider struct {
 	token string
@@ -61,22 +121,23 @@ func (p *TokenAuthProvider) extractToken(ctx *types.RequestCtx) string {
 		return ""
 	}
 
-	if strings.HasPrefix(authHeader, "Bearer ") {
-		return strings.TrimPrefix(authHeader, "Bearer ")
+	if token, ok := strings.CutPrefix(authHeader, "Bearer "); ok {
+		return token
 	}
 
-	if strings.HasPrefix(authHeader, "Token ") {
-		return strings.TrimPrefix(authHeader, "Token ")
+	if token, ok := strings.CutPrefix(authHeader, "Token "); ok {
+		return token
 	}
 
 	return authHeader
 }
 
 type BasicAuthProvider struct {
-	username  string
-	password  string
-	realm     string
-	cookieTTL time.Duration
+	username string
+	password string
+	realm    string
+	store    *sessionStore
+	ttl      time.Duration
 }
 
 func NewBasicAuthProvider(username, password string, cookieTTL time.Duration) *BasicAuthProvider {
@@ -84,10 +145,11 @@ func NewBasicAuthProvider(username, password string, cookieTTL time.Duration) *B
 		cookieTTL = basicAuthCookieDefaultTTL
 	}
 	return &BasicAuthProvider{
-		username:  username,
-		password:  password,
-		realm:     "Protected Area",
-		cookieTTL: cookieTTL,
+		username: username,
+		password: password,
+		realm:    "Protected Area",
+		store:    newSessionStore(cookieTTL),
+		ttl:      cookieTTL,
 	}
 }
 
@@ -96,18 +158,16 @@ func (p *BasicAuthProvider) Type() string {
 }
 
 func (p *BasicAuthProvider) ApplyToIncomingRequest(ctx *types.RequestCtx) error {
-	if cookieVal := string(ctx.Request.Header.Cookie(basicAuthCookieName)); cookieVal != "" {
-		if decoded, err := base64.StdEncoding.DecodeString(cookieVal); err == nil {
-			if parts := strings.SplitN(string(decoded), ":", 2); len(parts) == 2 && parts[0] == p.username && parts[1] == p.password {
-				ctx.SetUserValue("authenticated_user", parts[0])
-				ctx.SetUserValue("auth_type", "basic")
-				return nil
-			}
+	if token := string(ctx.Request.Header.Cookie(basicAuthCookieName)); token != "" {
+		if username, ok := p.store.touch(token); ok {
+			ctx.SetUserValue("authenticated_user", username)
+			ctx.SetUserValue("auth_type", "basic")
+			p.setSessionCookie(ctx, token)
+			return nil
 		}
 	}
 
 	authHeader := string(ctx.Request.Header.Peek("Authorization"))
-
 	if authHeader == "" {
 		return p.sendAuthChallenge(ctx, "Authorization header required")
 	}
@@ -122,30 +182,32 @@ func (p *BasicAuthProvider) ApplyToIncomingRequest(ctx *types.RequestCtx) error 
 		return p.sendAuthChallenge(ctx, "Invalid authentication encoding")
 	}
 
-	credentials := string(decoded)
-	parts := strings.SplitN(credentials, ":", 2)
+	parts := strings.SplitN(string(decoded), ":", 2)
 	if len(parts) != 2 {
 		return p.sendAuthChallenge(ctx, "Invalid authentication format")
 	}
 
-	username, password := parts[0], parts[1]
-
-	if username != p.username || password != p.password {
+	if parts[0] != p.username || parts[1] != p.password {
 		return p.sendAuthChallenge(ctx, "Invalid username or password")
 	}
 
-	ctx.SetUserValue("authenticated_user", username)
+	ctx.SetUserValue("authenticated_user", parts[0])
 	ctx.SetUserValue("auth_type", "basic")
 
-	var cookie fasthttp.Cookie
-	cookie.SetKey(basicAuthCookieName)
-	cookie.SetValue(base64.StdEncoding.EncodeToString([]byte(username + ":" + password)))
-	cookie.SetPath("/")
-	cookie.SetHTTPOnly(true)
-	cookie.SetExpire(time.Now().Add(p.cookieTTL))
-	ctx.Response.Header.SetCookie(&cookie)
+	token := p.store.create(parts[0])
+	p.setSessionCookie(ctx, token)
 
 	return nil
+}
+
+func (p *BasicAuthProvider) setSessionCookie(ctx *types.RequestCtx, token string) {
+	var cookie fasthttp.Cookie
+	cookie.SetKey(basicAuthCookieName)
+	cookie.SetValue(token)
+	cookie.SetPath("/")
+	cookie.SetHTTPOnly(true)
+	cookie.SetExpire(time.Now().Add(p.ttl))
+	ctx.Response.Header.SetCookie(&cookie)
 }
 
 func (p *BasicAuthProvider) sendAuthChallenge(ctx *types.RequestCtx, message string) error {
