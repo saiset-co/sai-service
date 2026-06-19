@@ -15,6 +15,7 @@ const DefaultLogBufferSize = 500
 type LogEntry struct {
 	Level  zapcore.Level
 	Text   string
+	Caller string
 	Fields string
 }
 
@@ -112,7 +113,7 @@ func (b *LogRingBuffer) Write(e zapcore.Entry, fields []zapcore.Field) error {
 		}
 	}
 
-	entry := LogEntry{Level: e.Level, Text: text, Fields: fieldsJSON}
+	entry := LogEntry{Level: e.Level, Text: text, Caller: e.Caller.TrimmedPath(), Fields: fieldsJSON}
 	b.mu.Lock()
 	b.entries[b.head] = entry
 	b.head = (b.head + 1) % b.max
