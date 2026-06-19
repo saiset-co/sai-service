@@ -422,7 +422,15 @@ type fasthttpLogger struct {
 }
 
 func (l *fasthttpLogger) Printf(format string, args ...any) {
-	l.logger.Warn(fmt.Sprintf(format, args...))
+	msg := fmt.Sprintf(format, args...)
+	if i := strings.Index(msg, ". Buffer size="); i >= 0 {
+		msg = msg[:i]
+	}
+	if strings.Contains(msg, `\x16\x03`) {
+		l.logger.Debug("TLS ClientHello on plain HTTP port")
+		return
+	}
+	l.logger.Warn(msg)
 }
 
 func (h *FastHTTPServer) executeHandler(ctx *types.RequestCtx, handler types.FastHTTPHandler, config *types.RouteConfig) {
