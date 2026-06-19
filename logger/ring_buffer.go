@@ -5,6 +5,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"time"
 
 	"go.uber.org/zap/zapcore"
 )
@@ -60,8 +61,13 @@ func zapFieldToString(f zapcore.Field) string {
 		return fmt.Sprintf("%g", math.Float32frombits(uint32(f.Integer)))
 	case zapcore.Float64Type:
 		return fmt.Sprintf("%g", math.Float64frombits(uint64(f.Integer)))
+	case zapcore.ByteStringType:
+		if bs, ok := f.Interface.([]byte); ok {
+			return string(bs)
+		}
+		return ""
 	case zapcore.DurationType:
-		return fmt.Sprintf("%dns", f.Integer)
+		return time.Duration(f.Integer).String()
 	case zapcore.ErrorType:
 		if f.Interface != nil {
 			return fmt.Sprintf("%v", f.Interface)
@@ -80,7 +86,7 @@ func zapFieldToString(f zapcore.Field) string {
 
 func (b *LogRingBuffer) Write(e zapcore.Entry, fields []zapcore.Field) error {
 	var sb strings.Builder
-	sb.WriteString(e.Time.Format("15:04:05"))
+	sb.WriteString(e.Time.Format("2006-01-02 15:04:05"))
 	sb.WriteByte(' ')
 	switch e.Level {
 	case zapcore.ErrorLevel, zapcore.FatalLevel, zapcore.PanicLevel:
