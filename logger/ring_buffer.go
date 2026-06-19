@@ -2,6 +2,7 @@ package logger
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 
@@ -38,6 +39,45 @@ func (b *LogRingBuffer) Check(e zapcore.Entry, ce *zapcore.CheckedEntry) *zapcor
 	return ce.AddCore(e, b)
 }
 
+var skipLogFields = map[string]bool{
+	"response_body_truncated": true,
+	"user_agent":              true,
+}
+
+func zapFieldToString(f zapcore.Field) string {
+	switch f.Type {
+	case zapcore.StringType:
+		return f.String
+	case zapcore.BoolType:
+		if f.Integer == 1 {
+			return "true"
+		}
+		return "false"
+	case zapcore.Int8Type, zapcore.Int16Type, zapcore.Int32Type, zapcore.Int64Type,
+		zapcore.Uint8Type, zapcore.Uint16Type, zapcore.Uint32Type, zapcore.Uint64Type:
+		return fmt.Sprintf("%d", f.Integer)
+	case zapcore.Float32Type:
+		return fmt.Sprintf("%g", math.Float32frombits(uint32(f.Integer)))
+	case zapcore.Float64Type:
+		return fmt.Sprintf("%g", math.Float64frombits(uint64(f.Integer)))
+	case zapcore.DurationType:
+		return fmt.Sprintf("%dns", f.Integer)
+	case zapcore.ErrorType:
+		if f.Interface != nil {
+			return fmt.Sprintf("%v", f.Interface)
+		}
+		return ""
+	default:
+		if f.Interface != nil {
+			return fmt.Sprintf("%v", f.Interface)
+		}
+		if f.String != "" {
+			return f.String
+		}
+		return fmt.Sprintf("%d", f.Integer)
+	}
+}
+
 func (b *LogRingBuffer) Write(e zapcore.Entry, fields []zapcore.Field) error {
 	var sb strings.Builder
 	sb.WriteString(e.Time.Format("15:04:05"))
@@ -54,28 +94,18 @@ func (b *LogRingBuffer) Write(e zapcore.Entry, fields []zapcore.Field) error {
 	}
 	sb.WriteByte(' ')
 	sb.WriteString(e.Message)
-	if len(fields) > 0 {
-		enc := zapcore.NewMapObjectEncoder()
-		for _, f := range fields {
-			f.AddTo(enc)
+	for _, f := range fields {
+		if skipLogFields[f.Key] {
+			continue
 		}
-		skipFields := map[string]bool{
-			"response_body_truncated": true,
-			"user_agent":              true,
+		s := zapFieldToString(f)
+		if len(s) > 200 {
+			s = s[:197] + "..."
 		}
-		for k, v := range enc.Fields {
-			if skipFields[k] {
-				continue
-			}
-			s := fmt.Sprintf("%v", v)
-			if len(s) > 200 {
-				s = s[:197] + "..."
-			}
-			sb.WriteString("  ")
-			sb.WriteString(k)
-			sb.WriteByte('=')
-			sb.WriteString(s)
-		}
+		sb.WriteByte(' ')
+		sb.WriteString(f.Key)
+		sb.WriteByte('=')
+		sb.WriteString(s)
 	}
 
 	entry := LogEntry{Level: e.Level, Text: sb.String()}
