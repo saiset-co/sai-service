@@ -1,9 +1,9 @@
 package logger
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
-	"strings"
 	"sync"
 	"time"
 
@@ -13,8 +13,9 @@ import (
 const DefaultLogBufferSize = 500
 
 type LogEntry struct {
-	Level zapcore.Level
-	Text  string
+	Level  zapcore.Level
+	Text   string
+	Fields string
 }
 
 type LogRingBuffer struct {
@@ -45,22 +46,19 @@ var skipLogFields = map[string]bool{
 	"user_agent":              true,
 }
 
-func zapFieldToString(f zapcore.Field) string {
+func zapFieldToValue(f zapcore.Field) any {
 	switch f.Type {
 	case zapcore.StringType:
 		return f.String
 	case zapcore.BoolType:
-		if f.Integer == 1 {
-			return "true"
-		}
-		return "false"
+		return f.Integer == 1
 	case zapcore.Int8Type, zapcore.Int16Type, zapcore.Int32Type, zapcore.Int64Type,
 		zapcore.Uint8Type, zapcore.Uint16Type, zapcore.Uint32Type, zapcore.Uint64Type:
-		return fmt.Sprintf("%d", f.Integer)
+		return f.Integer
 	case zapcore.Float32Type:
-		return fmt.Sprintf("%g", math.Float32frombits(uint32(f.Integer)))
+		return math.Float32frombits(uint32(f.Integer))
 	case zapcore.Float64Type:
-		return fmt.Sprintf("%g", math.Float64frombits(uint64(f.Integer)))
+		return math.Float64frombits(uint64(f.Integer))
 	case zapcore.ByteStringType:
 		if bs, ok := f.Interface.([]byte); ok {
 			return string(bs)
@@ -75,46 +73,46 @@ func zapFieldToString(f zapcore.Field) string {
 		return ""
 	default:
 		if f.Interface != nil {
-			return fmt.Sprintf("%v", f.Interface)
+			return f.Interface
 		}
 		if f.String != "" {
 			return f.String
 		}
-		return fmt.Sprintf("%d", f.Integer)
+		return f.Integer
 	}
 }
 
 func (b *LogRingBuffer) Write(e zapcore.Entry, fields []zapcore.Field) error {
-	var sb strings.Builder
-	sb.WriteString(e.Time.Format("2006-01-02 15:04:05"))
-	sb.WriteByte(' ')
+	var header string
 	switch e.Level {
 	case zapcore.ErrorLevel, zapcore.FatalLevel, zapcore.PanicLevel:
-		sb.WriteString("[ERR]")
+		header = "[ERR]"
 	case zapcore.WarnLevel:
-		sb.WriteString("[WRN]")
+		header = "[WRN]"
 	case zapcore.InfoLevel:
-		sb.WriteString("[INF]")
+		header = "[INF]"
 	default:
-		sb.WriteString("[DBG]")
+		header = "[DBG]"
 	}
-	sb.WriteByte(' ')
-	sb.WriteString(e.Message)
-	for _, f := range fields {
-		if skipLogFields[f.Key] {
-			continue
+	text := e.Time.Format("2006-01-02 15:04:05") + " " + header + " " + e.Message
+
+	var fieldsJSON string
+	if len(fields) > 0 {
+		m := make(map[string]any, len(fields))
+		for _, f := range fields {
+			if skipLogFields[f.Key] {
+				continue
+			}
+			m[f.Key] = zapFieldToValue(f)
 		}
-		s := zapFieldToString(f)
-		if len(s) > 200 {
-			s = s[:197] + "..."
+		if len(m) > 0 {
+			if b, err := json.Marshal(m); err == nil {
+				fieldsJSON = string(b)
+			}
 		}
-		sb.WriteByte(' ')
-		sb.WriteString(f.Key)
-		sb.WriteByte('=')
-		sb.WriteString(s)
 	}
 
-	entry := LogEntry{Level: e.Level, Text: sb.String()}
+	entry := LogEntry{Level: e.Level, Text: text, Fields: fieldsJSON}
 	b.mu.Lock()
 	b.entries[b.head] = entry
 	b.head = (b.head + 1) % b.max
